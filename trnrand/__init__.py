@@ -4,7 +4,7 @@ trnrand — Random number generation for AWS Trainium via NKI.
 Pseudo-random and quasi-random sequences for scientific computing.
 Reproducible seeding, standard distributions, and low-discrepancy
 sequences for quasi-Monte Carlo integration.
-Part of the trn-* scientific computing suite by Playground Logic.
+Part of the trnsci scientific computing suite.
 """
 
 __version__ = "0.1.0"
