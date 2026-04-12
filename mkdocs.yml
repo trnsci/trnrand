@@ -23,7 +23,9 @@ nav:
       - Quasi-random: api/quasi.md
       - NKI Backend: api/nki.md
   - Architecture: architecture.md
+  - Benchmarks: benchmarks.md
   - AWS Setup: aws_setup.md
+  - Release procedure: release.md
 
 markdown_extensions:
   - pymdownx.highlight
