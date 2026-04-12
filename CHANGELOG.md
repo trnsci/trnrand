@@ -7,6 +7,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- Philox 4×32-10 NKI kernel scaffold in `trnrand/nki/dispatch.py` with a
+  matching CPU reference (`philox4x32_reference`, `philox_uniform_cpu`)
+  used as the conformance oracle. CPU-side spec invariants tested in
+  `tests/test_nki_philox.py::TestPhiloxReference`. NKI kernel awaits
+  on-hardware validation per #1 — the `TestPhiloxNKI` class is gated by
+  the `neuron` marker.
+
 ## [0.1.0] - 2026-04-11
 
 ### Added
