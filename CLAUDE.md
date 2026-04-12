@@ -1,7 +1,7 @@
 # trnrand
 
 Random number generation for AWS Trainium via NKI.
-Part of the trn-* scientific computing suite by Playground Logic.
+Part of the trn-* scientific computing suite in the trnsci project.
 
 ## What This Is
 
@@ -40,11 +40,11 @@ trnrand/
 
 | Use Case | trnrand Function | Consumer |
 |----------|-----------------|----------|
-| Noise injection for speech training | `normal()` | trnfft (Williamson) |
+| Noise injection for speech training | `normal()` | trnfft |
 | Stochastic trace estimation | `normal()`, `sobol()` | trnsolver |
 | Weight initialization | `truncated_normal()` | trnfft/nn.py |
-| Monte Carlo integration | `sobol()`, `halton()` | trnblas (Janesko) |
-| Hyperparameter sweeps | `sobol()` | Ephemeron ablation |
+| Monte Carlo integration | `sobol()`, `halton()` | trnblas (DF-MP2) |
+| Hyperparameter sweeps | `sobol()` | Ablation studies |
 | Data augmentation | `uniform()`, `bernoulli()` | General |
 
 ## NKI Strategy
@@ -91,4 +91,4 @@ Sibling repos in the trn-* suite:
 - `trnsolver` — Linear solvers (https://github.com/scttfrdmn/trnsolver)
 - `trnrand` — Random number generation (this repo)
 
-All repos: Python/NKI, Apache 2.0, Playground Logic.
+All repos: Python/NKI, Apache 2.0.

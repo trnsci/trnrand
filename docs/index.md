@@ -7,7 +7,7 @@ quasi-Monte Carlo, and an on-device Philox RNG targeting the GpSimd engine —
 on-device generation avoids host→device transfer for large random tensors.
 
 Part of the **trn-\*** scientific computing suite by
-[Playground Logic](https://playgroundlogic.co).
+the trnsci project.
 
 ## Why
 
@@ -21,9 +21,9 @@ generated where they're consumed.
 
 ## Primary use cases
 
-- Noise injection for speech training (consumed by `trnfft` Williamson).
+- Noise injection for speech training (consumed by `trnfft`).
 - Stochastic trace estimation and Monte Carlo integration (consumed by
-  `trnblas` for the Janesko DF-MP2 work).
+  `trnblas` for DF-MP2 quantum chemistry workloads).
 - Truncated-normal weight initialization for neural-net layers.
 
 See [Architecture](architecture.md) for the Philox/GpSimd story.

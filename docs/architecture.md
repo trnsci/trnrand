@@ -21,11 +21,11 @@ trnrand/
 
 | Use case                          | trnrand function     | Consumer              |
 |-----------------------------------|----------------------|-----------------------|
-| Noise injection (speech training) | `normal()`           | trnfft (Williamson)   |
+| Noise injection (speech training) | `normal()`           | trnfft                |
 | Stochastic trace estimation       | `normal()`, `sobol()`| trnsolver             |
 | Weight initialization             | `truncated_normal()` | trnfft/nn.py          |
-| Monte Carlo integration           | `sobol()`, `halton()`| trnblas (Janesko)     |
-| Hyperparameter sweeps             | `sobol()`            | Ephemeron ablation    |
+| Monte Carlo integration           | `sobol()`, `halton()`| trnblas (DF-MP2)      |
+| Hyperparameter sweeps             | `sobol()`            | Ablation studies      |
 | Data augmentation                 | `uniform()`, `bernoulli()` | General         |
 
 ## NKI strategy
