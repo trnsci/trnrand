@@ -15,6 +15,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `tests/test_nki_philox.py::TestPhiloxReference`. NKI kernel awaits
   on-hardware validation per #1 — the `TestPhiloxNKI` class is gated by
   the `neuron` marker.
+- Box-Muller transform on the Vector Engine for `normal()`, with a CPU
+  reference (`box_muller_cpu`) and CPU-side distributional tests
+  (`TestBoxMullerReference`). Vector Engine kernel awaits on-hardware
+  validation per #2.
 
 ## [0.1.0] - 2026-04-11
 

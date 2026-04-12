@@ -16,6 +16,8 @@ of random tensors, which can be significant for large Monte Carlo runs.
 
 from __future__ import annotations
 
+import math
+
 import torch
 
 try:
@@ -24,6 +26,8 @@ try:
     HAS_NKI = True
 except ImportError:
     HAS_NKI = False
+
+TWO_PI = 2.0 * math.pi
 
 _backend = "auto"
 
@@ -95,6 +99,30 @@ def philox4x32_reference(counter: torch.Tensor, key: torch.Tensor) -> torch.Tens
         k1 = (k1 + PHILOX_W1) & UINT32_MASK
 
     return torch.stack([c0, c1, c2, c3], dim=-1)
+
+
+def box_muller_cpu(uniforms: torch.Tensor) -> torch.Tensor:
+    """Box-Muller transform: pairs of uniforms → standard-normal pairs.
+
+    Same algorithm as the Vector Engine kernel — kept on CPU so the
+    `normal_nki` path can be tested for distributional correctness without
+    Trainium hardware.
+
+    Args:
+        uniforms: even-length 1-D tensor of U(0, 1) samples.
+
+    Returns:
+        Tensor of the same shape, holding standard-normal samples.
+    """
+    assert uniforms.numel() % 2 == 0, "Box-Muller needs pairs"
+    u = uniforms.view(-1, 2)
+    # Clamp u1 away from 0 to avoid log(0) = -inf.
+    u1 = torch.clamp(u[:, 0], min=1e-10)
+    u2 = u[:, 1]
+    r = torch.sqrt(-2.0 * torch.log(u1))
+    theta = TWO_PI * u2
+    z = torch.stack([r * torch.cos(theta), r * torch.sin(theta)], dim=-1)
+    return z.reshape(uniforms.shape)
 
 
 def philox_uniform_cpu(
@@ -169,3 +197,28 @@ if HAS_NKI:
         nl.store(out_ref[1::4], c1)
         nl.store(out_ref[2::4], c2)
         nl.store(out_ref[3::4], c3)
+
+    @nki.jit
+    def box_muller_kernel(uniforms_ref, out_ref):
+        """Box-Muller transform on the Vector Engine: U(0,1) pairs → N(0,1) pairs.
+
+        Pairs of uniform inputs (u1, u2) → (z1, z2) with
+            r = sqrt(-2 ln u1),  θ = 2π u2,
+            z1 = r cos θ,  z2 = r sin θ.
+
+        Chosen over Marsaglia polar because the Vector Engine has hardware
+        cos/sin/log/sqrt; Marsaglia's rejection step kills SIMD throughput.
+
+        Status: scaffolded but awaits on-hardware validation per #2.
+        Iterate after #1 (Philox kernel) lands cleanly on trn1.
+        """
+        u1 = nl.load(uniforms_ref[0::2])
+        u2 = nl.load(uniforms_ref[1::2])
+        # Clamp u1 away from 0 to avoid log(0) = -inf.
+        u1_safe = nl.maximum(u1, 1e-10)
+        r = nl.sqrt(nl.multiply(nl.log(u1_safe), -2.0))
+        theta = nl.multiply(u2, TWO_PI)
+        z1 = nl.multiply(r, nl.cos(theta))
+        z2 = nl.multiply(r, nl.sin(theta))
+        nl.store(out_ref[0::2], z1)
+        nl.store(out_ref[1::2], z2)

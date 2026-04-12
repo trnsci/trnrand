@@ -22,6 +22,7 @@ from trnrand.nki.dispatch import (
     PHILOX_W0,
     PHILOX_W1,
     UINT32_MASK,
+    box_muller_cpu,
     philox4x32_reference,
     philox_uniform_cpu,
 )
@@ -107,6 +108,29 @@ class TestPhiloxReference:
         assert torch.equal(full[1024:], tail)
 
 
+# ── Box-Muller CPU reference ──────────────────────────────────────────────────
+
+
+class TestBoxMullerReference:
+    def test_shape_preserved(self):
+        u = torch.empty(1024).uniform_()
+        z = box_muller_cpu(u)
+        assert z.shape == u.shape
+
+    def test_distribution(self):
+        # Feed 100k uniforms; output should be ~N(0, 1).
+        u = philox_uniform_cpu(100_000, seed=7)
+        z = box_muller_cpu(u)
+        assert abs(z.mean().item()) < 0.02
+        assert abs(z.std().item() - 1.0) < 0.02
+
+    def test_deterministic(self):
+        u = philox_uniform_cpu(2048, seed=123)
+        z1 = box_muller_cpu(u)
+        z2 = box_muller_cpu(u)
+        assert torch.equal(z1, z2)
+
+
 # ── NKI hardware: kernel matches CPU reference ────────────────────────────────
 
 
@@ -158,6 +182,25 @@ class TestPhiloxNKI:
         expected = philox4x32_reference(ctr_ref, key_ref).to(torch.int32).reshape(-1)
 
         assert torch.equal(out, expected)
+
+    def test_box_muller_kernel_matches_reference(self):
+        from trnrand.nki.dispatch import box_muller_kernel
+
+        u = philox_uniform_cpu(4096, seed=99).to(torch.float32)
+        out = torch.zeros_like(u)
+        box_muller_kernel(u, out)
+        expected = box_muller_cpu(u).to(torch.float32)
+        # Allow small tolerance for hardware cos/sin/log/sqrt vs CPU libm.
+        torch.testing.assert_close(out, expected, rtol=1e-4, atol=1e-4)
+
+    def test_box_muller_kernel_distribution(self):
+        from trnrand.nki.dispatch import box_muller_kernel
+
+        u = philox_uniform_cpu(100_000, seed=11).to(torch.float32)
+        out = torch.zeros_like(u)
+        box_muller_kernel(u, out)
+        assert abs(out.mean().item()) < 0.02
+        assert abs(out.std().item() - 1.0) < 0.02
 
     def test_kernel_distribution(self):
         # 100k uint32 outputs converted to floats should be ~U[0,1).

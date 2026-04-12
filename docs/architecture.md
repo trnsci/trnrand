@@ -42,12 +42,26 @@ The Philox 4×32 counter-based RNG maps cleanly to Trainium:
 Philox is preferred over Mersenne Twister precisely because it's stateless
 and trivially parallelizable. It's the same engine used by cuRAND and JAX.
 
+## Box-Muller for `normal()`
+
+The on-device normal path is a Box-Muller transform layered on the Philox
+uniform stream:
+
+- Pairs of uniforms `(u1, u2)` → standard-normal pairs `(z1, z2)` via
+  `r = √(-2 ln u1)`, `θ = 2π u2`, `z1 = r cos θ`, `z2 = r sin θ`.
+- Runs on the Vector Engine, which has hardware `cos`/`sin`/`log`/`sqrt`.
+- Box-Muller is preferred over Marsaglia polar here: Marsaglia avoids the
+  trig calls but uses rejection sampling, which serializes branch-divergent
+  lanes and kills SIMD throughput. Box-Muller has constant work per pair.
+
 ## Known gaps
 
-- **NKI Philox kernel is a stub.** All generation currently routes through
-  `torch.Generator`. The kernel scaffold lives in `trnrand/nki/dispatch.py`.
+- **NKI Philox kernel awaits on-hardware validation.** The CPU reference
+  (`philox4x32_reference`, `philox_uniform_cpu`) is the conformance oracle;
+  see `tests/test_nki_philox.py::TestPhiloxNKI`. Tracked as #1.
+- **Box-Muller kernel awaits on-hardware validation.** Tracked as #2; same
+  CPU-reference conformance pattern.
 - **Halton degrades above ~20 dimensions** — known algorithmic limitation.
   Sobol is preferred for `d > 10`.
-- **No on-device normal distribution yet.** A Box-Muller transform from
-  uniform samples (cos/sin/log/sqrt on the Vector Engine) is the path
-  forward.
+- **Quasi-random sequences are host-only.** NKI scrambling for Sobol/Halton
+  is a v0.3 follow-up.
