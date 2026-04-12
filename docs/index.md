@@ -6,8 +6,7 @@ Seeded pseudo-random distributions, low-discrepancy quasi-random sequences for
 quasi-Monte Carlo, and an on-device Philox RNG targeting the GpSimd engine —
 on-device generation avoids host→device transfer for large random tensors.
 
-Part of the **trn-\*** scientific computing suite by
-the trnsci project.
+Part of the trnsci scientific computing suite ([github.com/trnsci](https://github.com/trnsci)).
 
 ## Why
 
@@ -30,6 +29,6 @@ See [Architecture](architecture.md) for the Philox/GpSimd story.
 
 ## Related projects
 
-- [trnfft](https://github.com/scttfrdmn/trnfft) — FFT + complex ops for Trainium.
-- [trnblas](https://github.com/scttfrdmn/trnblas) — BLAS operations for Trainium.
+- [trnfft](https://github.com/trnsci/trnfft) — FFT + complex ops for Trainium.
+- [trnblas](https://github.com/trnsci/trnblas) — BLAS operations for Trainium.
 - `trnsolver` *(planned)* — Linear solvers and eigendecomposition.

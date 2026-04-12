@@ -1,7 +1,7 @@
 # trnrand
 
 Random number generation for AWS Trainium via NKI.
-Part of the trn-* scientific computing suite in the trnsci project.
+Part of the trnsci scientific computing suite.
 
 ## What This Is
 
@@ -86,9 +86,9 @@ python examples/mc_integration.py
 ## Naming Convention
 
 Sibling repos in the trn-* suite:
-- `trnfft` — FFT + complex ops (https://github.com/scttfrdmn/trnfft)
-- `trnblas` — BLAS operations (https://github.com/scttfrdmn/trnblas)
-- `trnsolver` — Linear solvers (https://github.com/scttfrdmn/trnsolver)
+- `trnfft` — FFT + complex ops (https://github.com/trnsci/trnfft)
+- `trnblas` — BLAS operations (https://github.com/trnsci/trnblas)
+- `trnsolver` — Linear solvers (https://github.com/trnsci/trnsolver)
 - `trnrand` — Random number generation (this repo)
 
 All repos: Python/NKI, Apache 2.0.

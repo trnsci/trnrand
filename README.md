@@ -10,7 +10,7 @@ Random number generation for AWS Trainium via NKI.
 
 Seeded pseudo-random distributions, quasi-random sequences for quasi-Monte Carlo, and on-device Philox RNG targeting the GpSimd engine.
 
-Part of the **trn-\*** scientific computing suite by [Playground Logic](https://playgroundlogic.co).
+Part of the trnsci scientific computing suite ([github.com/trnsci](https://github.com/trnsci)).
 
 ## Install
 
@@ -82,10 +82,10 @@ Compares pseudo-random vs Sobol quasi-random for estimating the volume of a 5-D 
 
 | Project | What |
 |---------|------|
-| [trnfft](https://github.com/scttfrdmn/trnfft) | FFT + complex ops |
-| [trnblas](https://github.com/scttfrdmn/trnblas) | BLAS operations |
-| [trnsolver](https://github.com/scttfrdmn/trnsolver) | Linear solvers |
+| [trnfft](https://github.com/trnsci/trnfft) | FFT + complex ops |
+| [trnblas](https://github.com/trnsci/trnblas) | BLAS operations |
+| [trnsolver](https://github.com/trnsci/trnsolver) | Linear solvers |
 
 ## License
 
-Apache 2.0 — Playground Logic LLC
+Apache 2.0 — Copyright 2026 Scott Friedman
