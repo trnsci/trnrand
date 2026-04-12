@@ -1,5 +1,11 @@
 # trnrand
 
+[![CI](https://github.com/scttfrdmn/trnrand/actions/workflows/ci.yml/badge.svg)](https://github.com/scttfrdmn/trnrand/actions/workflows/ci.yml)
+[![PyPI](https://img.shields.io/pypi/v/trnrand)](https://pypi.org/project/trnrand/)
+[![Python](https://img.shields.io/pypi/pyversions/trnrand)](https://pypi.org/project/trnrand/)
+[![License](https://img.shields.io/github/license/scttfrdmn/trnrand)](LICENSE)
+[![Docs](https://img.shields.io/badge/docs-mkdocs-blue)](https://scttfrdmn.github.io/trnrand/)
+
 Random number generation for AWS Trainium via NKI.
 
 Seeded pseudo-random distributions, quasi-random sequences for quasi-Monte Carlo, and on-device Philox RNG targeting the GpSimd engine.
