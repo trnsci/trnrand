@@ -23,7 +23,7 @@ by sibling repos (see `pyproject.toml`).
 ## From source
 
 ```bash
-git clone https://github.com/scttfrdmn/trnrand
+git clone https://github.com/trnsci/trnrand
 cd trnrand
 pip install -e ".[dev]"
 pytest tests/ -v

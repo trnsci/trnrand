@@ -42,10 +42,10 @@ dev = [
 ]
 
 [project.urls]
-Homepage = "https://github.com/scttfrdmn/trnrand"
-Documentation = "https://scttfrdmn.github.io/trnrand/"
-Repository = "https://github.com/scttfrdmn/trnrand"
-Issues = "https://github.com/scttfrdmn/trnrand/issues"
+Homepage = "https://github.com/trnsci/trnrand"
+Documentation = "https://trnsci.github.io/trnrand/"
+Repository = "https://github.com/trnsci/trnrand"
+Issues = "https://github.com/trnsci/trnrand/issues"
 
 [tool.setuptools.packages.find]
 include = ["trnrand*"]
