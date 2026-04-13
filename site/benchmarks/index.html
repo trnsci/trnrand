@@ -10,13 +10,13 @@
       
       
       
-        <link rel="canonical" href="https://trnsci.github.io/trnrand/quickstart/">
+        <link rel="canonical" href="https://trnsci.github.io/trnrand/benchmarks/">
       
       
-        <link rel="prev" href="../installation/">
+        <link rel="prev" href="../architecture/">
       
       
-        <link rel="next" href="../api/generator/">
+        <link rel="next" href="../aws_setup/">
       
       
       <link rel="icon" href="../assets/images/favicon.png">
@@ -24,7 +24,7 @@
     
     
       
-        <title>Quickstart - trnrand</title>
+        <title>Benchmarks - trnrand</title>
       
     
     
@@ -74,7 +74,7 @@
     <div data-md-component="skip">
       
         
-        <a href="#quickstart" class="md-skip">
+        <a href="#benchmarks" class="md-skip">
           Skip to content
         </a>
       
@@ -110,7 +110,7 @@
         <div class="md-header__topic" data-md-component="header-topic">
           <span class="md-ellipsis">
             
-              Quickstart
+              Benchmarks
             
           </span>
         </div>
@@ -271,32 +271,10 @@
       
   
   
-    
   
   
-  
-    <li class="md-nav__item md-nav__item--active">
-      
-      <input class="md-nav__toggle md-toggle" type="checkbox" id="__toc">
-      
-      
-        
-      
-      
-        <label class="md-nav__link md-nav__link--active" for="__toc">
-          
-  
-  
-  <span class="md-ellipsis">
-    Quickstart
-    
-  </span>
-  
-
-          <span class="md-nav__icon md-icon"></span>
-        </label>
-      
-      <a href="./" class="md-nav__link md-nav__link--active">
+    <li class="md-nav__item">
+      <a href="../quickstart/" class="md-nav__link">
         
   
   
@@ -307,44 +285,6 @@
   
 
       </a>
-      
-        
-
-<nav class="md-nav md-nav--secondary" aria-label="Table of contents">
-  
-  
-  
-    
-  
-  
-    <label class="md-nav__title" for="__toc">
-      <span class="md-nav__icon md-icon"></span>
-      Table of contents
-    </label>
-    <ul class="md-nav__list" data-md-component="toc" data-md-scrollfix>
-      
-        <li class="md-nav__item">
-  <a href="#backend-selection" class="md-nav__link">
-    <span class="md-ellipsis">
-      Backend selection
-    </span>
-  </a>
-  
-</li>
-      
-        <li class="md-nav__item">
-  <a href="#mc-vs-qmc-example" class="md-nav__link">
-    <span class="md-ellipsis">
-      MC vs QMC example
-    </span>
-  </a>
-  
-</li>
-      
-    </ul>
-  
-</nav>
-      
     </li>
   
 
@@ -517,10 +457,32 @@
       
   
   
+    
   
   
-    <li class="md-nav__item">
-      <a href="../benchmarks/" class="md-nav__link">
+  
+    <li class="md-nav__item md-nav__item--active">
+      
+      <input class="md-nav__toggle md-toggle" type="checkbox" id="__toc">
+      
+      
+        
+      
+      
+        <label class="md-nav__link md-nav__link--active" for="__toc">
+          
+  
+  
+  <span class="md-ellipsis">
+    Benchmarks
+    
+  </span>
+  
+
+          <span class="md-nav__icon md-icon"></span>
+        </label>
+      
+      <a href="./" class="md-nav__link md-nav__link--active">
         
   
   
@@ -531,6 +493,53 @@
   
 
       </a>
+      
+        
+
+<nav class="md-nav md-nav--secondary" aria-label="Table of contents">
+  
+  
+  
+    
+  
+  
+    <label class="md-nav__title" for="__toc">
+      <span class="md-nav__icon md-icon"></span>
+      Table of contents
+    </label>
+    <ul class="md-nav__list" data-md-component="toc" data-md-scrollfix>
+      
+        <li class="md-nav__item">
+  <a href="#methodology" class="md-nav__link">
+    <span class="md-ellipsis">
+      Methodology
+    </span>
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#caveats" class="md-nav__link">
+    <span class="md-ellipsis">
+      Caveats
+    </span>
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#results" class="md-nav__link">
+    <span class="md-ellipsis">
+      Results
+    </span>
+  </a>
+  
+</li>
+      
+    </ul>
+  
+</nav>
+      
     </li>
   
 
@@ -606,18 +615,27 @@
     <ul class="md-nav__list" data-md-component="toc" data-md-scrollfix>
       
         <li class="md-nav__item">
-  <a href="#backend-selection" class="md-nav__link">
+  <a href="#methodology" class="md-nav__link">
     <span class="md-ellipsis">
-      Backend selection
+      Methodology
     </span>
   </a>
   
 </li>
       
         <li class="md-nav__item">
-  <a href="#mc-vs-qmc-example" class="md-nav__link">
+  <a href="#caveats" class="md-nav__link">
     <span class="md-ellipsis">
-      MC vs QMC example
+      Caveats
+    </span>
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#results" class="md-nav__link">
+    <span class="md-ellipsis">
+      Results
     </span>
   </a>
   
@@ -642,39 +660,43 @@
   
 
 
-<h1 id="quickstart">Quickstart<a class="headerlink" href="#quickstart" title="Permanent link">&para;</a></h1>
-<div class="highlight"><pre><span></span><code><span class="kn">import</span><span class="w"> </span><span class="nn">trnrand</span>
+<h1 id="benchmarks">Benchmarks<a class="headerlink" href="#benchmarks" title="Permanent link">&para;</a></h1>
+<p>trnrand kernels measured against two baselines on the same Trainium instance:</p>
+<ol>
+<li><strong>NKI</strong> — trnrand with <code>set_backend("nki")</code> (Philox on GpSimd; Box-Muller
+   on Vector Engine for <code>normal()</code>).</li>
+<li><strong>trnrand-PyTorch</strong> — trnrand with <code>set_backend("pytorch")</code> running on
+   the host CPU (<code>torch.Generator</code> + <code>torch.empty(...).uniform_()</code> etc.).</li>
+<li><strong>torch.*</strong> — vanilla <code>torch.empty(n).uniform_(generator=g)</code> /
+   <code>torch.quasirandom.SobolEngine(...)</code> on the host CPU.</li>
+</ol>
+<p>The first comparison (1 vs 2) answers <em>"did the NKI Philox kernel actually
+help vs our own PyTorch fallback?"</em> — it uses the same trnrand call site
+on both sides; only the backend dispatch differs.</p>
+<p>The second comparison (1 vs 3) answers <em>"what's the user-visible
+difference between trnrand and reaching for raw torch?"</em></p>
+<h2 id="methodology">Methodology<a class="headerlink" href="#methodology" title="Permanent link">&para;</a></h2>
+<ul>
+<li><strong>Hardware</strong>: AWS <code>trn1.2xlarge</code> (1 NeuronCore-v2, 32 GB SBUF, AMD EPYC host CPU)</li>
+<li><strong>Image</strong>: Deep Learning AMI Neuron PyTorch 2.9 (Ubuntu 24.04)</li>
+<li><strong>Neuron SDK</strong>: <code>neuronxcc 2.24.5133.0</code></li>
+<li><strong>Tool</strong>: <a href="https://pytest-benchmark.readthedocs.io/">pytest-benchmark</a> with default settings (calibration + 5+ rounds, reports median)</li>
+<li><strong>NKI warmup</strong>: each NKI test does an explicit warmup call before the timed loop so kernel compilation cost is excluded from steady-state numbers</li>
+<li><strong>Reproduce</strong>: <code>AWS_PROFILE=aws ./scripts/run_benchmarks.sh</code></li>
+</ul>
+<h2 id="caveats">Caveats<a class="headerlink" href="#caveats" title="Permanent link">&para;</a></h2>
+<ul>
+<li><strong>Small sizes are dispatch-bound.</strong> NKI kernel invocation has fixed overhead. Below some per-op threshold the host CPU wins for RNG, where each call already amortizes to a few hundred nanoseconds per element.</li>
+<li><strong>Philox is integer-heavy.</strong> GpSimd does the multiply-XOR rounds; the Tensor Engine isn't useful here. Don't expect Tensor-Engine-class speedups — the win comes from avoiding host→device transfer of the random tensor.</li>
+<li><strong>Quasi-random is host-only today.</strong> Sobol/Halton/LHS run via <code>torch.quasirandom</code> on the host. NKI scrambling is a v0.3 follow-up.</li>
+<li><strong>FP32 throughout.</strong> BF16/FP16 paths are future work.</li>
+<li>Numbers vary 5-15% run-to-run; treat the table as approximate.</li>
+</ul>
+<h2 id="results">Results<a class="headerlink" href="#results" title="Permanent link">&para;</a></h2>
+<!-- BENCH_TABLE_START -->
 
-<span class="c1"># Seeded, reproducible generation</span>
-<span class="n">g</span> <span class="o">=</span> <span class="n">trnrand</span><span class="o">.</span><span class="n">Generator</span><span class="p">(</span><span class="n">seed</span><span class="o">=</span><span class="mi">42</span><span class="p">)</span>
-
-<span class="c1"># Standard distributions</span>
-<span class="n">x</span> <span class="o">=</span> <span class="n">trnrand</span><span class="o">.</span><span class="n">normal</span><span class="p">(</span><span class="mi">1000</span><span class="p">,</span> <span class="n">mean</span><span class="o">=</span><span class="mf">0.0</span><span class="p">,</span> <span class="n">std</span><span class="o">=</span><span class="mf">1.0</span><span class="p">,</span> <span class="n">generator</span><span class="o">=</span><span class="n">g</span><span class="p">)</span>
-<span class="n">u</span> <span class="o">=</span> <span class="n">trnrand</span><span class="o">.</span><span class="n">uniform</span><span class="p">(</span><span class="mi">1000</span><span class="p">,</span> <span class="n">low</span><span class="o">=-</span><span class="mf">1.0</span><span class="p">,</span> <span class="n">high</span><span class="o">=</span><span class="mf">1.0</span><span class="p">,</span> <span class="n">generator</span><span class="o">=</span><span class="n">g</span><span class="p">)</span>
-<span class="n">e</span> <span class="o">=</span> <span class="n">trnrand</span><span class="o">.</span><span class="n">exponential</span><span class="p">(</span><span class="mi">1000</span><span class="p">,</span> <span class="n">rate</span><span class="o">=</span><span class="mf">2.0</span><span class="p">,</span> <span class="n">generator</span><span class="o">=</span><span class="n">g</span><span class="p">)</span>
-<span class="n">b</span> <span class="o">=</span> <span class="n">trnrand</span><span class="o">.</span><span class="n">bernoulli</span><span class="p">(</span><span class="mi">1000</span><span class="p">,</span> <span class="n">p</span><span class="o">=</span><span class="mf">0.3</span><span class="p">,</span> <span class="n">generator</span><span class="o">=</span><span class="n">g</span><span class="p">)</span>
-
-<span class="c1"># Quasi-random sequences (better convergence for MC integration)</span>
-<span class="n">sobol_pts</span> <span class="o">=</span> <span class="n">trnrand</span><span class="o">.</span><span class="n">sobol</span><span class="p">(</span><span class="mi">1024</span><span class="p">,</span> <span class="n">n_dims</span><span class="o">=</span><span class="mi">5</span><span class="p">,</span> <span class="n">seed</span><span class="o">=</span><span class="mi">42</span><span class="p">)</span>
-<span class="n">halton_pts</span> <span class="o">=</span> <span class="n">trnrand</span><span class="o">.</span><span class="n">halton</span><span class="p">(</span><span class="mi">1024</span><span class="p">,</span> <span class="n">n_dims</span><span class="o">=</span><span class="mi">3</span><span class="p">)</span>
-<span class="n">lhs_pts</span> <span class="o">=</span> <span class="n">trnrand</span><span class="o">.</span><span class="n">latin_hypercube</span><span class="p">(</span><span class="mi">100</span><span class="p">,</span> <span class="n">n_dims</span><span class="o">=</span><span class="mi">4</span><span class="p">)</span>
-
-<span class="c1"># Module-level seeding</span>
-<span class="n">trnrand</span><span class="o">.</span><span class="n">manual_seed</span><span class="p">(</span><span class="mi">42</span><span class="p">)</span>
-<span class="n">x</span> <span class="o">=</span> <span class="n">trnrand</span><span class="o">.</span><span class="n">standard_normal</span><span class="p">(</span><span class="mi">256</span><span class="p">)</span>
-</code></pre></div>
-<h2 id="backend-selection">Backend selection<a class="headerlink" href="#backend-selection" title="Permanent link">&para;</a></h2>
-<div class="highlight"><pre><span></span><code><span class="kn">import</span><span class="w"> </span><span class="nn">trnrand</span>
-
-<span class="n">trnrand</span><span class="o">.</span><span class="n">set_backend</span><span class="p">(</span><span class="s2">&quot;auto&quot;</span><span class="p">)</span>     <span class="c1"># NKI on Trainium, PyTorch elsewhere (default)</span>
-<span class="n">trnrand</span><span class="o">.</span><span class="n">set_backend</span><span class="p">(</span><span class="s2">&quot;pytorch&quot;</span><span class="p">)</span>  <span class="c1"># force PyTorch</span>
-<span class="n">trnrand</span><span class="o">.</span><span class="n">set_backend</span><span class="p">(</span><span class="s2">&quot;nki&quot;</span><span class="p">)</span>      <span class="c1"># force NKI (requires Neuron hardware)</span>
-</code></pre></div>
-<h2 id="mc-vs-qmc-example">MC vs QMC example<a class="headerlink" href="#mc-vs-qmc-example" title="Permanent link">&para;</a></h2>
-<div class="highlight"><pre><span></span><code>python<span class="w"> </span>examples/mc_integration.py
-</code></pre></div>
-<p>Compares pseudo-random vs Sobol quasi-random for estimating the volume of a
-5-D hypersphere. QMC converges O(1/N) vs O(1/√N).</p>
+<p><em>Pending first run on trn1.2xlarge — see issue #3.</em></p>
+<!-- BENCH_TABLE_END -->
 
 
 

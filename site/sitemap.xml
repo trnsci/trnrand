@@ -1,39 +1,47 @@
 <?xml version="1.0" encoding="UTF-8"?>
 <urlset xmlns="http://www.sitemaps.org/schemas/sitemap/0.9">
     <url>
-         <loc>https://scttfrdmn.github.io/trnrand/</loc>
+         <loc>https://trnsci.github.io/trnrand/</loc>
          <lastmod>2026-04-12</lastmod>
     </url>
     <url>
-         <loc>https://scttfrdmn.github.io/trnrand/architecture/</loc>
+         <loc>https://trnsci.github.io/trnrand/architecture/</loc>
          <lastmod>2026-04-12</lastmod>
     </url>
     <url>
-         <loc>https://scttfrdmn.github.io/trnrand/aws_setup/</loc>
+         <loc>https://trnsci.github.io/trnrand/aws_setup/</loc>
          <lastmod>2026-04-12</lastmod>
     </url>
     <url>
-         <loc>https://scttfrdmn.github.io/trnrand/installation/</loc>
+         <loc>https://trnsci.github.io/trnrand/benchmarks/</loc>
          <lastmod>2026-04-12</lastmod>
     </url>
     <url>
-         <loc>https://scttfrdmn.github.io/trnrand/quickstart/</loc>
+         <loc>https://trnsci.github.io/trnrand/installation/</loc>
          <lastmod>2026-04-12</lastmod>
     </url>
     <url>
-         <loc>https://scttfrdmn.github.io/trnrand/api/distributions/</loc>
+         <loc>https://trnsci.github.io/trnrand/quickstart/</loc>
          <lastmod>2026-04-12</lastmod>
     </url>
     <url>
-         <loc>https://scttfrdmn.github.io/trnrand/api/generator/</loc>
+         <loc>https://trnsci.github.io/trnrand/release/</loc>
          <lastmod>2026-04-12</lastmod>
     </url>
     <url>
-         <loc>https://scttfrdmn.github.io/trnrand/api/nki/</loc>
+         <loc>https://trnsci.github.io/trnrand/api/distributions/</loc>
          <lastmod>2026-04-12</lastmod>
     </url>
     <url>
-         <loc>https://scttfrdmn.github.io/trnrand/api/quasi/</loc>
+         <loc>https://trnsci.github.io/trnrand/api/generator/</loc>
+         <lastmod>2026-04-12</lastmod>
+    </url>
+    <url>
+         <loc>https://trnsci.github.io/trnrand/api/nki/</loc>
+         <lastmod>2026-04-12</lastmod>
+    </url>
+    <url>
+         <loc>https://trnsci.github.io/trnrand/api/quasi/</loc>
          <lastmod>2026-04-12</lastmod>
     </url>
 </urlset>

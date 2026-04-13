@@ -10,13 +10,11 @@
       
       
       
-        <link rel="canonical" href="https://trnsci.github.io/trnrand/quickstart/">
+        <link rel="canonical" href="https://trnsci.github.io/trnrand/release/">
       
       
-        <link rel="prev" href="../installation/">
+        <link rel="prev" href="../aws_setup/">
       
-      
-        <link rel="next" href="../api/generator/">
       
       
       <link rel="icon" href="../assets/images/favicon.png">
@@ -24,7 +22,7 @@
     
     
       
-        <title>Quickstart - trnrand</title>
+        <title>Release procedure - trnrand</title>
       
     
     
@@ -74,7 +72,7 @@
     <div data-md-component="skip">
       
         
-        <a href="#quickstart" class="md-skip">
+        <a href="#release-procedure" class="md-skip">
           Skip to content
         </a>
       
@@ -110,7 +108,7 @@
         <div class="md-header__topic" data-md-component="header-topic">
           <span class="md-ellipsis">
             
-              Quickstart
+              Release procedure
             
           </span>
         </div>
@@ -271,32 +269,10 @@
       
   
   
-    
   
   
-  
-    <li class="md-nav__item md-nav__item--active">
-      
-      <input class="md-nav__toggle md-toggle" type="checkbox" id="__toc">
-      
-      
-        
-      
-      
-        <label class="md-nav__link md-nav__link--active" for="__toc">
-          
-  
-  
-  <span class="md-ellipsis">
-    Quickstart
-    
-  </span>
-  
-
-          <span class="md-nav__icon md-icon"></span>
-        </label>
-      
-      <a href="./" class="md-nav__link md-nav__link--active">
+    <li class="md-nav__item">
+      <a href="../quickstart/" class="md-nav__link">
         
   
   
@@ -307,44 +283,6 @@
   
 
       </a>
-      
-        
-
-<nav class="md-nav md-nav--secondary" aria-label="Table of contents">
-  
-  
-  
-    
-  
-  
-    <label class="md-nav__title" for="__toc">
-      <span class="md-nav__icon md-icon"></span>
-      Table of contents
-    </label>
-    <ul class="md-nav__list" data-md-component="toc" data-md-scrollfix>
-      
-        <li class="md-nav__item">
-  <a href="#backend-selection" class="md-nav__link">
-    <span class="md-ellipsis">
-      Backend selection
-    </span>
-  </a>
-  
-</li>
-      
-        <li class="md-nav__item">
-  <a href="#mc-vs-qmc-example" class="md-nav__link">
-    <span class="md-ellipsis">
-      MC vs QMC example
-    </span>
-  </a>
-  
-</li>
-      
-    </ul>
-  
-</nav>
-      
     </li>
   
 
@@ -561,10 +499,32 @@
       
   
   
+    
   
   
-    <li class="md-nav__item">
-      <a href="../release/" class="md-nav__link">
+  
+    <li class="md-nav__item md-nav__item--active">
+      
+      <input class="md-nav__toggle md-toggle" type="checkbox" id="__toc">
+      
+      
+        
+      
+      
+        <label class="md-nav__link md-nav__link--active" for="__toc">
+          
+  
+  
+  <span class="md-ellipsis">
+    Release procedure
+    
+  </span>
+  
+
+          <span class="md-nav__icon md-icon"></span>
+        </label>
+      
+      <a href="./" class="md-nav__link md-nav__link--active">
         
   
   
@@ -575,6 +535,62 @@
   
 
       </a>
+      
+        
+
+<nav class="md-nav md-nav--secondary" aria-label="Table of contents">
+  
+  
+  
+    
+  
+  
+    <label class="md-nav__title" for="__toc">
+      <span class="md-nav__icon md-icon"></span>
+      Table of contents
+    </label>
+    <ul class="md-nav__list" data-md-component="toc" data-md-scrollfix>
+      
+        <li class="md-nav__item">
+  <a href="#one-time-setup" class="md-nav__link">
+    <span class="md-ellipsis">
+      One-time setup
+    </span>
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#cutting-a-release" class="md-nav__link">
+    <span class="md-ellipsis">
+      Cutting a release
+    </span>
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#pre-release-smoke-test" class="md-nav__link">
+    <span class="md-ellipsis">
+      Pre-release smoke test
+    </span>
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#rollback" class="md-nav__link">
+    <span class="md-ellipsis">
+      Rollback
+    </span>
+  </a>
+  
+</li>
+      
+    </ul>
+  
+</nav>
+      
     </li>
   
 
@@ -606,18 +622,36 @@
     <ul class="md-nav__list" data-md-component="toc" data-md-scrollfix>
       
         <li class="md-nav__item">
-  <a href="#backend-selection" class="md-nav__link">
+  <a href="#one-time-setup" class="md-nav__link">
     <span class="md-ellipsis">
-      Backend selection
+      One-time setup
     </span>
   </a>
   
 </li>
       
         <li class="md-nav__item">
-  <a href="#mc-vs-qmc-example" class="md-nav__link">
+  <a href="#cutting-a-release" class="md-nav__link">
     <span class="md-ellipsis">
-      MC vs QMC example
+      Cutting a release
+    </span>
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#pre-release-smoke-test" class="md-nav__link">
+    <span class="md-ellipsis">
+      Pre-release smoke test
+    </span>
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#rollback" class="md-nav__link">
+    <span class="md-ellipsis">
+      Rollback
     </span>
   </a>
   
@@ -642,39 +676,62 @@
   
 
 
-<h1 id="quickstart">Quickstart<a class="headerlink" href="#quickstart" title="Permanent link">&para;</a></h1>
-<div class="highlight"><pre><span></span><code><span class="kn">import</span><span class="w"> </span><span class="nn">trnrand</span>
-
-<span class="c1"># Seeded, reproducible generation</span>
-<span class="n">g</span> <span class="o">=</span> <span class="n">trnrand</span><span class="o">.</span><span class="n">Generator</span><span class="p">(</span><span class="n">seed</span><span class="o">=</span><span class="mi">42</span><span class="p">)</span>
-
-<span class="c1"># Standard distributions</span>
-<span class="n">x</span> <span class="o">=</span> <span class="n">trnrand</span><span class="o">.</span><span class="n">normal</span><span class="p">(</span><span class="mi">1000</span><span class="p">,</span> <span class="n">mean</span><span class="o">=</span><span class="mf">0.0</span><span class="p">,</span> <span class="n">std</span><span class="o">=</span><span class="mf">1.0</span><span class="p">,</span> <span class="n">generator</span><span class="o">=</span><span class="n">g</span><span class="p">)</span>
-<span class="n">u</span> <span class="o">=</span> <span class="n">trnrand</span><span class="o">.</span><span class="n">uniform</span><span class="p">(</span><span class="mi">1000</span><span class="p">,</span> <span class="n">low</span><span class="o">=-</span><span class="mf">1.0</span><span class="p">,</span> <span class="n">high</span><span class="o">=</span><span class="mf">1.0</span><span class="p">,</span> <span class="n">generator</span><span class="o">=</span><span class="n">g</span><span class="p">)</span>
-<span class="n">e</span> <span class="o">=</span> <span class="n">trnrand</span><span class="o">.</span><span class="n">exponential</span><span class="p">(</span><span class="mi">1000</span><span class="p">,</span> <span class="n">rate</span><span class="o">=</span><span class="mf">2.0</span><span class="p">,</span> <span class="n">generator</span><span class="o">=</span><span class="n">g</span><span class="p">)</span>
-<span class="n">b</span> <span class="o">=</span> <span class="n">trnrand</span><span class="o">.</span><span class="n">bernoulli</span><span class="p">(</span><span class="mi">1000</span><span class="p">,</span> <span class="n">p</span><span class="o">=</span><span class="mf">0.3</span><span class="p">,</span> <span class="n">generator</span><span class="o">=</span><span class="n">g</span><span class="p">)</span>
-
-<span class="c1"># Quasi-random sequences (better convergence for MC integration)</span>
-<span class="n">sobol_pts</span> <span class="o">=</span> <span class="n">trnrand</span><span class="o">.</span><span class="n">sobol</span><span class="p">(</span><span class="mi">1024</span><span class="p">,</span> <span class="n">n_dims</span><span class="o">=</span><span class="mi">5</span><span class="p">,</span> <span class="n">seed</span><span class="o">=</span><span class="mi">42</span><span class="p">)</span>
-<span class="n">halton_pts</span> <span class="o">=</span> <span class="n">trnrand</span><span class="o">.</span><span class="n">halton</span><span class="p">(</span><span class="mi">1024</span><span class="p">,</span> <span class="n">n_dims</span><span class="o">=</span><span class="mi">3</span><span class="p">)</span>
-<span class="n">lhs_pts</span> <span class="o">=</span> <span class="n">trnrand</span><span class="o">.</span><span class="n">latin_hypercube</span><span class="p">(</span><span class="mi">100</span><span class="p">,</span> <span class="n">n_dims</span><span class="o">=</span><span class="mi">4</span><span class="p">)</span>
-
-<span class="c1"># Module-level seeding</span>
-<span class="n">trnrand</span><span class="o">.</span><span class="n">manual_seed</span><span class="p">(</span><span class="mi">42</span><span class="p">)</span>
-<span class="n">x</span> <span class="o">=</span> <span class="n">trnrand</span><span class="o">.</span><span class="n">standard_normal</span><span class="p">(</span><span class="mi">256</span><span class="p">)</span>
+<h1 id="release-procedure">Release procedure<a class="headerlink" href="#release-procedure" title="Permanent link">&para;</a></h1>
+<p>trnrand publishes to PyPI via the GitHub Actions <code>publish.yml</code> workflow,
+using PyPI <a href="https://docs.pypi.org/trusted-publishers/">trusted publishers</a>
+(OIDC) — no API tokens stored anywhere. Pre-releases (tags containing <code>-</code>,
+e.g. <code>v0.2.0-rc1</code>) go to TestPyPI; stable tags go to PyPI.</p>
+<h2 id="one-time-setup">One-time setup<a class="headerlink" href="#one-time-setup" title="Permanent link">&para;</a></h2>
+<ol>
+<li><strong>Reserve the PyPI name.</strong> Register <code>trnrand</code> on
+   <a href="https://pypi.org/">PyPI</a> and <a href="https://test.pypi.org/">TestPyPI</a> by
+   creating a placeholder release manually, or by configuring the trusted
+   publisher first and letting the first OIDC publish create the project.</li>
+<li><strong>Configure trusted publisher</strong> — for both PyPI and TestPyPI:</li>
+<li>Go to <code>Account → Publishing → Add a new pending publisher</code>.</li>
+<li>Owner: <code>scttfrdmn</code>, repository: <code>trnrand</code>, workflow: <code>publish.yml</code>,
+     environment: <code>pypi</code> (PyPI) or <code>testpypi</code> (TestPyPI).</li>
+<li><strong>Confirm the GitHub environments exist.</strong> In the repo settings under
+   <code>Environments</code>, ensure <code>pypi</code> and <code>testpypi</code> are present (the workflow
+   references them via <code>environment.name</code>).</li>
+</ol>
+<h2 id="cutting-a-release">Cutting a release<a class="headerlink" href="#cutting-a-release" title="Permanent link">&para;</a></h2>
+<ol>
+<li><strong>Bump version</strong> in <code>pyproject.toml</code> and add a CHANGELOG section under
+   <code>## [Unreleased]</code> → move it to <code>## [X.Y.Z] - YYYY-MM-DD</code>.</li>
+<li><strong>Commit</strong> the bump on <code>main</code> (or via PR).</li>
+<li><strong>Tag and create a GitHub release</strong>:
+   <div class="highlight"><pre><span></span><code>git<span class="w"> </span>tag<span class="w"> </span>vX.Y.Z
+git<span class="w"> </span>push<span class="w"> </span>origin<span class="w"> </span>vX.Y.Z
+gh<span class="w"> </span>release<span class="w"> </span>create<span class="w"> </span>vX.Y.Z<span class="w"> </span>--generate-notes
 </code></pre></div>
-<h2 id="backend-selection">Backend selection<a class="headerlink" href="#backend-selection" title="Permanent link">&para;</a></h2>
-<div class="highlight"><pre><span></span><code><span class="kn">import</span><span class="w"> </span><span class="nn">trnrand</span>
+   For a release candidate, use <code>vX.Y.Z-rc1</code> — the workflow routes that to
+   TestPyPI.</li>
+<li><strong>Verify</strong> the workflow run on the Actions tab. PyPI/TestPyPI shows the
+   new version within a minute or two.</li>
+</ol>
+<h2 id="pre-release-smoke-test">Pre-release smoke test<a class="headerlink" href="#pre-release-smoke-test" title="Permanent link">&para;</a></h2>
+<p>Before cutting a stable release, do a TestPyPI dry-run:</p>
+<div class="highlight"><pre><span></span><code>git<span class="w"> </span>tag<span class="w"> </span>v0.1.0-rc1
+git<span class="w"> </span>push<span class="w"> </span>origin<span class="w"> </span>v0.1.0-rc1
+gh<span class="w"> </span>release<span class="w"> </span>create<span class="w"> </span>v0.1.0-rc1<span class="w"> </span>--prerelease<span class="w"> </span>--generate-notes
 
-<span class="n">trnrand</span><span class="o">.</span><span class="n">set_backend</span><span class="p">(</span><span class="s2">&quot;auto&quot;</span><span class="p">)</span>     <span class="c1"># NKI on Trainium, PyTorch elsewhere (default)</span>
-<span class="n">trnrand</span><span class="o">.</span><span class="n">set_backend</span><span class="p">(</span><span class="s2">&quot;pytorch&quot;</span><span class="p">)</span>  <span class="c1"># force PyTorch</span>
-<span class="n">trnrand</span><span class="o">.</span><span class="n">set_backend</span><span class="p">(</span><span class="s2">&quot;nki&quot;</span><span class="p">)</span>      <span class="c1"># force NKI (requires Neuron hardware)</span>
+<span class="c1"># After the workflow lands, verify the install works from TestPyPI:</span>
+pip<span class="w"> </span>install<span class="w"> </span>--index-url<span class="w"> </span>https://test.pypi.org/simple/<span class="w"> </span><span class="se">\</span>
+<span class="w">            </span>--extra-index-url<span class="w"> </span>https://pypi.org/simple/<span class="w"> </span><span class="se">\</span>
+<span class="w">            </span><span class="nv">trnrand</span><span class="o">==</span><span class="m">0</span>.1.0rc1
+python<span class="w"> </span>-c<span class="w"> </span><span class="s2">&quot;import trnrand; print(trnrand.__version__)&quot;</span>
 </code></pre></div>
-<h2 id="mc-vs-qmc-example">MC vs QMC example<a class="headerlink" href="#mc-vs-qmc-example" title="Permanent link">&para;</a></h2>
-<div class="highlight"><pre><span></span><code>python<span class="w"> </span>examples/mc_integration.py
+<h2 id="rollback">Rollback<a class="headerlink" href="#rollback" title="Permanent link">&para;</a></h2>
+<p>PyPI does not allow re-uploading the same version. If a release is broken,
+yank it (<code>pip</code> will refuse to install yanked versions but they remain
+installable when explicitly pinned for reproducibility) and cut a new
+patch version:</p>
+<div class="highlight"><pre><span></span><code><span class="c1"># from your PyPI account UI: yank the broken version</span>
+git<span class="w"> </span>tag<span class="w"> </span>vX.Y.<span class="o">(</span>Z+1<span class="o">)</span>
+git<span class="w"> </span>push<span class="w"> </span>origin<span class="w"> </span>vX.Y.<span class="o">(</span>Z+1<span class="o">)</span>
+gh<span class="w"> </span>release<span class="w"> </span>create<span class="w"> </span>vX.Y.<span class="o">(</span>Z+1<span class="o">)</span><span class="w"> </span>--generate-notes
 </code></pre></div>
-<p>Compares pseudo-random vs Sobol quasi-random for estimating the volume of a
-5-D hypersphere. QMC converges O(1/N) vs O(1/√N).</p>
 
 
 
