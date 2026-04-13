@@ -10,7 +10,7 @@ readme = "README.md"
 license = "Apache-2.0"
 requires-python = ">=3.10"
 authors = [
-    { name = "Scott Friedman", email = "3011922+scttfrdmn@users.noreply.github.com" },
+    { name = "Scott Friedman", email = "scttfrdmn@gmail.com" },
 ]
 classifiers = [
     "Development Status :: 3 - Alpha",
@@ -43,7 +43,7 @@ dev = [
 
 [project.urls]
 Homepage = "https://github.com/trnsci/trnrand"
-Documentation = "https://trnsci.github.io/trnrand/"
+Documentation = "https://trnsci.dev/trnrand/"
 Repository = "https://github.com/trnsci/trnrand"
 Issues = "https://github.com/trnsci/trnrand/issues"
 
