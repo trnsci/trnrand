@@ -179,15 +179,14 @@ class TestPhiloxNKI:
     """
 
     def test_kernel_matches_reference_zero_key(self):
-        from trnrand.nki.dispatch import philox4x32_kernel
+        from trnrand.nki.dispatch import philox4x32_nki
 
         n_lanes = 128
         counter_lo = torch.arange(n_lanes, dtype=torch.int32)
         key_lo = torch.zeros(n_lanes, dtype=torch.int32)
         key_hi = torch.zeros(n_lanes, dtype=torch.int32)
-        out = torch.zeros(n_lanes * 4, dtype=torch.int32)
 
-        philox4x32_kernel(counter_lo, key_lo, key_hi, out)
+        out = philox4x32_nki(counter_lo, key_lo, key_hi)
 
         # Reference: same lanes, same 4-word counter (counter_lo, 0, 0, 0).
         ctr_ref = torch.zeros(n_lanes, 4, dtype=torch.int64)
@@ -198,15 +197,14 @@ class TestPhiloxNKI:
         assert torch.equal(out, expected)
 
     def test_kernel_with_nonzero_key(self):
-        from trnrand.nki.dispatch import philox4x32_kernel
+        from trnrand.nki.dispatch import philox4x32_nki
 
         n_lanes = 128
         counter_lo = torch.arange(n_lanes, dtype=torch.int32)
         key_lo = torch.full((n_lanes,), 0x12345678 & 0x7FFFFFFF, dtype=torch.int32)
         key_hi = torch.full((n_lanes,), 0x9ABCDEF0 & 0x7FFFFFFF, dtype=torch.int32)
-        out = torch.zeros(n_lanes * 4, dtype=torch.int32)
 
-        philox4x32_kernel(counter_lo, key_lo, key_hi, out)
+        out = philox4x32_nki(counter_lo, key_lo, key_hi)
 
         ctr_ref = torch.zeros(n_lanes, 4, dtype=torch.int64)
         ctr_ref[:, 0] = counter_lo.to(torch.int64)
@@ -218,35 +216,32 @@ class TestPhiloxNKI:
         assert torch.equal(out, expected)
 
     def test_box_muller_kernel_matches_reference(self):
-        from trnrand.nki.dispatch import box_muller_kernel
+        from trnrand.nki.dispatch import box_muller_nki
 
         u = philox_uniform_cpu(4096, seed=99).to(torch.float32)
-        out = torch.zeros_like(u)
-        box_muller_kernel(u, out)
+        out = box_muller_nki(u)
         expected = box_muller_cpu(u).to(torch.float32)
         # Allow small tolerance for hardware cos/sin/log/sqrt vs CPU libm.
         torch.testing.assert_close(out, expected, rtol=1e-4, atol=1e-4)
 
     def test_box_muller_kernel_distribution(self):
-        from trnrand.nki.dispatch import box_muller_kernel
+        from trnrand.nki.dispatch import box_muller_nki
 
         u = philox_uniform_cpu(100_000, seed=11).to(torch.float32)
-        out = torch.zeros_like(u)
-        box_muller_kernel(u, out)
+        out = box_muller_nki(u)
         assert abs(out.mean().item()) < 0.02
         assert abs(out.std().item() - 1.0) < 0.02
 
     def test_kernel_distribution(self):
         # 100k uint32 outputs converted to floats should be ~U[0,1).
-        from trnrand.nki.dispatch import philox4x32_kernel
+        from trnrand.nki.dispatch import philox4x32_nki
 
         n_lanes = 25_000  # 4 outputs per lane → 100k samples
         counter_lo = torch.arange(n_lanes, dtype=torch.int32)
         key_lo = torch.zeros(n_lanes, dtype=torch.int32)
         key_hi = torch.zeros(n_lanes, dtype=torch.int32)
-        out = torch.zeros(n_lanes * 4, dtype=torch.int32)
 
-        philox4x32_kernel(counter_lo, key_lo, key_hi, out)
+        out = philox4x32_nki(counter_lo, key_lo, key_hi)
 
         u = (out.to(torch.int64) & UINT32_MASK).to(torch.float64) / 2**32
         assert abs(u.mean().item() - 0.5) < 0.005

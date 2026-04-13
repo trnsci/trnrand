@@ -17,6 +17,8 @@ of random tensors, which can be significant for large Monte Carlo runs.
 from __future__ import annotations
 
 import math
+import os
+import warnings
 
 import torch
 
@@ -27,6 +29,40 @@ try:
     HAS_NKI = True
 except ImportError:
     HAS_NKI = False
+
+# When set, kernel-path failures re-raise instead of falling back to the
+# PyTorch reference path. Used by the validation suite to catch silent
+# kernel breakage during iteration — mirrors TRNBLAS_REQUIRE_NKI etc.
+_REQUIRE_NKI = os.environ.get("TRNRAND_REQUIRE_NKI", "").lower() in ("1", "true", "yes")
+
+
+class NkiFallbackWarning(UserWarning):
+    """Emitted when an NKI kernel path fails and we fall back to PyTorch."""
+
+
+def _warn_fallback(exc: Exception) -> None:
+    warnings.warn(
+        f"NKI path failed ({type(exc).__name__}: {exc}); falling back to PyTorch. "
+        "Set TRNRAND_REQUIRE_NKI=1 to re-raise instead.",
+        NkiFallbackWarning,
+        stacklevel=3,
+    )
+
+
+def _to_xla(*tensors):
+    """Move tensors to the XLA device for NKI kernel dispatch.
+
+    Importantly, importing `torch_xla` here also fully registers
+    `torch_neuronx` in `sys.modules` — without that,
+    `neuronxcc.nki._torch_xla` raises `KeyError: 'torch_neuronx'` on the
+    first kernel call.
+    """
+    import torch_xla.core.xla_model as xm
+
+    device = xm.xla_device()
+    orig = tensors[0].device
+    return [t.to(device) for t in tensors], orig
+
 
 TWO_PI = 2.0 * math.pi
 
@@ -223,3 +259,46 @@ if HAS_NKI:
         z2 = nl.multiply(r, nl.sin(theta))
         nl.store(out_ref[0::2], z1)
         nl.store(out_ref[1::2], z2)
+
+    def philox4x32_nki(
+        counter_lo: torch.Tensor,
+        key_lo: torch.Tensor,
+        key_hi: torch.Tensor,
+    ) -> torch.Tensor:
+        """Host-side wrapper for the Philox NKI kernel.
+
+        Moves inputs to the XLA device (which also imports torch_xla,
+        populating `sys.modules['torch_neuronx']` before the kernel
+        invocation), allocates the output buffer on-device, calls the
+        kernel, and copies the result back.
+
+        Args:
+            counter_lo: int32 per-lane counter increment, shape `(lanes,)`.
+            key_lo:     int32 key low word, shape `(lanes,)`.
+            key_hi:     int32 key high word, shape `(lanes,)`.
+
+        Returns:
+            int32 tensor of shape `(lanes * 4,)` holding the Philox output.
+        """
+        n_lanes = counter_lo.shape[0]
+        (cl, kl, kh), orig = _to_xla(
+            counter_lo.to(torch.int32).contiguous(),
+            key_lo.to(torch.int32).contiguous(),
+            key_hi.to(torch.int32).contiguous(),
+        )
+        out = torch.zeros(n_lanes * 4, dtype=torch.int32, device=cl.device)
+        philox4x32_kernel(cl, kl, kh, out)
+        return out.to(orig)
+
+    def box_muller_nki(uniforms: torch.Tensor) -> torch.Tensor:
+        """Host-side wrapper for the Box-Muller NKI kernel.
+
+        Moves the input to the XLA device, calls the kernel, and copies
+        the result back. Expects an even-length float32 tensor of
+        uniforms; returns same-shape float32 normals.
+        """
+        assert uniforms.numel() % 2 == 0, "Box-Muller needs pairs"
+        (u,), orig = _to_xla(uniforms.to(torch.float32).contiguous())
+        out = torch.zeros_like(u)
+        box_muller_kernel(u, out)
+        return out.to(orig)
