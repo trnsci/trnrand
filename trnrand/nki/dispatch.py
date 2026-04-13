@@ -191,23 +191,17 @@ def philox_uniform_cpu(
 if HAS_NKI:
 
     @nki.jit
-    def philox4x32_kernel(counter_lo_ref, key_lo_ref, key_hi_ref, out_ref):
-        """Philox 4×32-10 NKI kernel running on GpSimd.
+    def philox4x32_kernel(counter_lo_ref, key_lo_ref, key_hi_ref):
+        """Philox 4×32-10 NKI kernel on GpSimd.
 
-        Each lane processes one independent Philox stream:
-        - `counter_lo` (per-lane) is the 32-bit counter increment; the
-          remaining counter words start at zero. This is enough to give
-          each tile a disjoint 2^96-element stream.
-        - `key_lo`, `key_hi` are the two key words (broadcast across lanes).
+        Each of the P partition-axis lanes runs one independent Philox
+        stream. Input shape is `(P, 1)` per @nki.jit / NKI convention
+        (partition, free). Output is `(P, 4)` — one int32 per round-output
+        word per lane. The wrapper flattens to `(P*4,)` interleaved.
 
-        Output: 4 uint32 words per lane, written contiguously to out_ref.
-
-        Status: scaffolded against the Philox 4×32-10 spec but not yet
-        validated on trn1/trn2. The CPU reference in `philox4x32_reference`
-        is the conformance oracle (see tests/test_nki_philox.py).
+        Status: scaffolded against the Philox 4×32-10 spec. CPU reference
+        in `philox4x32_reference` is the conformance oracle.
         """
-        # Load one tile of counter_lo values (one per lane); other counter
-        # words start at 0 — they get written by the round function.
         c0 = nl.load(counter_lo_ref)
         c1 = nl.zeros_like(c0)
         c2 = nl.zeros_like(c0)
@@ -215,11 +209,11 @@ if HAS_NKI:
         k0 = nl.load(key_lo_ref)
         k1 = nl.load(key_hi_ref)
 
-        # 10 rounds of the Philox round function.
-        # NKI mul-hi-lo: result is i64; high 32 / low 32 isolated by shift+mask.
+        # 10 rounds of the Philox round function. NKI mul is i64 on i32
+        # inputs; high/low 32 isolated via shift+mask.
         for _ in nl.static_range(PHILOX_ROUNDS):
-            prod0 = nl.multiply(c0, PHILOX_M0)  # i64
-            prod1 = nl.multiply(c2, PHILOX_M1)  # i64
+            prod0 = nl.multiply(c0, PHILOX_M0)
+            prod1 = nl.multiply(c2, PHILOX_M1)
             hi0 = nl.bitwise_and(nl.right_shift(prod0, 32), UINT32_MASK)
             lo0 = nl.bitwise_and(prod0, UINT32_MASK)
             hi1 = nl.bitwise_and(nl.right_shift(prod1, 32), UINT32_MASK)
@@ -234,36 +228,41 @@ if HAS_NKI:
             k0 = nl.bitwise_and(nl.add(k0, PHILOX_W0), UINT32_MASK)
             k1 = nl.bitwise_and(nl.add(k1, PHILOX_W1), UINT32_MASK)
 
-        # Write 4 output words per lane interleaved.
-        nl.store(out_ref[0::4], c0)
-        nl.store(out_ref[1::4], c1)
-        nl.store(out_ref[2::4], c2)
-        nl.store(out_ref[3::4], c3)
+        P = counter_lo_ref.shape[0]
+        out = nl.ndarray((P, 4), dtype=counter_lo_ref.dtype, buffer=nl.shared_hbm)
+        out[:, 0:1] = c0
+        out[:, 1:2] = c1
+        out[:, 2:3] = c2
+        out[:, 3:4] = c3
+        return out
 
     @nki.jit
-    def box_muller_kernel(uniforms_ref, out_ref):
-        """Box-Muller transform on the Vector Engine: U(0,1) pairs → N(0,1) pairs.
+    def box_muller_kernel(uniforms_ref):
+        """Box-Muller transform on the Vector Engine: U(0,1) pairs → N(0,1).
 
-        Pairs of uniform inputs (u1, u2) → (z1, z2) with
-            r = sqrt(-2 ln u1),  θ = 2π u2,
-            z1 = r cos θ,  z2 = r sin θ.
+        Input shape `(P, 2)` — P lanes, each holding (u1, u2). Output
+        shape `(P, 2)` — paired standard normals (z1, z2). Runs
+        SBUF-resident on Vector Engine using hardware cos/sin/log/sqrt.
 
-        Chosen over Marsaglia polar because the Vector Engine has hardware
-        cos/sin/log/sqrt; Marsaglia's rejection step kills SIMD throughput.
-
-        Status: scaffolded but awaits on-hardware validation per #2.
-        Iterate after #1 (Philox kernel) lands cleanly on trn1.
+        Box-Muller chosen over Marsaglia polar: Marsaglia's rejection
+        step serializes branch-divergent lanes, killing SIMD throughput.
+        Box-Muller has constant work per pair.
         """
-        u1 = nl.load(uniforms_ref[0::2])
-        u2 = nl.load(uniforms_ref[1::2])
+        pairs = nl.load(uniforms_ref)
+        u1 = pairs[:, 0:1]
+        u2 = pairs[:, 1:2]
         # Clamp u1 away from 0 to avoid log(0) = -inf.
         u1_safe = nl.maximum(u1, 1e-10)
         r = nl.sqrt(nl.multiply(nl.log(u1_safe), -2.0))
         theta = nl.multiply(u2, TWO_PI)
         z1 = nl.multiply(r, nl.cos(theta))
         z2 = nl.multiply(r, nl.sin(theta))
-        nl.store(out_ref[0::2], z1)
-        nl.store(out_ref[1::2], z2)
+
+        P = uniforms_ref.shape[0]
+        out = nl.ndarray((P, 2), dtype=uniforms_ref.dtype, buffer=nl.shared_hbm)
+        out[:, 0:1] = z1
+        out[:, 1:2] = z2
+        return out
 
     def philox4x32_nki(
         counter_lo: torch.Tensor,
@@ -297,14 +296,15 @@ if HAS_NKI:
         chunks = []
         for start in range(0, n_lanes, _PHILOX_LANES_PER_TILE):
             end = min(start + _PHILOX_LANES_PER_TILE, n_lanes)
+            # NKI expects (partition, free) — reshape to (tile_len, 1).
             (cl, kl, kh), orig = _to_xla(
-                counter_lo[start:end].contiguous(),
-                key_lo[start:end].contiguous(),
-                key_hi[start:end].contiguous(),
+                counter_lo[start:end].reshape(-1, 1).contiguous(),
+                key_lo[start:end].reshape(-1, 1).contiguous(),
+                key_hi[start:end].reshape(-1, 1).contiguous(),
             )
-            tile_len = end - start
-            out_tile = torch.zeros(tile_len * 4, dtype=torch.int32, device=cl.device)
-            philox4x32_kernel(cl, kl, kh, out_tile)
+            # Kernel returns (tile_len, 4); flatten to interleaved
+            # [c0_0, c1_0, c2_0, c3_0, c0_1, c1_1, ...].
+            out_tile = philox4x32_kernel(cl, kl, kh).reshape(-1)
             chunks.append(out_tile.to(orig))
         return torch.cat(chunks) if len(chunks) > 1 else chunks[0]
 
@@ -323,9 +323,11 @@ if HAS_NKI:
         chunks = []
         for start_pair in range(0, n_pairs, tile_pairs):
             end_pair = min(start_pair + tile_pairs, n_pairs)
-            tile_slice = uniforms[start_pair * 2 : end_pair * 2].contiguous()
+            # Reshape flat uniforms to (tile_len, 2) — partition axis is lanes,
+            # free axis is the (u1, u2) pair.
+            tile_slice = uniforms[start_pair * 2 : end_pair * 2].reshape(-1, 2).contiguous()
             (u,), orig = _to_xla(tile_slice)
-            out_tile = torch.zeros_like(u)
-            box_muller_kernel(u, out_tile)
+            # Kernel returns (tile_len, 2); flatten to interleaved [z1, z2, z1, z2, ...].
+            out_tile = box_muller_kernel(u).reshape(-1)
             chunks.append(out_tile.to(orig))
         return torch.cat(chunks) if len(chunks) > 1 else chunks[0]
