@@ -12,6 +12,7 @@ Usage:
 """
 
 import torch
+
 import trnrand
 
 
@@ -22,8 +23,10 @@ def simulate_trials(true_rate: float, n: int, generator: trnrand.Generator) -> i
 
 
 def posterior_probability_b_beats_a(
-    a_successes: int, a_trials: int,
-    b_successes: int, b_trials: int,
+    a_successes: int,
+    a_trials: int,
+    b_successes: int,
+    b_trials: int,
     n_samples: int = 100_000,
     seed: int = 42,
 ) -> tuple[float, torch.Tensor, torch.Tensor]:
@@ -62,15 +65,11 @@ def main():
 
     print("Bayesian A/B test — Beta-binomial conjugate posterior")
     print("=" * 56)
-    print(f"Variant A: {a_successes} / {n_trials} conversions "
-          f"(true rate {true_rate_a:.3f})")
-    print(f"Variant B: {b_successes} / {n_trials} conversions "
-          f"(true rate {true_rate_b:.3f})")
+    print(f"Variant A: {a_successes} / {n_trials} conversions (true rate {true_rate_a:.3f})")
+    print(f"Variant B: {b_successes} / {n_trials} conversions (true rate {true_rate_b:.3f})")
     print()
-    print(f"Posterior mean A: {post_a.mean().item():.4f}   "
-          f"95% CI: [{ci_a[0]:.4f}, {ci_a[1]:.4f}]")
-    print(f"Posterior mean B: {post_b.mean().item():.4f}   "
-          f"95% CI: [{ci_b[0]:.4f}, {ci_b[1]:.4f}]")
+    print(f"Posterior mean A: {post_a.mean().item():.4f}   95% CI: [{ci_a[0]:.4f}, {ci_a[1]:.4f}]")
+    print(f"Posterior mean B: {post_b.mean().item():.4f}   95% CI: [{ci_b[0]:.4f}, {ci_b[1]:.4f}]")
     print()
     print(f"P(B > A) = {prob_b:.4f}")
     if prob_b > 0.95:

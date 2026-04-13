@@ -15,6 +15,7 @@ Usage:
 """
 
 import torch
+
 import trnrand
 
 
@@ -38,8 +39,8 @@ def event_time_view(
 
 
 def main():
-    rate = 2.5       # events per unit time
-    horizon = 10.0   # observe for 10 units → expect ~25 events per replication
+    rate = 2.5  # events per unit time
+    horizon = 10.0  # observe for 10 units → expect ~25 events per replication
     n_replications = 20_000
 
     counts_a = count_view(rate, horizon, n_replications, seed=42)
@@ -47,16 +48,20 @@ def main():
 
     print("Homogeneous Poisson process — count vs event-time equivalence")
     print("=" * 62)
-    print(f"Rate λ = {rate}, horizon T = {horizon}, expected Poisson(λT) mean = {rate*horizon}")
+    print(f"Rate λ = {rate}, horizon T = {horizon}, expected Poisson(λT) mean = {rate * horizon}")
     print()
-    print(f"Count view   (n={n_replications}):  "
-          f"mean = {counts_a.double().mean().item():.3f}, "
-          f"var = {counts_a.double().var().item():.3f}")
-    print(f"Event-time   (n=500):    "
-          f"mean = {counts_b.double().mean().item():.3f}, "
-          f"var = {counts_b.double().var().item():.3f}")
+    print(
+        f"Count view   (n={n_replications}):  "
+        f"mean = {counts_a.double().mean().item():.3f}, "
+        f"var = {counts_a.double().var().item():.3f}"
+    )
+    print(
+        f"Event-time   (n=500):    "
+        f"mean = {counts_b.double().mean().item():.3f}, "
+        f"var = {counts_b.double().var().item():.3f}"
+    )
     print()
-    print(f"Both means should be ≈ {rate*horizon} (Poisson(λT) has mean = variance = λT).")
+    print(f"Both means should be ≈ {rate * horizon} (Poisson(λT) has mean = variance = λT).")
     print("Agreement between the two views confirms the Exponential-interarrival")
     print("and Poisson-count formulations of the same process.")
 

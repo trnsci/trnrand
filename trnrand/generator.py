@@ -14,7 +14,6 @@ tiles, and used by both PyTorch and JAX as their default engine.
 from __future__ import annotations
 
 import torch
-from typing import Optional
 
 
 class Generator:
@@ -24,7 +23,7 @@ class Generator:
     counter-based RNG running on the GpSimd engine.
     """
 
-    def __init__(self, seed: Optional[int] = None, device: str = "cpu"):
+    def __init__(self, seed: int | None = None, device: str = "cpu"):
         self._device = device
         self._torch_gen = torch.Generator(device=device)
         if seed is not None:
@@ -32,7 +31,7 @@ class Generator:
         self._seed = seed
 
     @property
-    def seed(self) -> Optional[int]:
+    def seed(self) -> int | None:
         return self._seed
 
     @property

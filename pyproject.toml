@@ -37,10 +37,42 @@ dev = [
     "pytest>=7.0",
     "pytest-benchmark>=4.0",
     "pytest-cov>=4.0",
+    "ruff>=0.6",
+    "pre-commit>=3.5",
     "scipy>=1.11",
     "mkdocs>=1.5",
     "mkdocs-material>=9.0",
 ]
+
+[tool.ruff]
+# Match the rest of the trnsci suite. Line length 100 is a compromise
+# between black's 88 and the wider tables common in scientific code.
+line-length = 100
+target-version = "py310"
+extend-exclude = ["site", "infra/terraform*/.terraform"]
+
+[tool.ruff.lint]
+# Sensible default selection: pycodestyle (E/W), Pyflakes (F), isort (I),
+# pyupgrade (UP), flake8-bugbear (B), flake8-simplify (SIM). Skip docstring
+# rules (D*) — we're deliberately light on docstrings in this project.
+select = ["E", "W", "F", "I", "UP", "B", "SIM"]
+ignore = [
+    "E501",   # line too long — formatter handles it
+    "B008",   # function call in default arg — common + intentional here
+    "SIM108", # if/else → ternary — explicit form reads better in dispatch paths
+]
+
+[tool.ruff.lint.per-file-ignores]
+# NKI kernels use patterns that trip some lint rules (SBUF writes that
+# look unused to the linter, etc). Don't fight the kernel authoring loop.
+"trnrand/nki/dispatch.py" = ["F841", "B007"]
+"scripts/*" = ["F401"]
+"tests/*"   = ["F401", "F811"]
+
+[tool.ruff.format]
+# Black-compatible defaults.
+quote-style = "double"
+indent-style = "space"
 
 [tool.coverage.run]
 source = ["trnrand"]

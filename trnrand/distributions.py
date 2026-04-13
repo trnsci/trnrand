@@ -20,8 +20,8 @@ For scientific computing:
 from __future__ import annotations
 
 import math
+
 import torch
-from typing import Optional, Tuple, Union
 
 from .generator import Generator, get_default_generator
 
@@ -31,7 +31,7 @@ def uniform(
     low: float = 0.0,
     high: float = 1.0,
     dtype: torch.dtype = torch.float32,
-    generator: Optional[Generator] = None,
+    generator: Generator | None = None,
 ) -> torch.Tensor:
     """Uniform distribution on [low, high)."""
     gen = (generator or get_default_generator()).torch_generator
@@ -43,7 +43,7 @@ def normal(
     mean: float = 0.0,
     std: float = 1.0,
     dtype: torch.dtype = torch.float32,
-    generator: Optional[Generator] = None,
+    generator: Generator | None = None,
 ) -> torch.Tensor:
     """Normal (Gaussian) distribution."""
     gen = (generator or get_default_generator()).torch_generator
@@ -53,7 +53,7 @@ def normal(
 def standard_normal(
     *size: int,
     dtype: torch.dtype = torch.float32,
-    generator: Optional[Generator] = None,
+    generator: Generator | None = None,
 ) -> torch.Tensor:
     """Standard normal N(0, 1)."""
     return normal(*size, mean=0.0, std=1.0, dtype=dtype, generator=generator)
@@ -63,7 +63,7 @@ def exponential(
     *size: int,
     rate: float = 1.0,
     dtype: torch.dtype = torch.float32,
-    generator: Optional[Generator] = None,
+    generator: Generator | None = None,
 ) -> torch.Tensor:
     """Exponential distribution with given rate (λ).
 
@@ -81,7 +81,7 @@ def bernoulli(
     *size: int,
     p: float = 0.5,
     dtype: torch.dtype = torch.float32,
-    generator: Optional[Generator] = None,
+    generator: Generator | None = None,
 ) -> torch.Tensor:
     """Bernoulli distribution: 1 with probability p, 0 otherwise."""
     gen = (generator or get_default_generator()).torch_generator
@@ -93,7 +93,7 @@ def randint(
     low: int = 0,
     high: int = 1,
     dtype: torch.dtype = torch.long,
-    generator: Optional[Generator] = None,
+    generator: Generator | None = None,
 ) -> torch.Tensor:
     """Random integers from [low, high)."""
     gen = (generator or get_default_generator()).torch_generator
@@ -103,7 +103,7 @@ def randint(
 def randperm(
     n: int,
     dtype: torch.dtype = torch.long,
-    generator: Optional[Generator] = None,
+    generator: Generator | None = None,
 ) -> torch.Tensor:
     """Random permutation of 0..n-1."""
     gen = (generator or get_default_generator()).torch_generator
@@ -115,7 +115,7 @@ def gamma(
     shape: float,
     scale: float = 1.0,
     dtype: torch.dtype = torch.float32,
-    generator: Optional[Generator] = None,
+    generator: Generator | None = None,
 ) -> torch.Tensor:
     """Gamma distribution with given shape (k) and scale (θ).
 
@@ -157,13 +157,10 @@ def gamma(
         valid = z > -1.0 / c
         # log(v) safe where valid; clamp on the masked-out entries to avoid nan.
         v_safe = torch.where(valid, v, torch.ones_like(v))
-        accept = (
-            valid
-            & (u.log() < 0.5 * z * z + d - d * v + d * v_safe.log())
-        )
+        accept = valid & (u.log() < 0.5 * z * z + d - d * v + d * v_safe.log())
         draws = (d * v)[accept]
         take = min(draws.numel(), remaining)
-        result[idx:idx + take] = draws[:take]
+        result[idx : idx + take] = draws[:take]
         idx += take
 
     if boost is not None:
@@ -175,7 +172,7 @@ def chi_squared(
     *size: int,
     df: float,
     dtype: torch.dtype = torch.float32,
-    generator: Optional[Generator] = None,
+    generator: Generator | None = None,
 ) -> torch.Tensor:
     """Chi-squared distribution with `df` degrees of freedom.
 
@@ -190,7 +187,7 @@ def beta(
     alpha: float,
     beta: float,
     dtype: torch.dtype = torch.float32,
-    generator: Optional[Generator] = None,
+    generator: Generator | None = None,
 ) -> torch.Tensor:
     """Beta distribution on (0, 1) with shape parameters α, β > 0.
 
@@ -210,7 +207,7 @@ def poisson(
     *size: int,
     lam: float = 1.0,
     dtype: torch.dtype = torch.float32,
-    generator: Optional[Generator] = None,
+    generator: Generator | None = None,
 ) -> torch.Tensor:
     """Poisson distribution with rate λ.
 
@@ -230,7 +227,7 @@ def truncated_normal(
     low: float = -2.0,
     high: float = 2.0,
     dtype: torch.dtype = torch.float32,
-    generator: Optional[Generator] = None,
+    generator: Generator | None = None,
 ) -> torch.Tensor:
     """Truncated normal distribution clipped to [low, high] (in std units).
 
@@ -248,7 +245,7 @@ def truncated_normal(
         samples = torch.empty(batch_size, dtype=dtype).normal_(mean, std, generator=gen)
         valid = samples[(samples >= mean + low * std) & (samples <= mean + high * std)]
         take = min(len(valid), n_remaining - idx)
-        remaining[idx:idx + take] = valid[:take]
+        remaining[idx : idx + take] = valid[:take]
         idx += take
 
     return result

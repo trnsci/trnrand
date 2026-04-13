@@ -10,8 +10,6 @@ Usage:
     python examples/mc_integration.py
 """
 
-import time
-import torch
 import trnrand
 
 
@@ -29,17 +27,18 @@ def sphere_volume_mc(n_points: int, n_dims: int, quasi: bool = False) -> float:
         points = trnrand.uniform(n_points, n_dims, low=-1.0, high=1.0, generator=g)
 
     # Check which points are inside the unit sphere
-    r_squared = (points ** 2).sum(dim=1)
+    r_squared = (points**2).sum(dim=1)
     inside = (r_squared <= 1.0).float().mean().item()
 
     # Volume = fraction_inside * volume_of_cube
-    cube_volume = 2.0 ** n_dims
+    cube_volume = 2.0**n_dims
     return inside * cube_volume
 
 
 def exact_sphere_volume(d: int) -> float:
     """Exact volume of d-dimensional unit sphere."""
     import math
+
     return math.pi ** (d / 2) / math.gamma(d / 2 + 1)
 
 
@@ -58,7 +57,9 @@ def main():
         mc_err = abs(mc_est - exact)
         qmc_err = abs(qmc_est - exact)
         ratio = qmc_err / mc_err if mc_err > 1e-10 else float("inf")
-        print(f"{n:>8}  {mc_est:>10.6f}  {mc_err:>10.6f}  {qmc_est:>10.6f}  {qmc_err:>10.6f}  {ratio:>8.3f}")
+        print(
+            f"{n:>8}  {mc_est:>10.6f}  {mc_err:>10.6f}  {qmc_est:>10.6f}  {qmc_err:>10.6f}  {ratio:>8.3f}"
+        )
 
     print()
     print("QMC/MC < 1 means quasi-random is more accurate.")

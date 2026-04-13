@@ -14,15 +14,13 @@ Use cases:
 
 from __future__ import annotations
 
-import math
 import torch
-from typing import Optional
 
 
 def sobol(
     n_points: int,
     n_dims: int,
-    seed: Optional[int] = None,
+    seed: int | None = None,
     scramble: bool = True,
     dtype: torch.dtype = torch.float32,
 ) -> torch.Tensor:
@@ -99,7 +97,7 @@ def latin_hypercube(
     n_points: int,
     n_dims: int,
     dtype: torch.dtype = torch.float32,
-    generator: Optional[torch.Generator] = None,
+    generator: torch.Generator | None = None,
 ) -> torch.Tensor:
     """Latin Hypercube Sampling.
 

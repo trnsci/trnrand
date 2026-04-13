@@ -1,14 +1,14 @@
 """Test random number generation."""
 
+import numpy as np
 import pytest
 import torch
-import numpy as np
+
 import trnrand
 from trnrand import Generator
 
 
 class TestGenerator:
-
     def test_seeded_reproducibility(self):
         g1 = Generator(seed=42)
         g2 = Generator(seed=42)
@@ -39,7 +39,6 @@ class TestGenerator:
 
 
 class TestUniform:
-
     def test_range(self):
         g = Generator(seed=42)
         x = trnrand.uniform(10000, low=2.0, high=5.0, generator=g)
@@ -57,7 +56,6 @@ class TestUniform:
 
 
 class TestNormal:
-
     def test_shape(self):
         x = trnrand.normal(3, 4)
         assert x.shape == (3, 4)
@@ -76,7 +74,6 @@ class TestNormal:
 
 
 class TestExponential:
-
     def test_positive(self):
         g = Generator(seed=42)
         x = trnrand.exponential(10000, rate=1.0, generator=g)
@@ -90,7 +87,6 @@ class TestExponential:
 
 
 class TestBernoulli:
-
     def test_binary(self):
         g = Generator(seed=42)
         x = trnrand.bernoulli(1000, p=0.5, generator=g)
@@ -107,7 +103,6 @@ class TestBernoulli:
 
 
 class TestRandint:
-
     def test_range(self):
         g = Generator(seed=42)
         x = trnrand.randint(10000, low=5, high=10, generator=g)
@@ -120,7 +115,6 @@ class TestRandint:
 
 
 class TestRandperm:
-
     def test_is_permutation(self):
         g = Generator(seed=42)
         x = trnrand.randperm(100, generator=g)
@@ -130,7 +124,6 @@ class TestRandperm:
 
 
 class TestTruncatedNormal:
-
     def test_bounds(self):
         g = Generator(seed=42)
         x = trnrand.truncated_normal(10000, mean=0.0, std=1.0, low=-2.0, high=2.0, generator=g)
@@ -143,7 +136,6 @@ class TestTruncatedNormal:
 
 
 class TestGamma:
-
     def test_shape(self):
         x = trnrand.gamma(7, 5, shape=2.0)
         assert x.shape == (7, 5)
@@ -176,7 +168,6 @@ class TestGamma:
 
 
 class TestChiSquared:
-
     def test_shape(self):
         x = trnrand.chi_squared(4, 6, df=5)
         assert x.shape == (4, 6)
@@ -201,7 +192,6 @@ class TestChiSquared:
 
 
 class TestBeta:
-
     def test_shape(self):
         x = trnrand.beta(3, 4, alpha=2.0, beta=3.0)
         assert x.shape == (3, 4)
@@ -228,7 +218,6 @@ class TestBeta:
 
 
 class TestPoisson:
-
     def test_shape(self):
         x = trnrand.poisson(5, 6, lam=3.0)
         assert x.shape == (5, 6)

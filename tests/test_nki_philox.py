@@ -27,7 +27,6 @@ from trnrand.nki.dispatch import (
     philox_uniform_cpu,
 )
 
-
 # ── CPU reference: spec invariants ────────────────────────────────────────────
 
 

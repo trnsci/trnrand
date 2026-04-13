@@ -1,13 +1,13 @@
 """Test quasi-random sequences."""
 
+import numpy as np
 import pytest
 import torch
-import numpy as np
+
 import trnrand
 
 
 class TestSobol:
-
     def test_shape(self):
         x = trnrand.sobol(100, 5)
         assert x.shape == (100, 5)
@@ -35,7 +35,6 @@ class TestSobol:
 
 
 class TestHalton:
-
     def test_shape(self):
         x = trnrand.halton(100, 3)
         assert x.shape == (100, 3)
@@ -59,7 +58,6 @@ class TestHalton:
 
 
 class TestLatinHypercube:
-
     def test_shape(self):
         x = trnrand.latin_hypercube(50, 3)
         assert x.shape == (50, 3)
