@@ -1,0 +1,36 @@
+name: Notify trnsci umbrella of docs change
+
+# Fires a repository_dispatch at trnsci/trnsci whenever this repo's docs or
+# mkdocs.yml change on main, so the combined site at trnsci.dev rebuilds
+# immediately rather than waiting for the daily cron.
+#
+# Requires repo/org secret TRNSCI_DISPATCH_TOKEN — a fine-grained PAT scoped
+# to the trnsci/trnsci repo with "Contents: Read and write" (which covers
+# repository_dispatch). See README for setup.
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "docs/**"
+      - "mkdocs.yml"
+      - "README.md"
+      - "CHANGELOG.md"
+  workflow_dispatch:
+
+jobs:
+  dispatch:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Trigger umbrella rebuild
+        env:
+          GH_TOKEN: ${{ secrets.TRNSCI_DISPATCH_TOKEN }}
+        run: |
+          if [ -z "${GH_TOKEN:-}" ]; then
+            echo "::notice::TRNSCI_DISPATCH_TOKEN not set; umbrella will pick up this change on next daily cron or manual dispatch."
+            exit 0
+          fi
+          gh api --method POST repos/trnsci/trnsci/dispatches \
+            -f event_type=subproject-updated \
+            -f "client_payload[repo]=${GITHUB_REPOSITORY}" \
+            -f "client_payload[sha]=${GITHUB_SHA}"
