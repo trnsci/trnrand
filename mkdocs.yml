@@ -6,6 +6,9 @@ repo_name: trnsci/trnrand
 
 theme:
   name: material
+  font:
+    text: Atkinson Hyperlegible
+    code: Atkinson Hyperlegible Mono
   palette:
     scheme: default
     primary: indigo
@@ -24,7 +27,8 @@ nav:
       - NKI Backend: api/nki.md
   - Architecture: architecture.md
   - Benchmarks: benchmarks.md
-  - AWS Setup: aws_setup.md
+  - Deployment:
+      - AWS Setup for Neuron CI: aws_setup.md
   - Release procedure: release.md
 
 markdown_extensions:
