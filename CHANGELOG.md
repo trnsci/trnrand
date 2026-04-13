@@ -13,6 +13,27 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+## [0.2.0] - 2026-04-13
+
+### Added
+
+- `gamma(size, shape, scale=1.0, ...)` — Gamma distribution via
+  Marsaglia-Tsang rejection with the boost identity for `shape < 1`.
+- `chi_squared(size, df, ...)` — Chi-squared via `2·Gamma(df/2, 1)`.
+- `beta(size, alpha, beta, ...)` — Beta via the gamma-ratio identity
+  `X / (X + Y)` with `X ~ Gamma(α)`, `Y ~ Gamma(β)`.
+- `poisson(size, lam, ...)` — Poisson via `torch.poisson` with a
+  generator-bound rates tensor.
+
+All four distributions are generator-aware for reproducibility and
+tested against analytic mean / variance on 100k–200k samples.
+
+### Known limitations
+
+- NKI kernels for these distributions are v0.3.0 scope (#13, #14, #15,
+  #16). CPU path works today via the PyTorch backend; on-device
+  acceleration waits for hardware validation.
+
 ## [0.1.1] - 2026-04-13
 
 ### Fixed

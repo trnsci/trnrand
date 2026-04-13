@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "trnrand"
-version = "0.1.1"
+version = "0.2.0"
 description = "Random number generation for AWS Trainium via NKI"
 readme = "README.md"
 license = "Apache-2.0"

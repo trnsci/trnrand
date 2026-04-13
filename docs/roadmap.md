@@ -14,11 +14,19 @@ new features.
 - [#10](https://github.com/trnsci/trnrand/issues/10) — Update GitHub repo
   `homepageUrl` to `trnsci.dev/trnrand/`.
 
-## v0.2.0 — NKI hardware validation _(blocked on trn1 access)_
+## v0.2.0 — CPU distributions + NKI hardware validation _(CPU distributions shipped; hardware validation gated on trn1)_
 
-Prove the Philox and Box-Muller NKI scaffolds from v0.1.0 work on real
-Trainium silicon. Nothing new to build — these issues drive the
-hardware-in-the-loop validation cycle.
+CPU implementations of the v0.3.0 distributions ship here so users can
+pick them up today without waiting for NKI hardware validation. The
+Philox and Box-Muller NKI scaffolds from v0.1.0 still need proving on
+real Trainium silicon — tracked in the same milestone.
+
+**Shipped (v0.2.0):**
+
+- Gamma, chi-squared, beta, poisson CPU implementations (see
+  [Distributions API](api/distributions.md)).
+
+**Hardware-gated (open on this milestone):**
 
 - [#1](https://github.com/trnsci/trnrand/issues/1) — Validate NKI
   Philox 4×32-10 kernel on trn1/trn2.
@@ -42,13 +50,14 @@ the distributions that close the gap vs cuRAND / NumPy.
 **Distribution breadth (Vector Engine):**
 
 - [#13](https://github.com/trnsci/trnrand/issues/13) — Beta distribution
-  (gamma-ratio method).
+  (gamma-ratio method). _CPU path shipped in v0.2.0; NKI pending._
 - [#14](https://github.com/trnsci/trnrand/issues/14) — Gamma distribution
-  (Marsaglia-Tsang + boost).
+  (Marsaglia-Tsang + boost). _CPU path shipped in v0.2.0; NKI pending._
 - [#15](https://github.com/trnsci/trnrand/issues/15) — Poisson distribution
-  (Knuth / Atkinson rejection).
+  (Knuth / Atkinson rejection). _CPU path shipped in v0.2.0; NKI pending._
 - [#16](https://github.com/trnsci/trnrand/issues/16) — Chi-squared
-  distribution (sum of squared normals).
+  distribution (sum of squared normals). _CPU path shipped in v0.2.0;
+  NKI pending._
 - [#17](https://github.com/trnsci/trnrand/issues/17) — Truncated normal on
   the Vector Engine (currently host-side rejection).
 

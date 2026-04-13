@@ -27,6 +27,9 @@ trnrand/
 | Monte Carlo integration           | `sobol()`, `halton()`| trnblas (DF-MP2)      |
 | Hyperparameter sweeps             | `sobol()`            | Ablation studies      |
 | Data augmentation                 | `uniform()`, `bernoulli()` | General         |
+| Bayesian inference priors         | `gamma()`, `beta()`  | General scientific    |
+| Event-count / queuing simulation  | `poisson()`          | General scientific    |
+| Variance / goodness-of-fit tests  | `chi_squared()`      | General scientific    |
 
 ## NKI strategy
 
