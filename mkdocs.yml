@@ -26,6 +26,8 @@ nav:
       - Quasi-random: api/quasi.md
       - NKI Backend: api/nki.md
   - Architecture: architecture.md
+  - Design:
+      - SBUF-resident streaming Generator (Phase 3 RFC): design/sbuf_resident_generator.md
   - Roadmap: roadmap.md
   - Benchmarks: benchmarks.md
   - Deployment:

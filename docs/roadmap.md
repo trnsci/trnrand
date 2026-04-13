@@ -66,6 +66,12 @@ the distributions that close the gap vs cuRAND / NumPy.
 Batched-tile RNG streaming, NEFF compile-cache reuse, per-kernel tuning
 so the NKI path is meaningfully faster than the PyTorch fallback.
 
+**Design:** [SBUF-resident streaming Generator RFC](design/sbuf_resident_generator.md)
+— pre-compiled streaming kernel that keeps Generator state SBUF-resident
+across multiple distribution calls, pipelining GpSimd / Vector / Scalar
+engines concurrently. This is qualitatively different from cuRAND's
+per-call dispatch model, not a perf tweak.
+
 - [#19](https://github.com/trnsci/trnrand/issues/19) — Phase 3 tracker:
   `trnrand.normal_into(buf)` streaming API, Sobol/Halton perf parity,
   published tokens/sec + GB/s benchmarks.
