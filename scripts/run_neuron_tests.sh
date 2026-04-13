@@ -103,20 +103,31 @@ CMD_ID=$(aws ssm send-command \
   --output text --query 'Command.CommandId')
 
 echo "Command ID: $CMD_ID"
-echo "Waiting for command to complete (this may take several minutes)..."
+echo "Waiting for command to complete (this may take several minutes — cold NKI compile + first-run pip install can run long)..."
 
-# aws ssm wait command-executed exits 255 if the command fails. We want to
-# capture output even on failure, so don't fail-fast here.
-aws ssm wait command-executed \
-  --command-id "$CMD_ID" \
-  --instance-id "$INSTANCE_ID" \
-  --region "$REGION" || true
-
-STATUS=$(aws ssm get-command-invocation \
-  --command-id "$CMD_ID" \
-  --instance-id "$INSTANCE_ID" \
-  --region "$REGION" \
-  --query 'Status' --output text)
+# The AWS CLI `ssm wait command-executed` waiter maxes out at ~100 attempts
+# × 5s = 8 min. Cold NKI compile for a fresh repo + pip install into the
+# Neuron venv can exceed that on first run. Poll manually with a longer
+# ceiling (30 min).
+POLL_TIMEOUT=1800
+POLL_INTERVAL=10
+elapsed=0
+while (( elapsed < POLL_TIMEOUT )); do
+  STATUS=$(aws ssm get-command-invocation \
+    --command-id "$CMD_ID" \
+    --instance-id "$INSTANCE_ID" \
+    --region "$REGION" \
+    --query 'Status' --output text 2>/dev/null || echo "Pending")
+  case "$STATUS" in
+    Success|Failed|TimedOut|Cancelled)
+      break
+      ;;
+    *)
+      sleep "$POLL_INTERVAL"
+      elapsed=$(( elapsed + POLL_INTERVAL ))
+      ;;
+  esac
+done
 
 echo ""
 echo "=== STDOUT ==="
