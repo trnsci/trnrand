@@ -26,6 +26,7 @@ nav:
       - Quasi-random: api/quasi.md
       - NKI Backend: api/nki.md
   - Architecture: architecture.md
+  - Roadmap: roadmap.md
   - Benchmarks: benchmarks.md
   - Deployment:
       - AWS Setup for Neuron CI: aws_setup.md

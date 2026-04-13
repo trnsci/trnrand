@@ -7,6 +7,26 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+### Changed
+
+### Fixed
+
+## [0.1.1] - 2026-04-13
+
+### Fixed
+
+- Docs badge in `README.md` and `mkdocs.yml` `site_url` now point at
+  `trnsci.dev/trnrand/` (the central docs home) instead of the retired
+  per-repo github.io URL (#9). Repo `homepageUrl` updated to match (#10).
+
+### Added
+
+- `ROADMAP.md` and `docs/roadmap.md` with v0.1.1 / v0.2.0 / v0.3.0
+  milestones and the issues attached to each.
+- `[Unreleased]` skeleton in CHANGELOG for future entries.
+
 ## [0.1.0] - 2026-04-12
 
 ### Added

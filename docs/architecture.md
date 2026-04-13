@@ -56,12 +56,16 @@ uniform stream:
 
 ## Known gaps
 
-- **NKI Philox kernel awaits on-hardware validation.** The CPU reference
-  (`philox4x32_reference`, `philox_uniform_cpu`) is the conformance oracle;
-  see `tests/test_nki_philox.py::TestPhiloxNKI`. Tracked as #1.
-- **Box-Muller kernel awaits on-hardware validation.** Tracked as #2; same
-  CPU-reference conformance pattern.
+- **NKI Philox and Box-Muller kernels await on-hardware validation.** Both
+  landed in v0.1.0 with CPU conformance oracles (the three canonical Salmon
+  et al. SC'11 test vectors pass in
+  `tests/test_nki_philox.py::TestPhiloxReference::test_spec_vectors`). The
+  hardware-gated `TestPhiloxNKI` suite runs only with `neuronxcc` available.
+  Tracked on the [v0.2.0 milestone](https://github.com/trnsci/trnrand/milestone/1)
+  (#1 Philox, #2 Box-Muller).
 - **Halton degrades above ~20 dimensions** — known algorithmic limitation.
   Sobol is preferred for `d > 10`.
-- **Quasi-random sequences are host-only.** NKI scrambling for Sobol/Halton
-  is a v0.3 follow-up.
+- **Quasi-random sequences are host-only.** NKI scrambling for
+  Sobol/Halton is scoped for [v0.3.0](roadmap.md) (#11, #12).
+- **FP32 throughout.** BF16 / FP16 output paths and multi-NeuronCore
+  sharding are v0.4+ candidates (see [roadmap](roadmap.md)).
