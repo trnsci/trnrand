@@ -104,6 +104,119 @@ def randperm(
     return torch.randperm(n, dtype=dtype, generator=gen)
 
 
+def gamma(
+    *size: int,
+    shape: float,
+    scale: float = 1.0,
+    dtype: torch.dtype = torch.float32,
+    generator: Optional[Generator] = None,
+) -> torch.Tensor:
+    """Gamma distribution with given shape (k) and scale (θ).
+
+    PDF: f(x) = x^(k-1) exp(-x/θ) / (Γ(k) θ^k)
+    Mean: k·θ; Variance: k·θ²
+
+    Uses Marsaglia-Tsang rejection for shape ≥ 1. For shape < 1, samples
+    Gamma(shape+1) and multiplies by U^(1/shape) (the "boost" identity).
+    """
+    assert shape > 0 and scale > 0, "gamma requires shape > 0 and scale > 0"
+    gen = (generator or get_default_generator()).torch_generator
+
+    if len(size) == 1 and isinstance(size[0], (tuple, list)):
+        size = tuple(size[0])
+    n = 1
+    for d in size:
+        n *= d
+
+    if shape < 1.0:
+        boost = torch.empty(n, dtype=torch.float64).uniform_(0.0, 1.0, generator=gen)
+        boost = boost ** (1.0 / shape)
+        shape_eff = shape + 1.0
+    else:
+        boost = None
+        shape_eff = shape
+
+    d = shape_eff - 1.0 / 3.0
+    c = 1.0 / math.sqrt(9.0 * d)
+    result = torch.empty(n, dtype=torch.float64)
+    idx = 0
+    while idx < n:
+        remaining = n - idx
+        # Oversample ~30% so most iterations finish in one pass.
+        draw = max(32, int(remaining * 1.3) + 32)
+        z = torch.empty(draw, dtype=torch.float64).normal_(0.0, 1.0, generator=gen)
+        u = torch.empty(draw, dtype=torch.float64).uniform_(0.0, 1.0, generator=gen)
+        v = (1.0 + c * z) ** 3
+        # v > 0 guaranteed when z > -1/c; log needs strictly-positive v.
+        valid = z > -1.0 / c
+        # log(v) safe where valid; clamp on the masked-out entries to avoid nan.
+        v_safe = torch.where(valid, v, torch.ones_like(v))
+        accept = (
+            valid
+            & (u.log() < 0.5 * z * z + d - d * v + d * v_safe.log())
+        )
+        draws = (d * v)[accept]
+        take = min(draws.numel(), remaining)
+        result[idx:idx + take] = draws[:take]
+        idx += take
+
+    if boost is not None:
+        result = result * boost
+    return (result * scale).to(dtype).reshape(size)
+
+
+def chi_squared(
+    *size: int,
+    df: float,
+    dtype: torch.dtype = torch.float32,
+    generator: Optional[Generator] = None,
+) -> torch.Tensor:
+    """Chi-squared distribution with `df` degrees of freedom.
+
+    Equivalent to Gamma(df/2, scale=2). Mean: df; Variance: 2·df.
+    """
+    assert df > 0, "chi_squared requires df > 0"
+    return gamma(*size, shape=df / 2.0, scale=2.0, dtype=dtype, generator=generator)
+
+
+def beta(
+    *size: int,
+    alpha: float,
+    beta: float,
+    dtype: torch.dtype = torch.float32,
+    generator: Optional[Generator] = None,
+) -> torch.Tensor:
+    """Beta distribution on (0, 1) with shape parameters α, β > 0.
+
+    Sampled via the gamma-ratio identity: X ~ Gamma(α, 1), Y ~ Gamma(β, 1),
+    then Z = X / (X + Y) ~ Beta(α, β).
+
+    Mean: α/(α+β); Variance: αβ/((α+β)²(α+β+1)).
+    """
+    assert alpha > 0 and beta > 0, "beta requires alpha > 0 and beta > 0"
+    x = gamma(*size, shape=alpha, scale=1.0, dtype=torch.float64, generator=generator)
+    y = gamma(*size, shape=beta, scale=1.0, dtype=torch.float64, generator=generator)
+    # Both x, y > 0 with probability 1; the sum never underflows for reasonable shapes.
+    return (x / (x + y)).to(dtype)
+
+
+def poisson(
+    *size: int,
+    lam: float = 1.0,
+    dtype: torch.dtype = torch.float32,
+    generator: Optional[Generator] = None,
+) -> torch.Tensor:
+    """Poisson distribution with rate λ.
+
+    PMF: P(k) = λ^k exp(-λ) / k!
+    Mean: λ; Variance: λ
+    """
+    assert lam >= 0, "poisson requires lam >= 0"
+    gen = (generator or get_default_generator()).torch_generator
+    rates = torch.full(size, float(lam), dtype=torch.float32)
+    return torch.poisson(rates, generator=gen).to(dtype)
+
+
 def truncated_normal(
     *size: int,
     mean: float = 0.0,

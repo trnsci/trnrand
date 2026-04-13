@@ -16,6 +16,7 @@ from .generator import Generator, manual_seed, get_default_generator
 from .distributions import (
     uniform, normal, standard_normal, exponential,
     bernoulli, randint, randperm, truncated_normal,
+    gamma, chi_squared, beta, poisson,
 )
 
 # Quasi-random sequences
@@ -30,6 +31,7 @@ __all__ = [
     # Distributions
     "uniform", "normal", "standard_normal", "exponential",
     "bernoulli", "randint", "randperm", "truncated_normal",
+    "gamma", "chi_squared", "beta", "poisson",
     # Quasi-random
     "sobol", "halton", "latin_hypercube",
     # Backend
