@@ -36,9 +36,26 @@ neuron = [
 dev = [
     "pytest>=7.0",
     "pytest-benchmark>=4.0",
+    "pytest-cov>=4.0",
     "scipy>=1.11",
     "mkdocs>=1.5",
     "mkdocs-material>=9.0",
+]
+
+[tool.coverage.run]
+source = ["trnrand"]
+omit = [
+    # NKI kernels require neuronxcc and only run on Trainium; CI coverage
+    # would always show 0% and drag the total down.
+    "trnrand/nki/*",
+]
+
+[tool.coverage.report]
+exclude_lines = [
+    "pragma: no cover",
+    "raise NotImplementedError",
+    "if TYPE_CHECKING:",
+    "if __name__ == .__main__.:",
 ]
 
 [project.urls]
