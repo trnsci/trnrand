@@ -31,6 +31,7 @@ nav:
   - Deployment:
       - AWS Setup for Neuron CI: aws_setup.md
   - Release procedure: release.md
+  - API stability: stability.md
 
 markdown_extensions:
   - pymdownx.highlight
