@@ -38,6 +38,41 @@ class TestPhiloxReference:
         assert PHILOX_W0 == 0x9E3779B9
         assert PHILOX_W1 == 0xBB67AE85
 
+    @pytest.mark.parametrize(
+        "counter,key,expected",
+        [
+            # Published Philox4×32-10 test vectors from Salmon et al. SC'11
+            # (Random123 reference) — also match the cuRAND / JAX
+            # implementations. Any drift from these means the kernel does not
+            # produce a standards-conformant stream.
+            (
+                (0x00000000, 0x00000000, 0x00000000, 0x00000000),
+                (0x00000000, 0x00000000),
+                (0x6627E8D5, 0xE169C58D, 0xBC57AC4C, 0x9B00DBD8),
+            ),
+            (
+                (0xFFFFFFFF, 0xFFFFFFFF, 0xFFFFFFFF, 0xFFFFFFFF),
+                (0xFFFFFFFF, 0xFFFFFFFF),
+                (0x408F276D, 0x41C83B0E, 0xA20BC7C6, 0x6D5451FD),
+            ),
+            (
+                (0x243F6A88, 0x85A308D3, 0x13198A2E, 0x03707344),
+                (0xA4093822, 0x299F31D0),
+                (0xD16CFE09, 0x94FDCCEB, 0x5001E420, 0x24126EA1),
+            ),
+        ],
+    )
+    def test_spec_vectors(self, counter, key, expected):
+        ctr = torch.tensor([list(counter)], dtype=torch.int64)
+        k = torch.tensor([list(key)], dtype=torch.int64)
+        out = philox4x32_reference(ctr, k)[0].tolist()
+        assert out == list(expected), (
+            f"Philox4×32-10 output mismatch: got "
+            f"({out[0]:#010x}, {out[1]:#010x}, {out[2]:#010x}, {out[3]:#010x}), "
+            f"expected ({expected[0]:#010x}, {expected[1]:#010x}, "
+            f"{expected[2]:#010x}, {expected[3]:#010x})"
+        )
+
     def test_zero_input_deterministic(self):
         ctr = torch.zeros(1, 4, dtype=torch.int64)
         key = torch.zeros(1, 2, dtype=torch.int64)
