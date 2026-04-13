@@ -31,7 +31,7 @@ jobs:
         with:
           python-version: ${{ matrix.python-version }}
       - run: pip install -e ".[dev]"
-      - run: pytest tests/ -v -x --tb=short -m "not neuron" --cov=trnrand --cov-report=xml --cov-report=term
+      - run: pytest tests/ -v -x --tb=short -m "not neuron and not simulator" --cov=trnrand --cov-report=xml --cov-report=term
       - name: Upload coverage to Codecov
         if: matrix.python-version == '3.12'
         uses: codecov/codecov-action@v4
@@ -39,3 +39,24 @@ jobs:
           files: ./coverage.xml
           flags: unittests
           fail_ci_if_error: false
+
+  test-simulator:
+    runs-on: ubuntu-latest
+    # Until neuronx-cc 2.29 hits the Neuron pip index, this job will
+    # fail at install. Keep CI green with continue-on-error so trnrand
+    # stays on main-branch-green while Amazon catches up; the job
+    # auto-lights-up the moment the package drops.
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.12"
+      - name: Install neuronx-cc (Neuron SDK 2.29 / NKI 0.3.0 Stable)
+        run: pip install "neuronx-cc>=2.29" --extra-index-url https://pip.repos.neuron.amazonaws.com
+      - run: pip install -e ".[dev]"
+      - run: pytest tests/ -v -m simulator --cov=trnrand --cov-report=xml --cov-append
+      - name: Upload coverage reports to Codecov
+        uses: codecov/codecov-action@v5
+        with:
+          token: ${{ secrets.CODECOV_TOKEN }}

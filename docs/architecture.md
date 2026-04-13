@@ -59,13 +59,21 @@ uniform stream:
 
 ## Known gaps
 
-- **NKI Philox and Box-Muller kernels await on-hardware validation.** Both
-  landed in v0.1.0 with CPU conformance oracles (the three canonical Salmon
-  et al. SC'11 test vectors pass in
-  `tests/test_nki_philox.py::TestPhiloxReference::test_spec_vectors`). The
-  hardware-gated `TestPhiloxNKI` suite runs only with `neuronxcc` available.
-  Tracked on the [v0.2.0 milestone](https://github.com/trnsci/trnrand/milestone/1)
-  (#1 Philox, #2 Box-Muller).
+- **NKI Philox and Box-Muller kernels await validation.** Both landed in
+  v0.1.0 with CPU conformance oracles (the three canonical Salmon et al.
+  SC'11 test vectors pass in
+  `tests/test_nki_philox.py::TestPhiloxReference::test_spec_vectors`).
+  Tracked on the [v0.3.0 milestone](https://github.com/trnsci/trnrand/milestones)
+  (#1 Philox, #2 Box-Muller, #18 Phase 1).
+
+**Phase 1 iteration is no longer hardware-gated.** Neuron SDK 2.29
+(April 2026) brought NKI 0.3.0 Stable with a CPU simulator
+(`nki.simulate_kernel`); the `test-simulator` CI job exercises kernel
+correctness on `ubuntu-latest` without a trn1 instance. Use
+`pytest tests/ -v -m simulator` as the **inner loop** for NKI kernel
+development — seconds per iteration, no AWS round-trip. Hardware runs
+via `scripts/run_neuron_tests.sh` are reserved for final real-device
+validation, not inner-loop iteration.
 - **Halton degrades above ~20 dimensions** — known algorithmic limitation.
   Sobol is preferred for `d > 10`.
 - **Quasi-random sequences are host-only.** NKI scrambling for

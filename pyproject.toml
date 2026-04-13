@@ -102,5 +102,6 @@ include = ["trnrand*"]
 [tool.pytest.ini_options]
 markers = [
     "neuron: requires Neuron hardware (trn1/trn2 instance)",
+    "simulator: runs NKI kernels via nki.simulate_kernel on CPU (no hardware)",
 ]
 testpaths = ["tests"]
