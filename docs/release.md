@@ -13,7 +13,7 @@ e.g. `v0.2.0-rc1`) go to TestPyPI; stable tags go to PyPI.
    publisher first and letting the first OIDC publish create the project.
 2. **Configure trusted publisher** — for both PyPI and TestPyPI:
    - Go to `Account → Publishing → Add a new pending publisher`.
-   - Owner: `scttfrdmn`, repository: `trnrand`, workflow: `publish.yml`,
+   - Owner: `trnsci`, repository: `trnrand`, workflow: `publish.yml`,
      environment: `pypi` (PyPI) or `testpypi` (TestPyPI).
 3. **Confirm the GitHub environments exist.** In the repo settings under
    `Environments`, ensure `pypi` and `testpypi` are present (the workflow
