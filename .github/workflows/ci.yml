@@ -4,6 +4,9 @@ on:
   push:
     branches: [main]
   pull_request:
+  schedule:
+    # 06:17 UTC daily — offset from the top of hour to miss the scheduled-run queue surge.
+    - cron: '17 6 * * *'
 
 jobs:
   test:
