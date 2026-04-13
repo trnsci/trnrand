@@ -13,6 +13,19 @@ Seeded pseudo-random distributions, quasi-random sequences for quasi-Monte Carlo
 
 Part of the trnsci scientific computing suite ([github.com/trnsci](https://github.com/trnsci)).
 
+## Current phase
+
+trnrand follows the [trnsci 5-phase roadmap](https://trnsci.dev/roadmap/). Active work is tracked in phase-labeled GitHub issues:
+
+- **[Phase 1 — correctness](https://github.com/trnsci/trnrand/issues/18)** (active): Philox 4×32 and Box-Muller NKI kernels scaffolded with CPU-reference oracles; awaiting hardware validation on trn1 / trn2.
+- **[Phase 3 — perf](https://github.com/trnsci/trnrand/issues/19)**: batched-tile RNG streaming, NEFF cache reuse.
+- **[Phase 4 — multi-chip](https://github.com/trnsci/trnrand/issues/20)**: stream-partitioned RNG across NeuronCores.
+- **[Phase 5 — generation](https://github.com/trnsci/trnrand/issues/21)**: trn2 PSUM sizing for larger batched tile generation.
+
+_(No Phase 2 for trnrand — the precision story is inherited where relevant.)_
+
+Suite-wide tracker: [trnsci/trnsci#1](https://github.com/trnsci/trnsci/issues/1).
+
 ## Install
 
 ```bash
