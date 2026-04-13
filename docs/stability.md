@@ -90,3 +90,43 @@ sampling to an analytic method). Such changes will be flagged in the
 CHANGELOG under `### Changed` with a note about reproducibility impact.
 Workaround: pin to a specific minor version for reproducible research
 runs.
+
+## Differentiability
+
+**All trnrand outputs are non-differentiable by design.** Sampled
+tensors have `requires_grad=False` and carry no `grad_fn`. This matches
+the behavior of `torch.rand()`, `torch.normal()`, and every other
+sampler in PyTorch — a random draw has no meaningful derivative with
+respect to its seed or generator state.
+
+Calling `.backward()` on a loss that flows only through an RNG output
+raises
+
+```
+RuntimeError: element 0 of tensors does not require grad and does
+not have a grad_fn
+```
+
+This is correct behavior, not a bug in trnrand or in PyTorch.
+
+**Reparameterization trick.** For VAE / normalizing-flow / SVI
+workloads that need gradients of a loss with respect to distribution
+parameters, keep the gradient on the parameters and use trnrand only
+for the non-differentiable noise:
+
+```python
+eps = trnrand.standard_normal(n)          # no grad; pure noise
+z = mu + sigma * eps                      # grad flows through mu, sigma
+loss = model(z).sum()
+loss.backward()                           # mu.grad, sigma.grad populated
+```
+
+This is the standard pattern and mirrors how `torch.randn()` is used in
+`torch.nn.functional.gumbel_softmax`, VAE encoders, and diffusion
+samplers.
+
+**Suite-wide context.** Sister projects with differentiable kernels
+(trnfft, trnblas, trnsolver, trnsparse, trntensor) wrap their NKI paths
+in `torch.autograd.Function` with analytic backward passes — see
+umbrella issue [trnsci/trnsci#3](https://github.com/trnsci/trnsci/issues/3).
+trnrand is explicitly non-applicable: no wrapper exists or is planned.
