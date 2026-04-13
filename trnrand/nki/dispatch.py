@@ -57,11 +57,16 @@ def _to_xla(*tensors):
     `neuronxcc.nki._torch_xla` raises `KeyError: 'torch_neuronx'` on the
     first kernel call.
     """
-    import torch_xla.core.xla_model as xm
+    import torch_xla
 
-    device = xm.xla_device()
+    device = torch_xla.device()
     orig = tensors[0].device
     return [t.to(device) for t in tensors], orig
+
+
+# NKI partition axis is limited to 128 lanes on trn1/trn2. The host wrapper
+# tiles inputs into 128-lane chunks before dispatch.
+_PHILOX_LANES_PER_TILE = 128
 
 
 TWO_PI = 2.0 * math.pi
@@ -267,10 +272,14 @@ if HAS_NKI:
     ) -> torch.Tensor:
         """Host-side wrapper for the Philox NKI kernel.
 
-        Moves inputs to the XLA device (which also imports torch_xla,
-        populating `sys.modules['torch_neuronx']` before the kernel
-        invocation), allocates the output buffer on-device, calls the
-        kernel, and copies the result back.
+        NKI's partition axis is capped at 128 lanes on trn1/trn2. For
+        larger lane counts we tile the input into 128-lane chunks,
+        dispatch the kernel per chunk, and concatenate outputs. The
+        output layout per chunk is `[c0, c1, c2, c3]` interleaved per
+        lane (4 uint32 words → 4 * lanes int32 values per chunk).
+
+        Importing `torch_xla` inside `_to_xla` also populates
+        `sys.modules['torch_neuronx']` before the first kernel invocation.
 
         Args:
             counter_lo: int32 per-lane counter increment, shape `(lanes,)`.
@@ -281,24 +290,42 @@ if HAS_NKI:
             int32 tensor of shape `(lanes * 4,)` holding the Philox output.
         """
         n_lanes = counter_lo.shape[0]
-        (cl, kl, kh), orig = _to_xla(
-            counter_lo.to(torch.int32).contiguous(),
-            key_lo.to(torch.int32).contiguous(),
-            key_hi.to(torch.int32).contiguous(),
-        )
-        out = torch.zeros(n_lanes * 4, dtype=torch.int32, device=cl.device)
-        philox4x32_kernel(cl, kl, kh, out)
-        return out.to(orig)
+        counter_lo = counter_lo.to(torch.int32).contiguous()
+        key_lo = key_lo.to(torch.int32).contiguous()
+        key_hi = key_hi.to(torch.int32).contiguous()
+
+        chunks = []
+        for start in range(0, n_lanes, _PHILOX_LANES_PER_TILE):
+            end = min(start + _PHILOX_LANES_PER_TILE, n_lanes)
+            (cl, kl, kh), orig = _to_xla(
+                counter_lo[start:end].contiguous(),
+                key_lo[start:end].contiguous(),
+                key_hi[start:end].contiguous(),
+            )
+            tile_len = end - start
+            out_tile = torch.zeros(tile_len * 4, dtype=torch.int32, device=cl.device)
+            philox4x32_kernel(cl, kl, kh, out_tile)
+            chunks.append(out_tile.to(orig))
+        return torch.cat(chunks) if len(chunks) > 1 else chunks[0]
 
     def box_muller_nki(uniforms: torch.Tensor) -> torch.Tensor:
         """Host-side wrapper for the Box-Muller NKI kernel.
 
-        Moves the input to the XLA device, calls the kernel, and copies
-        the result back. Expects an even-length float32 tensor of
-        uniforms; returns same-shape float32 normals.
+        Same 128-lane partition-axis constraint as Philox. The input is
+        tiled into chunks of 2 * 128 uniforms per dispatch (each
+        emitting 2 * 128 normals via Box-Muller pairing).
         """
         assert uniforms.numel() % 2 == 0, "Box-Muller needs pairs"
-        (u,), orig = _to_xla(uniforms.to(torch.float32).contiguous())
-        out = torch.zeros_like(u)
-        box_muller_kernel(u, out)
-        return out.to(orig)
+        uniforms = uniforms.to(torch.float32).contiguous()
+        n_pairs = uniforms.numel() // 2
+        tile_pairs = _PHILOX_LANES_PER_TILE  # one pair per "lane" for symmetry
+
+        chunks = []
+        for start_pair in range(0, n_pairs, tile_pairs):
+            end_pair = min(start_pair + tile_pairs, n_pairs)
+            tile_slice = uniforms[start_pair * 2 : end_pair * 2].contiguous()
+            (u,), orig = _to_xla(tile_slice)
+            out_tile = torch.zeros_like(u)
+            box_muller_kernel(u, out_tile)
+            chunks.append(out_tile.to(orig))
+        return torch.cat(chunks) if len(chunks) > 1 else chunks[0]
