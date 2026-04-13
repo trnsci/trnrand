@@ -61,17 +61,42 @@ the distributions that close the gap vs cuRAND / NumPy.
 - [#17](https://github.com/trnsci/trnrand/issues/17) — Truncated normal on
   the Vector Engine (currently host-side rejection).
 
-## v0.4.0+ candidates _(not yet issue-tracked)_
+## v0.4.0 — Phase 3: single-chip performance _(planned)_
 
-Directions that didn't make v0.3.0 but are on the radar:
+Batched-tile RNG streaming, NEFF compile-cache reuse, per-kernel tuning
+so the NKI path is meaningfully faster than the PyTorch fallback.
 
-- **Multi-NeuronCore counter-space sharding.** Throughput scaling beyond
-  one NeuronCore by partitioning Philox counter space across cores.
-- **BF16 / FP16 output dtypes.** Today trnrand emits FP32 only. Low-
-  precision paths save bandwidth in weight-init and noise-injection
-  workloads.
-- **`torch.compile` / inductor integration.** Make `Generator` state
-  graph-friendly so trnrand slots into compiled model graphs without
-  tracing breaks.
+- [#19](https://github.com/trnsci/trnrand/issues/19) — Phase 3 tracker:
+  `trnrand.normal_into(buf)` streaming API, Sobol/Halton perf parity,
+  published tokens/sec + GB/s benchmarks.
 
-Open an issue if any of these turn into priorities.
+## v0.5.0 — Phase 4: multi-chip counter partitioning _(planned)_
+
+Philox's counter-based design makes cross-chip sharding trivial — each
+NeuronCore gets a disjoint counter subrange, outputs are bit-exact vs
+single-chip.
+
+- [#20](https://github.com/trnsci/trnrand/issues/20) — Phase 4 tracker:
+  `Generator` accepts `partition_rank` / `partition_size`; near-linear
+  strong scaling on `trn1.32xlarge`.
+
+## v0.6.0 — Phase 5: trn2 wider-PSUM fast path _(planned)_
+
+Exploit trn2's larger partition count without maintaining two separately
+tuned codebases; runtime capability detection picks the right kernel.
+
+- [#21](https://github.com/trnsci/trnrand/issues/21) — Phase 5 tracker:
+  trn2-specific Philox kernel + runtime hardware detection in dispatch.
+
+## Suite phase mapping
+
+trnrand's roadmap aligns with the
+[trnsci suite-wide phase plan](https://github.com/trnsci/trnsci/blob/main/ROADMAP.md):
+
+| Suite Phase | trnrand Milestone | Tracker |
+|---|---|---|
+| Phase 1 — correctness on hardware | v0.3.0 | [#18](https://github.com/trnsci/trnrand/issues/18) |
+| Phase 2 — precision | *(N/A — trnrand is precision-neutral)* | — |
+| Phase 3 — single-chip perf | v0.4.0 | [#19](https://github.com/trnsci/trnrand/issues/19) |
+| Phase 4 — multi-chip | v0.5.0 | [#20](https://github.com/trnsci/trnrand/issues/20) |
+| Phase 5 — generation-specific | v0.6.0 | [#21](https://github.com/trnsci/trnrand/issues/21) |

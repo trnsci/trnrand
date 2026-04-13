@@ -5,10 +5,16 @@ Standard distributions with reproducible seeding via Generator.
 All functions accept an optional Generator for deterministic streams.
 
 For scientific computing:
-- uniform/normal: Monte Carlo sampling, weight initialization
-- exponential: Poisson process simulation, radioactive decay
-- multinomial: importance sampling
-- truncated_normal: bounded parameter initialization
+
+- uniform / normal / standard_normal — Monte Carlo sampling, weight init
+- exponential — Poisson process simulation, radioactive decay
+- bernoulli — coin-flip sampling, dropout masks
+- randint / randperm — integer sampling, permutations
+- truncated_normal — bounded weight initialization
+- gamma — Bayesian priors, waiting-time distributions
+- chi_squared — variance / goodness-of-fit tests
+- beta — A/B testing, Bayesian conjugate priors
+- poisson — event-count / queuing simulation
 """
 
 from __future__ import annotations
