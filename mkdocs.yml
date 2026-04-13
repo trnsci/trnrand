@@ -1,6 +1,6 @@
 site_name: trnrand
 site_description: Random number generation for AWS Trainium via NKI
-site_url: https://trnsci.github.io/trnrand/
+site_url: https://trnsci.dev/trnrand/
 repo_url: https://github.com/trnsci/trnrand
 repo_name: trnsci/trnrand
 

@@ -4,7 +4,7 @@
 [![PyPI](https://img.shields.io/pypi/v/trnrand)](https://pypi.org/project/trnrand/)
 [![Python](https://img.shields.io/pypi/pyversions/trnrand)](https://pypi.org/project/trnrand/)
 [![License](https://img.shields.io/github/license/trnsci/trnrand)](LICENSE)
-[![Docs](https://img.shields.io/badge/docs-mkdocs-blue)](https://trnsci.github.io/trnrand/)
+[![Docs](https://img.shields.io/badge/docs-trnsci.dev-blue)](https://trnsci.dev/trnrand/)
 
 Random number generation for AWS Trainium via NKI.
 
