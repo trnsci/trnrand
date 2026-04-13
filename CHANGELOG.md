@@ -7,20 +7,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
-### Added
-
-- Philox 4×32-10 NKI kernel scaffold in `trnrand/nki/dispatch.py` with a
-  matching CPU reference (`philox4x32_reference`, `philox_uniform_cpu`)
-  used as the conformance oracle. CPU-side spec invariants tested in
-  `tests/test_nki_philox.py::TestPhiloxReference`. NKI kernel awaits
-  on-hardware validation per #1 — the `TestPhiloxNKI` class is gated by
-  the `neuron` marker.
-- Box-Muller transform on the Vector Engine for `normal()`, with a CPU
-  reference (`box_muller_cpu`) and CPU-side distributional tests
-  (`TestBoxMullerReference`). Vector Engine kernel awaits on-hardware
-  validation per #2.
-
-## [0.1.0] - 2026-04-11
+## [0.1.0] - 2026-04-12
 
 ### Added
 
@@ -31,8 +18,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Quasi-random sequences: `sobol` (scrambled), `halton`, `latin_hypercube`.
 - Backend dispatch: `set_backend` (`auto`/`pytorch`/`nki`), `get_backend`,
   `HAS_NKI` flag.
-- NKI Philox kernel scaffold in `trnrand/nki/dispatch.py` (stub — falls
-  back to `torch.Generator` until validated on hardware).
+- Philox 4×32-10 NKI kernel in `trnrand/nki/dispatch.py` with a CPU
+  reference (`philox4x32_reference`, `philox_uniform_cpu`) used as the
+  conformance oracle. CPU-side spec invariants and the three canonical
+  Salmon et al. SC'11 test vectors are verified in
+  `tests/test_nki_philox.py::TestPhiloxReference`.
+- Box-Muller transform on the Vector Engine for `normal()`, with a CPU
+  reference (`box_muller_cpu`) and CPU-side distributional tests
+  (`TestBoxMullerReference`).
 - MC vs QMC hypersphere-volume example in `examples/mc_integration.py`.
 - Test suites for distributions (reproducibility, statistics, bounds) and
   quasi-random sequences (uniformity, determinism, stratification).
+
+### Known limitations
+
+- **NKI path is not hardware-validated yet.** The Philox and Box-Muller
+  kernels are scaffolded against the NKI 2.24 API and pass the CPU
+  conformance oracle by construction, but the `@pytest.mark.neuron`
+  suite has not yet run on trn1/trn2. Tracked in #1 (Philox) and #2
+  (Box-Muller). Until validated, `trnrand` falls back to `torch.Generator`
+  on CPU — the backend dispatch path is the only user-visible difference.
+- **Benchmarks vs cuRAND pending hardware access** (#3).
