@@ -28,6 +28,7 @@ nav:
   - Architecture: architecture.md
   - Design:
       - SBUF-resident streaming Generator (Phase 3 RFC): design/sbuf_resident_generator.md
+      - Counter-partitioned multi-chip RNG (Phase 4 RFC): design/counter_partitioned_multichip.md
   - Roadmap: roadmap.md
   - Benchmarks: benchmarks.md
   - Deployment:

@@ -204,9 +204,11 @@ The design is compatible with suite-wide patterns:
 
 - **Phase 1** (#18): this RFC assumes #18's Philox + Box-Muller
   kernels are the building blocks. No conflict.
-- **Phase 4** (#20): counter partitioning across chips. The
-  streaming kernel receives a counter subrange at entry; nothing
-  else changes.
+- **Phase 4** ([#20](https://github.com/trnsci/trnrand/issues/20),
+  [RFC](counter_partitioned_multichip.md)): counter partitioning
+  across chips. The streaming kernel receives a counter subrange at
+  entry; NEFF cache is unchanged because rank lives in HBM arguments,
+  not the compiled kernel. Phase 3 and Phase 4 wins multiply cleanly.
 - **[trnsci/trnsci#3](https://github.com/trnsci/trnsci/issues/3)**
   (autograd wrappers): trnrand outputs remain non-differentiable per
   `docs/stability.md#differentiability`. Streaming doesn't change
@@ -218,4 +220,5 @@ The design is compatible with suite-wide patterns:
 
 - [trnsci ROADMAP — Phase 3](https://trnsci.dev/roadmap/#phase-3-single-chip-performance) — suite-wide framing.
 - [trnrand Phase 3 tracker (#19)](https://github.com/trnsci/trnrand/issues/19) — issue-level acceptance criteria.
+- [Phase 4 RFC — Counter-partitioned multi-chip RNG](counter_partitioned_multichip.md) — how this design composes with cluster-scale sharding.
 - [Salmon, Moraes, Dror, Shaw — "Parallel Random Numbers: As Easy as 1, 2, 3" (SC'11)](https://www.thesalmons.org/john/random123/papers/random123sc11.pdf) — Philox spec; informs SBUF state layout.

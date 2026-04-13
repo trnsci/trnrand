@@ -82,6 +82,13 @@ Philox's counter-based design makes cross-chip sharding trivial — each
 NeuronCore gets a disjoint counter subrange, outputs are bit-exact vs
 single-chip.
 
+**Design:** [Counter-partitioned multi-chip RNG RFC](design/counter_partitioned_multichip.md)
+— the bit-exactness thesis: a 1-chip run and a 32-chip run with the
+same seed produce the same combined stream, byte-for-byte. GPU RNG
+libraries typically can't guarantee this; for MCMC / replication
+studies / cluster-reshape debugging, that's a qualitatively different
+property.
+
 - [#20](https://github.com/trnsci/trnrand/issues/20) — Phase 4 tracker:
   `Generator` accepts `partition_rank` / `partition_size`; near-linear
   strong scaling on `trn1.32xlarge`.
