@@ -264,8 +264,9 @@ if HAS_NKI:
             mid = nl.add(hl, lh, dtype=nl.uint32)
             mid_carry = nl.copy(nl.less(mid, hl), dtype=nl.uint32)
 
-            # lo32 = (ll + (mid << 16)) mod 2^32.
-            shifted_mid_lo = nl.bitwise_and(nl.left_shift(mid, 16, dtype=nl.uint32), 0xFFFFFFFF)
+            # lo32 = (ll + (mid << 16)) mod 2^32. Explicit dtype=uint32
+            # on left_shift already truncates to 32 bits — no mask needed.
+            shifted_mid_lo = nl.left_shift(mid, 16, dtype=nl.uint32)
             lo32_u = nl.add(ll, shifted_mid_lo, dtype=nl.uint32)
             lo_carry = nl.copy(nl.less(lo32_u, ll), dtype=nl.uint32)
 
