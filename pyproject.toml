@@ -26,11 +26,11 @@ dependencies = [
 
 [project.optional-dependencies]
 neuron = [
-    # neuronxcc is not on public PyPI; it ships with the Deep Learning AMI Neuron.
-    # Pin >=2.24 to match sibling repos (trnfft) — the NKI calling convention
-    # used by the trn-* suite requires the 2.24+ partition-dim tile layout.
-    # See docs/installation.md for the validated AMI/SDK versions.
-    "neuronxcc>=2.24",
+    # NKI 0.3.0 Stable (Neuron SDK 2.29, April 2026) promotes `nki.*` as the
+    # canonical namespace. Previous releases exposed `neuronxcc.nki.*` which
+    # is now deprecated. Ships with the Deep Learning AMI Neuron or via
+    # https://pip.repos.neuron.amazonaws.com.
+    "nki>=0.3.0",
     "torch-neuronx>=2.9",
 ]
 dev = [

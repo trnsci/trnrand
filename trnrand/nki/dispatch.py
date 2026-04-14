@@ -23,8 +23,8 @@ import warnings
 import torch
 
 try:
-    import neuronxcc.nki as nki
-    import neuronxcc.nki.language as nl
+    import nki
+    import nki.language as nl
 
     HAS_NKI = True
 except ImportError:
