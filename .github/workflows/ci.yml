@@ -31,7 +31,7 @@ jobs:
         with:
           python-version: ${{ matrix.python-version }}
       - run: pip install -e ".[dev]"
-      - run: pytest tests/ -v -x --tb=short -m "not neuron and not simulator" --cov=trnrand --cov-report=xml --cov-report=term
+      - run: pytest tests/ -v -x --tb=short -m "not neuron and not nki_simulator" --cov=trnrand --cov-report=xml --cov-report=term
       - name: Upload coverage to Codecov
         if: matrix.python-version == '3.12'
         uses: codecov/codecov-action@v4
@@ -40,22 +40,24 @@ jobs:
           flags: unittests
           fail_ci_if_error: false
 
-  test-simulator:
+  nki-simulator:
     runs-on: ubuntu-latest
-    # Until neuronx-cc 2.29 hits the Neuron pip index, this job will
-    # fail at install. Keep CI green with continue-on-error so trnrand
-    # stays on main-branch-green while Amazon catches up; the job
-    # auto-lights-up the moment the package drops.
+    # Until `nki>=0.3.0` hits the Neuron pip index this job fails at
+    # install. Keep CI green via continue-on-error so trnrand stays on
+    # main-branch-green while Amazon catches up; auto-activates when
+    # the package drops. Suite-wide pattern — see trnblas ci.yml.
     continue-on-error: true
+    env:
+      TRNRAND_USE_SIMULATOR: "1"
     steps:
       - uses: actions/checkout@v6
       - uses: actions/setup-python@v6
         with:
           python-version: "3.12"
-      - name: Install neuronx-cc (Neuron SDK 2.29 / NKI 0.3.0 Stable)
-        run: pip install "neuronx-cc>=2.29" --extra-index-url https://pip.repos.neuron.amazonaws.com
+      - name: Install nki (Neuron SDK 2.29 / NKI 0.3.0 Stable)
+        run: pip install "nki>=0.3.0" --extra-index-url https://pip.repos.neuron.amazonaws.com
       - run: pip install -e ".[dev]"
-      - run: pytest tests/ -v -m simulator --cov=trnrand --cov-report=xml --cov-append
+      - run: pytest tests/ -v -m nki_simulator --cov=trnrand --cov-report=xml --cov-append
       - name: Upload coverage reports to Codecov
         uses: codecov/codecov-action@v5
         with:
