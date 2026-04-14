@@ -210,18 +210,81 @@ def philox_uniform_cpu(
 
 
 if HAS_NKI:
+    # NKI 0.3.0 has no int64 — max integer width is 32 bits. The 32×32
+    # Philox multiply decomposes into four 16×16 sub-multiplies that each
+    # fit in uint32, reassembled so every intermediate stays ≤ uint32 max.
+    # Helper must be module-level (inside the `if HAS_NKI:` block): NKI
+    # rejects inner function definitions inside @nki.jit kernels.
+    _PHILOX_M0_L = PHILOX_M0 & 0xFFFF  # 0x1F53
+    _PHILOX_M0_H = (PHILOX_M0 >> 16) & 0xFFFF  # 0xD251
+    _PHILOX_M1_L = PHILOX_M1 & 0xFFFF  # 0x8D57
+    _PHILOX_M1_H = (PHILOX_M1 >> 16) & 0xFFFF  # 0xCD9E
+
+    def _mul32_hi_lo(a, b_l, b_h):
+        """32×32→64 multiply returning (hi32, lo32) int32 tensors.
+
+        Carry-free 16-bit half decomposition — every intermediate fits
+        in uint32 by construction, no bool-based overflow detection:
+
+            a = a_h<<16 + a_l,   b = b_h<<16 + b_l
+            p00 = a_l * b_l   ≤ 0xFFFE0001
+            p01 = a_l * b_h   ≤ 0xFFFE0001
+            p10 = a_h * b_l   ≤ 0xFFFE0001
+            p11 = a_h * b_h   ≤ 0xFFFE0001
+
+            mid  = (p00>>16) + (p01&0xFFFF) + (p10&0xFFFF)  ≤ 3·0xFFFF
+            lo32 = (mid&0xFFFF)<<16 | (p00&0xFFFF)
+            hi32 = (mid>>16) + (p01>>16) + (p10>>16) + p11  ≤ 0xFFFFFFFE
+
+        `a` is a uint32-valued int32 tile. `b_l`, `b_h` are int32 scalar
+        constants (low/high 16 bits of the uint32 multiplier).
+        """
+        a_l = nl.bitwise_and(a, 0xFFFF)
+        a_h = nl.right_shift(a, 16, dtype=nl.uint32)
+
+        p00 = nl.multiply(a_l, b_l, dtype=nl.uint32)
+        p01 = nl.multiply(a_l, b_h, dtype=nl.uint32)
+        p10 = nl.multiply(a_h, b_l, dtype=nl.uint32)
+        p11 = nl.multiply(a_h, b_h, dtype=nl.uint32)
+
+        p00_hi = nl.right_shift(p00, 16, dtype=nl.uint32)
+        p01_lo = nl.bitwise_and(p01, 0xFFFF)
+        p01_hi = nl.right_shift(p01, 16, dtype=nl.uint32)
+        p10_lo = nl.bitwise_and(p10, 0xFFFF)
+        p10_hi = nl.right_shift(p10, 16, dtype=nl.uint32)
+
+        mid = nl.add(
+            nl.add(p00_hi, p01_lo, dtype=nl.uint32),
+            p10_lo,
+            dtype=nl.uint32,
+        )  # ≤ 3 × 0xFFFF = 0x2FFFD
+
+        lo32_u = nl.bitwise_or(
+            nl.left_shift(nl.bitwise_and(mid, 0xFFFF), 16, dtype=nl.uint32),
+            nl.bitwise_and(p00, 0xFFFF),
+        )
+
+        hi32_u = nl.add(
+            nl.add(p11, p01_hi, dtype=nl.uint32),
+            nl.add(
+                p10_hi,
+                nl.right_shift(mid, 16, dtype=nl.uint32),
+                dtype=nl.uint32,
+            ),
+            dtype=nl.uint32,
+        )  # max 0xFFFFFFFE
+
+        # Return int32 for downstream XOR — same bit pattern.
+        return nl.copy(hi32_u, dtype=nl.int32), nl.copy(lo32_u, dtype=nl.int32)
 
     @nki.jit
     def philox4x32_kernel(counter_lo_ref, key_lo_ref, key_hi_ref):
         """Philox 4×32-10 NKI kernel on GpSimd.
 
         Each of the P partition-axis lanes runs one independent Philox
-        stream. Input shape is `(P, 1)` per @nki.jit / NKI convention
-        (partition, free). Output is `(P, 4)` — one int32 per round-output
-        word per lane. The wrapper flattens to `(P*4,)` interleaved.
-
-        Status: scaffolded against the Philox 4×32-10 spec. CPU reference
-        in `philox4x32_reference` is the conformance oracle.
+        stream. Input shape is `(P, 1)` per NKI convention (partition,
+        free). Output is `(P, 4)` — one int32 per round-output word per
+        lane. The wrapper flattens to `(P*4,)` interleaved.
         """
         c0 = nl.load(counter_lo_ref)
         c1 = nl.zeros_like(c0)
@@ -230,78 +293,11 @@ if HAS_NKI:
         k0 = nl.load(key_lo_ref)
         k1 = nl.load(key_hi_ref)
 
-        # NKI 0.3.0 has no int64 dtype — max integer width is 32 bits.
-        # Compute the 32×32→64 Philox multiply via 16-bit half
-        # decomposition: (aH<<16 | aL) * (bH<<16 | bL) decomposes into
-        # four 16×16 sub-multiplies that each fit in uint32, reassembled
-        # with explicit carry bits.
-        m0_l = PHILOX_M0 & 0xFFFF  # 0x1F53
-        m0_h = (PHILOX_M0 >> 16) & 0xFFFF  # 0xD251
-        m1_l = PHILOX_M1 & 0xFFFF  # 0x8D57
-        m1_h = (PHILOX_M1 >> 16) & 0xFFFF  # 0xCD9E
-
-        def _mul32_hi_lo(a, b_l, b_h):
-            """32×32→64 multiply returning (hi32, lo32) int32 tensors.
-
-            Carry-free 16-bit half decomposition: every intermediate fits
-            in uint32 by construction — no bool carry bits, no nl.less-
-            based overflow detection.
-
-                a = a_h<<16 + a_l,   b = b_h<<16 + b_l
-                p00 = a_l * b_l   ≤ 0xFFFE0001
-                p01 = a_l * b_h   ≤ 0xFFFE0001
-                p10 = a_h * b_l   ≤ 0xFFFE0001
-                p11 = a_h * b_h   ≤ 0xFFFE0001
-
-                mid  = (p00>>16) + (p01&0xFFFF) + (p10&0xFFFF)  ≤ 3·0xFFFF
-                lo32 = (mid&0xFFFF)<<16 | (p00&0xFFFF)
-                hi32 = (mid>>16) + (p01>>16) + (p10>>16) + p11  ≤ 0xFFFFFFFE
-
-            `a` is a uint32-valued int32 tile. `b_l`, `b_h` are int32
-            scalar constants (low/high 16 bits of the uint32 multiplier).
-            """
-            a_l = nl.bitwise_and(a, 0xFFFF)
-            a_h = nl.right_shift(a, 16, dtype=nl.uint32)
-
-            p00 = nl.multiply(a_l, b_l, dtype=nl.uint32)
-            p01 = nl.multiply(a_l, b_h, dtype=nl.uint32)
-            p10 = nl.multiply(a_h, b_l, dtype=nl.uint32)
-            p11 = nl.multiply(a_h, b_h, dtype=nl.uint32)
-
-            p00_hi = nl.right_shift(p00, 16, dtype=nl.uint32)
-            p01_lo = nl.bitwise_and(p01, 0xFFFF)
-            p01_hi = nl.right_shift(p01, 16, dtype=nl.uint32)
-            p10_lo = nl.bitwise_and(p10, 0xFFFF)
-            p10_hi = nl.right_shift(p10, 16, dtype=nl.uint32)
-
-            mid = nl.add(
-                nl.add(p00_hi, p01_lo, dtype=nl.uint32),
-                p10_lo,
-                dtype=nl.uint32,
-            )  # ≤ 3 × 0xFFFF = 0x2FFFD
-
-            lo32_u = nl.bitwise_or(
-                nl.left_shift(nl.bitwise_and(mid, 0xFFFF), 16, dtype=nl.uint32),
-                nl.bitwise_and(p00, 0xFFFF),
-            )
-
-            hi32_u = nl.add(
-                nl.add(p11, p01_hi, dtype=nl.uint32),
-                nl.add(
-                    p10_hi,
-                    nl.right_shift(mid, 16, dtype=nl.uint32),
-                    dtype=nl.uint32,
-                ),
-                dtype=nl.uint32,
-            )  # max 0xFFFFFFFE
-
-            # Return int32 for downstream XOR — same bit pattern.
-            return nl.copy(hi32_u, dtype=nl.int32), nl.copy(lo32_u, dtype=nl.int32)
-
-        # 10 rounds of Philox.
+        # 10 rounds of Philox — multiply via the carry-free 16-bit
+        # decomposition helper (module-level; NKI forbids inner defs).
         for _ in nl.static_range(PHILOX_ROUNDS):
-            hi0, lo0 = _mul32_hi_lo(c0, m0_l, m0_h)
-            hi1, lo1 = _mul32_hi_lo(c2, m1_l, m1_h)
+            hi0, lo0 = _mul32_hi_lo(c0, _PHILOX_M0_L, _PHILOX_M0_H)
+            hi1, lo1 = _mul32_hi_lo(c2, _PHILOX_M1_L, _PHILOX_M1_H)
 
             new_c0 = nl.bitwise_xor(nl.bitwise_xor(hi1, c1), k0)
             new_c1 = lo1
