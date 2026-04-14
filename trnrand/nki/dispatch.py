@@ -243,45 +243,59 @@ if HAS_NKI:
         def _mul32_hi_lo(a, b_l, b_h):
             """32×32→64 multiply returning (hi32, lo32) int32 tensors.
 
-            `a` is a uint32-valued int32 tile. `b_l`, `b_h` are int32 scalar
-            constants (low/high 16 bits of the full uint32 multiplier).
-            All intermediate products fit in uint32 (16×16≤0xFFFE0001).
+            Carry-free 16-bit half decomposition: every intermediate fits
+            in uint32 by construction — no bool carry bits, no nl.less-
+            based overflow detection.
+
+                a = a_h<<16 + a_l,   b = b_h<<16 + b_l
+                p00 = a_l * b_l   ≤ 0xFFFE0001
+                p01 = a_l * b_h   ≤ 0xFFFE0001
+                p10 = a_h * b_l   ≤ 0xFFFE0001
+                p11 = a_h * b_h   ≤ 0xFFFE0001
+
+                mid  = (p00>>16) + (p01&0xFFFF) + (p10&0xFFFF)  ≤ 3·0xFFFF
+                lo32 = (mid&0xFFFF)<<16 | (p00&0xFFFF)
+                hi32 = (mid>>16) + (p01>>16) + (p10>>16) + p11  ≤ 0xFFFFFFFE
+
+            `a` is a uint32-valued int32 tile. `b_l`, `b_h` are int32
+            scalar constants (low/high 16 bits of the uint32 multiplier).
             """
             a_l = nl.bitwise_and(a, 0xFFFF)
-            a_h = nl.bitwise_and(nl.right_shift(a, 16), 0xFFFF)
+            a_h = nl.right_shift(a, 16, dtype=nl.uint32)
 
-            # Four 16×16→32 sub-products. Declare dtype=uint32 so that
-            # aH*bH (which can exceed INT32_MAX = 0x7FFFFFFF for e.g.
-            # 0xFFFF*0xD251 = 0xD2503DAF) doesn't get sign-extended.
-            ll = nl.multiply(a_l, b_l, dtype=nl.uint32)
-            hl = nl.multiply(a_h, b_l, dtype=nl.uint32)
-            lh = nl.multiply(a_l, b_h, dtype=nl.uint32)
-            hh = nl.multiply(a_h, b_h, dtype=nl.uint32)
+            p00 = nl.multiply(a_l, b_l, dtype=nl.uint32)
+            p01 = nl.multiply(a_l, b_h, dtype=nl.uint32)
+            p10 = nl.multiply(a_h, b_l, dtype=nl.uint32)
+            p11 = nl.multiply(a_h, b_h, dtype=nl.uint32)
 
-            # mid = hl + lh; may overflow uint32 (both can be up to
-            # 0xD2503DAF, so sum up to ~1.75 * 2^32 — overflow bit = 1
-            # whenever the sum wraps below either operand).
-            mid = nl.add(hl, lh, dtype=nl.uint32)
-            mid_carry = nl.copy(nl.less(mid, hl), dtype=nl.uint32)
+            p00_hi = nl.right_shift(p00, 16, dtype=nl.uint32)
+            p01_lo = nl.bitwise_and(p01, 0xFFFF)
+            p01_hi = nl.right_shift(p01, 16, dtype=nl.uint32)
+            p10_lo = nl.bitwise_and(p10, 0xFFFF)
+            p10_hi = nl.right_shift(p10, 16, dtype=nl.uint32)
 
-            # lo32 = (ll + (mid << 16)) mod 2^32. Explicit dtype=uint32
-            # on left_shift already truncates to 32 bits — no mask needed.
-            shifted_mid_lo = nl.left_shift(mid, 16, dtype=nl.uint32)
-            lo32_u = nl.add(ll, shifted_mid_lo, dtype=nl.uint32)
-            lo_carry = nl.copy(nl.less(lo32_u, ll), dtype=nl.uint32)
+            mid = nl.add(
+                nl.add(p00_hi, p01_lo, dtype=nl.uint32),
+                p10_lo,
+                dtype=nl.uint32,
+            )  # ≤ 3 × 0xFFFF = 0x2FFFD
 
-            # hi32 = hh + (mid >> 16) + (mid_carry << 16) + lo_carry.
+            lo32_u = nl.bitwise_or(
+                nl.left_shift(nl.bitwise_and(mid, 0xFFFF), 16, dtype=nl.uint32),
+                nl.bitwise_and(p00, 0xFFFF),
+            )
+
             hi32_u = nl.add(
-                nl.add(hh, nl.right_shift(mid, 16, dtype=nl.uint32), dtype=nl.uint32),
+                nl.add(p11, p01_hi, dtype=nl.uint32),
                 nl.add(
-                    nl.left_shift(mid_carry, 16, dtype=nl.uint32),
-                    lo_carry,
+                    p10_hi,
+                    nl.right_shift(mid, 16, dtype=nl.uint32),
                     dtype=nl.uint32,
                 ),
                 dtype=nl.uint32,
-            )
+            )  # max 0xFFFFFFFE
 
-            # Cast back to int32 for downstream XOR — same bit pattern.
+            # Return int32 for downstream XOR — same bit pattern.
             return nl.copy(hi32_u, dtype=nl.int32), nl.copy(lo32_u, dtype=nl.int32)
 
         # 10 rounds of Philox.
