@@ -239,8 +239,12 @@ if HAS_NKI:
         `a` is a uint32-valued int32 tile. `b_l`, `b_h` are int32 scalar
         constants (low/high 16 bits of the uint32 multiplier).
         """
-        a_l = nl.bitwise_and(a, 0xFFFF)
-        a_h = nl.right_shift(a, 16, dtype=nl.uint32)
+        # Cast `a` to uint32 up front so the dst/src dtype match in MLIR
+        # tensor_scalar_bitvec ops (bitwise_and, right_shift). Hardware
+        # verifier rejects src=i32/dst=ui32 mismatches.
+        a_u = nl.copy(a, dtype=nl.uint32)
+        a_l = nl.bitwise_and(a_u, 0xFFFF, dtype=nl.uint32)
+        a_h = nl.right_shift(a_u, 16, dtype=nl.uint32)
 
         p00 = nl.multiply(a_l, b_l, dtype=nl.uint32)
         p01 = nl.multiply(a_l, b_h, dtype=nl.uint32)
