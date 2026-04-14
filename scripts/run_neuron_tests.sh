@@ -87,23 +87,25 @@ if [[ "$PING" != "Online" ]]; then
   exit 1
 fi
 
-# --philox-only: deselect Box-Muller kernel tests from TestPhiloxNKI so we
-# can see Philox's hardware status without Box-Muller's separate trn1
-# compile issue (NCC_IBIR605) masking it. Simulator has already validated
+# --philox-only: deselect the two Box-Muller kernel tests so we can see
+# Philox's hardware status without Box-Muller's separate trn1 compile
+# issue (NCC_IBIR605) masking it. Simulator has already validated
 # Box-Muller; isolating Philox here gives independent hardware signal.
+# Uses explicit --deselect node-ids (not -k) to avoid nested-quote issues
+# in the SSM command parameter.
 if [[ "$PHILOX_ONLY" == "1" ]]; then
-  PYTEST_K_EXPR='-k "not box_muller"'
+  PYTEST_DESELECT="--deselect tests/test_nki_philox.py::TestPhiloxNKI::test_box_muller_kernel_matches_reference --deselect tests/test_nki_philox.py::TestPhiloxNKI::test_box_muller_kernel_distribution"
 else
-  PYTEST_K_EXPR=""
+  PYTEST_DESELECT=""
 fi
 
 # --warm: run the suite twice to expose the NEFF cache delta — the second
 # pass gets warm /var/tmp/neuron-compile-cache/. -s surfaces the perf
 # prints from TestPerformance.
 if [[ "$WARM" == "1" ]]; then
-  PYTEST_INVOCATION="\$NEURON_VENV/bin/pytest /home/ubuntu/trnrand/tests/ -v -s -m neuron $PYTEST_K_EXPR --tb=short && echo === WARM PASS === && \$NEURON_VENV/bin/pytest /home/ubuntu/trnrand/tests/ -v -s -m neuron $PYTEST_K_EXPR --tb=short"
+  PYTEST_INVOCATION="\$NEURON_VENV/bin/pytest /home/ubuntu/trnrand/tests/ -v -s -m neuron $PYTEST_DESELECT --tb=short && echo === WARM PASS === && \$NEURON_VENV/bin/pytest /home/ubuntu/trnrand/tests/ -v -s -m neuron $PYTEST_DESELECT --tb=short"
 else
-  PYTEST_INVOCATION="\$NEURON_VENV/bin/pytest /home/ubuntu/trnrand/tests/ -v -m neuron $PYTEST_K_EXPR --tb=short"
+  PYTEST_INVOCATION="\$NEURON_VENV/bin/pytest /home/ubuntu/trnrand/tests/ -v -m neuron $PYTEST_DESELECT --tb=short"
 fi
 
 echo "Sending test command (SHA=$SHA, warm=$WARM)..."
