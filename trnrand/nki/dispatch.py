@@ -262,12 +262,12 @@ if HAS_NKI:
             # 0xD2503DAF, so sum up to ~1.75 * 2^32 — overflow bit = 1
             # whenever the sum wraps below either operand).
             mid = nl.add(hl, lh, dtype=nl.uint32)
-            mid_carry = nl.static_cast(nl.less(mid, hl), dtype=nl.uint32)
+            mid_carry = nl.copy(nl.less(mid, hl), dtype=nl.uint32)
 
             # lo32 = (ll + (mid << 16)) mod 2^32.
             shifted_mid_lo = nl.bitwise_and(nl.left_shift(mid, 16, dtype=nl.uint32), 0xFFFFFFFF)
             lo32_u = nl.add(ll, shifted_mid_lo, dtype=nl.uint32)
-            lo_carry = nl.static_cast(nl.less(lo32_u, ll), dtype=nl.uint32)
+            lo_carry = nl.copy(nl.less(lo32_u, ll), dtype=nl.uint32)
 
             # hi32 = hh + (mid >> 16) + (mid_carry << 16) + lo_carry.
             hi32_u = nl.add(
@@ -281,7 +281,7 @@ if HAS_NKI:
             )
 
             # Cast back to int32 for downstream XOR — same bit pattern.
-            return nl.static_cast(hi32_u, dtype=nl.int32), nl.static_cast(lo32_u, dtype=nl.int32)
+            return nl.copy(hi32_u, dtype=nl.int32), nl.copy(lo32_u, dtype=nl.int32)
 
         # 10 rounds of Philox.
         for _ in nl.static_range(PHILOX_ROUNDS):
@@ -296,10 +296,10 @@ if HAS_NKI:
 
             # Key bump: (k + W) mod 2^32. W fits in uint32 but exceeds
             # INT32_MAX, so do the add as uint32 and cast back.
-            k0_u = nl.add(nl.static_cast(k0, dtype=nl.uint32), PHILOX_W0, dtype=nl.uint32)
-            k1_u = nl.add(nl.static_cast(k1, dtype=nl.uint32), PHILOX_W1, dtype=nl.uint32)
-            k0 = nl.static_cast(k0_u, dtype=nl.int32)
-            k1 = nl.static_cast(k1_u, dtype=nl.int32)
+            k0_u = nl.add(nl.copy(k0, dtype=nl.uint32), PHILOX_W0, dtype=nl.uint32)
+            k1_u = nl.add(nl.copy(k1, dtype=nl.uint32), PHILOX_W1, dtype=nl.uint32)
+            k0 = nl.copy(k0_u, dtype=nl.int32)
+            k1 = nl.copy(k1_u, dtype=nl.int32)
 
         P = counter_lo_ref.shape[0]
         out = nl.ndarray((P, 4), dtype=counter_lo_ref.dtype, buffer=nl.shared_hbm)
