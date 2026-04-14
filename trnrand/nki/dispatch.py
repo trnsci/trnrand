@@ -336,14 +336,17 @@ if HAS_NKI:
         pairs = nl.load(uniforms_ref)
         u1 = pairs[:, 0:1]
         u2 = pairs[:, 1:2]
-        # Clamp u1 away from 0 to avoid log(0) = -inf.
-        u1_safe = nl.maximum(u1, 1e-10)
-        # trn1 compiler restriction (NCC_IBIR605): InstActivation bias for
-        # Log must be a vector-immediate tensor, not a scalar. Materialize
-        # the -2 factor as an (P, 1) tensor rather than a Python scalar.
+        # trn1 compiler restriction (NCC_IBIR605): InstActivation with Ln
+        # rejects scalar-immediate bias parameters. Materialize any
+        # scalar feeding into or out of nl.log as a vector-immediate
+        # (P, 1) tensor. This avoids the compiler fusing the clamp /
+        # scale into a Log activation with a scalar bias.
+        clamp_eps = nl.full((P, 1), 1e-10, dtype=uniforms_ref.dtype)
+        u1_safe = nl.maximum(u1, clamp_eps)
         neg_two = nl.full((P, 1), -2.0, dtype=uniforms_ref.dtype)
         r = nl.sqrt(nl.multiply(nl.log(u1_safe), neg_two))
-        theta = nl.multiply(u2, TWO_PI)
+        two_pi = nl.full((P, 1), TWO_PI, dtype=uniforms_ref.dtype)
+        theta = nl.multiply(u2, two_pi)
         z1 = nl.multiply(r, nl.cos(theta))
         z2 = nl.multiply(r, nl.sin(theta))
 
