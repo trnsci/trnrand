@@ -95,12 +95,37 @@ def _use_nki() -> bool:
 
 
 # Philox 4×32-10 constants (Salmon et al., SC'11; matches cuRAND, JAX).
+# Canonical uint32 values — used by the CPU reference.
 PHILOX_M0 = 0xD2511F53
 PHILOX_M1 = 0xCD9E8D57
 PHILOX_W0 = 0x9E3779B9
 PHILOX_W1 = 0xBB67AE85
 PHILOX_ROUNDS = 10
 UINT32_MASK = 0xFFFFFFFF
+
+
+def _as_i32(u: int) -> int:
+    """Reinterpret a uint32 as int32 (two's complement, same bit pattern).
+
+    NKI's `nl.multiply` and friends take int32 scalars. Constants like
+    `PHILOX_M0 = 0xD2511F53` (3_528_531_795) exceed INT32_MAX, so passing
+    them verbatim raises `OverflowError: Python integer ... out of bounds
+    for int32`. Reinterpreting via two's complement keeps the bit pattern
+    identical — the multiply's low-32 bits are unaffected by sign
+    interpretation (wraparound is wraparound), and the high-32 bits we
+    extract via `nl.right_shift(..., 32)` + `nl.bitwise_and(..., MASK)`
+    reconstruct the unsigned result.
+    """
+    return u - (1 << 32) if u >= (1 << 31) else u
+
+
+# Int32 signed reinterpretation of the Philox constants — used only by the
+# NKI kernel. The uint32 constants above remain canonical for the CPU path.
+_PHILOX_M0_I32 = _as_i32(PHILOX_M0)
+_PHILOX_M1_I32 = _as_i32(PHILOX_M1)
+_PHILOX_W0_I32 = _as_i32(PHILOX_W0)
+_PHILOX_W1_I32 = _as_i32(PHILOX_W1)
+_UINT32_MASK_I32 = _as_i32(UINT32_MASK)  # -1
 
 
 def philox4x32_reference(counter: torch.Tensor, key: torch.Tensor) -> torch.Tensor:
@@ -209,15 +234,17 @@ if HAS_NKI:
         k0 = nl.load(key_lo_ref)
         k1 = nl.load(key_hi_ref)
 
-        # 10 rounds of the Philox round function. NKI mul is i64 on i32
-        # inputs; high/low 32 isolated via shift+mask.
+        # 10 rounds of the Philox round function. NKI scalar ops take int32,
+        # so the uint32 Philox constants are passed as their two's-complement
+        # signed-int32 reinterpretation (same bit pattern). The multiply
+        # wraparound is unsigned-equivalent; shift+mask extracts high/low 32.
         for _ in nl.static_range(PHILOX_ROUNDS):
-            prod0 = nl.multiply(c0, PHILOX_M0)
-            prod1 = nl.multiply(c2, PHILOX_M1)
-            hi0 = nl.bitwise_and(nl.right_shift(prod0, 32), UINT32_MASK)
-            lo0 = nl.bitwise_and(prod0, UINT32_MASK)
-            hi1 = nl.bitwise_and(nl.right_shift(prod1, 32), UINT32_MASK)
-            lo1 = nl.bitwise_and(prod1, UINT32_MASK)
+            prod0 = nl.multiply(c0, _PHILOX_M0_I32)
+            prod1 = nl.multiply(c2, _PHILOX_M1_I32)
+            hi0 = nl.bitwise_and(nl.right_shift(prod0, 32), _UINT32_MASK_I32)
+            lo0 = nl.bitwise_and(prod0, _UINT32_MASK_I32)
+            hi1 = nl.bitwise_and(nl.right_shift(prod1, 32), _UINT32_MASK_I32)
+            lo1 = nl.bitwise_and(prod1, _UINT32_MASK_I32)
 
             new_c0 = nl.bitwise_xor(nl.bitwise_xor(hi1, c1), k0)
             new_c1 = lo1
@@ -225,8 +252,8 @@ if HAS_NKI:
             new_c3 = lo0
             c0, c1, c2, c3 = new_c0, new_c1, new_c2, new_c3
 
-            k0 = nl.bitwise_and(nl.add(k0, PHILOX_W0), UINT32_MASK)
-            k1 = nl.bitwise_and(nl.add(k1, PHILOX_W1), UINT32_MASK)
+            k0 = nl.bitwise_and(nl.add(k0, _PHILOX_W0_I32), _UINT32_MASK_I32)
+            k1 = nl.bitwise_and(nl.add(k1, _PHILOX_W1_I32), _UINT32_MASK_I32)
 
         P = counter_lo_ref.shape[0]
         out = nl.ndarray((P, 4), dtype=counter_lo_ref.dtype, buffer=nl.shared_hbm)
