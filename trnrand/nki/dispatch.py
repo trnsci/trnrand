@@ -20,6 +20,7 @@ import math
 import os
 import warnings
 
+import numpy as np
 import torch
 
 try:
@@ -34,6 +35,22 @@ except ImportError:
 # PyTorch reference path. Used by the validation suite to catch silent
 # kernel breakage during iteration — mirrors TRNBLAS_REQUIRE_NKI etc.
 _REQUIRE_NKI = os.environ.get("TRNRAND_REQUIRE_NKI", "").lower() in ("1", "true", "yes")
+
+# When set, dispatch bypasses torch_xla and runs kernels through
+# `nki.simulate(kernel)(np_args)` on CPU. Lets us iterate kernels on any
+# x86_64 Linux box without paying the NEFF compile + hardware dispatch
+# cost. Semantics follow NKI 0.3.0's simulator: no NEFF compile, no
+# SBUF/PSUM capacity checks, no latency/parallelism modelling. For
+# correctness iteration only; hardware still owns perf numbers.
+_USE_SIMULATOR = os.environ.get("TRNRAND_USE_SIMULATOR", "").lower() in (
+    "1",
+    "true",
+    "yes",
+)
+
+
+def _use_simulator() -> bool:
+    return _USE_SIMULATOR and HAS_NKI
 
 
 class NkiFallbackWarning(UserWarning):
@@ -318,16 +335,24 @@ if HAS_NKI:
         chunks = []
         for start in range(0, n_lanes, _PHILOX_LANES_PER_TILE):
             end = min(start + _PHILOX_LANES_PER_TILE, n_lanes)
-            # NKI expects (partition, free) — reshape to (tile_len, 1).
-            (cl, kl, kh), orig = _to_xla(
-                counter_lo[start:end].reshape(-1, 1).contiguous(),
-                key_lo[start:end].reshape(-1, 1).contiguous(),
-                key_hi[start:end].reshape(-1, 1).contiguous(),
-            )
-            # Kernel returns (tile_len, 4); flatten to interleaved
-            # [c0_0, c1_0, c2_0, c3_0, c0_1, c1_1, ...].
-            out_tile = philox4x32_kernel(cl, kl, kh).reshape(-1)
-            chunks.append(out_tile.to(orig))
+            cl_tile = counter_lo[start:end].reshape(-1, 1).contiguous()
+            kl_tile = key_lo[start:end].reshape(-1, 1).contiguous()
+            kh_tile = key_hi[start:end].reshape(-1, 1).contiguous()
+
+            if _use_simulator():
+                # CPU path: feed NumPy directly to nki.simulate(kernel).
+                out_np = nki.simulate(philox4x32_kernel)(
+                    cl_tile.cpu().numpy(),
+                    kl_tile.cpu().numpy(),
+                    kh_tile.cpu().numpy(),
+                )
+                out_tile = torch.from_numpy(np.asarray(out_np)).reshape(-1)
+            else:
+                (cl, kl, kh), orig = _to_xla(cl_tile, kl_tile, kh_tile)
+                # Kernel returns (tile_len, 4); flatten to interleaved
+                # [c0_0, c1_0, c2_0, c3_0, c0_1, c1_1, ...].
+                out_tile = philox4x32_kernel(cl, kl, kh).reshape(-1).to(orig)
+            chunks.append(out_tile)
         return torch.cat(chunks) if len(chunks) > 1 else chunks[0]
 
     def box_muller_nki(uniforms: torch.Tensor) -> torch.Tensor:
@@ -348,8 +373,13 @@ if HAS_NKI:
             # Reshape flat uniforms to (tile_len, 2) — partition axis is lanes,
             # free axis is the (u1, u2) pair.
             tile_slice = uniforms[start_pair * 2 : end_pair * 2].reshape(-1, 2).contiguous()
-            (u,), orig = _to_xla(tile_slice)
-            # Kernel returns (tile_len, 2); flatten to interleaved [z1, z2, z1, z2, ...].
-            out_tile = box_muller_kernel(u).reshape(-1)
-            chunks.append(out_tile.to(orig))
+
+            if _use_simulator():
+                out_np = nki.simulate(box_muller_kernel)(tile_slice.cpu().numpy())
+                out_tile = torch.from_numpy(np.asarray(out_np)).reshape(-1)
+            else:
+                (u,), orig = _to_xla(tile_slice)
+                # Kernel returns (tile_len, 2); flatten to interleaved [z1, z2, z1, z2, ...].
+                out_tile = box_muller_kernel(u).reshape(-1).to(orig)
+            chunks.append(out_tile)
         return torch.cat(chunks) if len(chunks) > 1 else chunks[0]
