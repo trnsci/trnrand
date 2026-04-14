@@ -230,42 +230,76 @@ if HAS_NKI:
         k0 = nl.load(key_lo_ref)
         k1 = nl.load(key_hi_ref)
 
-        # 10 rounds of Philox. The multiply needs 32×32→64-bit semantics;
-        # NKI int32 multiplies sign-extend the result, so we promote
-        # operands to int64 and mask to uint32-range before the multiply.
-        # That gives a non-negative int64 product whose high/low 32 bits
-        # we can extract cleanly with shift+mask. Cast back to int32 for
-        # the XOR/store path.
+        # NKI 0.3.0 has no int64 dtype — max integer width is 32 bits.
+        # Compute the 32×32→64 Philox multiply via 16-bit half
+        # decomposition: (aH<<16 | aL) * (bH<<16 | bL) decomposes into
+        # four 16×16 sub-multiplies that each fit in uint32, reassembled
+        # with explicit carry bits.
+        m0_l = PHILOX_M0 & 0xFFFF  # 0x1F53
+        m0_h = (PHILOX_M0 >> 16) & 0xFFFF  # 0xD251
+        m1_l = PHILOX_M1 & 0xFFFF  # 0x8D57
+        m1_h = (PHILOX_M1 >> 16) & 0xFFFF  # 0xCD9E
+
+        def _mul32_hi_lo(a, b_l, b_h):
+            """32×32→64 multiply returning (hi32, lo32) int32 tensors.
+
+            `a` is a uint32-valued int32 tile. `b_l`, `b_h` are int32 scalar
+            constants (low/high 16 bits of the full uint32 multiplier).
+            All intermediate products fit in uint32 (16×16≤0xFFFE0001).
+            """
+            a_l = nl.bitwise_and(a, 0xFFFF)
+            a_h = nl.bitwise_and(nl.right_shift(a, 16), 0xFFFF)
+
+            # Four 16×16→32 sub-products. Declare dtype=uint32 so that
+            # aH*bH (which can exceed INT32_MAX = 0x7FFFFFFF for e.g.
+            # 0xFFFF*0xD251 = 0xD2503DAF) doesn't get sign-extended.
+            ll = nl.multiply(a_l, b_l, dtype=nl.uint32)
+            hl = nl.multiply(a_h, b_l, dtype=nl.uint32)
+            lh = nl.multiply(a_l, b_h, dtype=nl.uint32)
+            hh = nl.multiply(a_h, b_h, dtype=nl.uint32)
+
+            # mid = hl + lh; may overflow uint32 (both can be up to
+            # 0xD2503DAF, so sum up to ~1.75 * 2^32 — overflow bit = 1
+            # whenever the sum wraps below either operand).
+            mid = nl.add(hl, lh, dtype=nl.uint32)
+            mid_carry = nl.static_cast(nl.less(mid, hl), dtype=nl.uint32)
+
+            # lo32 = (ll + (mid << 16)) mod 2^32.
+            shifted_mid_lo = nl.bitwise_and(nl.left_shift(mid, 16, dtype=nl.uint32), 0xFFFFFFFF)
+            lo32_u = nl.add(ll, shifted_mid_lo, dtype=nl.uint32)
+            lo_carry = nl.static_cast(nl.less(lo32_u, ll), dtype=nl.uint32)
+
+            # hi32 = hh + (mid >> 16) + (mid_carry << 16) + lo_carry.
+            hi32_u = nl.add(
+                nl.add(hh, nl.right_shift(mid, 16, dtype=nl.uint32), dtype=nl.uint32),
+                nl.add(
+                    nl.left_shift(mid_carry, 16, dtype=nl.uint32),
+                    lo_carry,
+                    dtype=nl.uint32,
+                ),
+                dtype=nl.uint32,
+            )
+
+            # Cast back to int32 for downstream XOR — same bit pattern.
+            return nl.static_cast(hi32_u, dtype=nl.int32), nl.static_cast(lo32_u, dtype=nl.int32)
+
+        # 10 rounds of Philox.
         for _ in nl.static_range(PHILOX_ROUNDS):
-            c0_u = nl.bitwise_and(nl.cast(c0, dtype=nl.int64), UINT32_MASK)
-            c2_u = nl.bitwise_and(nl.cast(c2, dtype=nl.int64), UINT32_MASK)
+            hi0, lo0 = _mul32_hi_lo(c0, m0_l, m0_h)
+            hi1, lo1 = _mul32_hi_lo(c2, m1_l, m1_h)
 
-            prod0 = nl.multiply(c0_u, PHILOX_M0)
-            prod1 = nl.multiply(c2_u, PHILOX_M1)
-
-            hi0_i64 = nl.bitwise_and(nl.right_shift(prod0, 32), UINT32_MASK)
-            lo0_i64 = nl.bitwise_and(prod0, UINT32_MASK)
-            hi1_i64 = nl.bitwise_and(nl.right_shift(prod1, 32), UINT32_MASK)
-            lo1_i64 = nl.bitwise_and(prod1, UINT32_MASK)
-
-            hi0 = nl.cast(hi0_i64, dtype=nl.int32)
-            lo0 = nl.cast(lo0_i64, dtype=nl.int32)
-            hi1 = nl.cast(hi1_i64, dtype=nl.int32)
-            lo1 = nl.cast(lo1_i64, dtype=nl.int32)
-
-            # Bitwise XOR is sign-agnostic; int32 two's complement is fine.
             new_c0 = nl.bitwise_xor(nl.bitwise_xor(hi1, c1), k0)
             new_c1 = lo1
             new_c2 = nl.bitwise_xor(nl.bitwise_xor(hi0, c3), k1)
             new_c3 = lo0
             c0, c1, c2, c3 = new_c0, new_c1, new_c2, new_c3
 
-            # Key bump in int64 so the W0/W1 constants (which exceed
-            # INT32_MAX) don't overflow the int32 add.
-            k0_u = nl.bitwise_and(nl.add(nl.cast(k0, dtype=nl.int64), PHILOX_W0), UINT32_MASK)
-            k1_u = nl.bitwise_and(nl.add(nl.cast(k1, dtype=nl.int64), PHILOX_W1), UINT32_MASK)
-            k0 = nl.cast(k0_u, dtype=nl.int32)
-            k1 = nl.cast(k1_u, dtype=nl.int32)
+            # Key bump: (k + W) mod 2^32. W fits in uint32 but exceeds
+            # INT32_MAX, so do the add as uint32 and cast back.
+            k0_u = nl.add(nl.static_cast(k0, dtype=nl.uint32), PHILOX_W0, dtype=nl.uint32)
+            k1_u = nl.add(nl.static_cast(k1, dtype=nl.uint32), PHILOX_W1, dtype=nl.uint32)
+            k0 = nl.static_cast(k0_u, dtype=nl.int32)
+            k1 = nl.static_cast(k1_u, dtype=nl.int32)
 
         P = counter_lo_ref.shape[0]
         out = nl.ndarray((P, 4), dtype=counter_lo_ref.dtype, buffer=nl.shared_hbm)
