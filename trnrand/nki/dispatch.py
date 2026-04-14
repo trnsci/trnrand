@@ -332,17 +332,21 @@ if HAS_NKI:
         step serializes branch-divergent lanes, killing SIMD throughput.
         Box-Muller has constant work per pair.
         """
+        P = uniforms_ref.shape[0]
         pairs = nl.load(uniforms_ref)
         u1 = pairs[:, 0:1]
         u2 = pairs[:, 1:2]
         # Clamp u1 away from 0 to avoid log(0) = -inf.
         u1_safe = nl.maximum(u1, 1e-10)
-        r = nl.sqrt(nl.multiply(nl.log(u1_safe), -2.0))
+        # trn1 compiler restriction (NCC_IBIR605): InstActivation bias for
+        # Log must be a vector-immediate tensor, not a scalar. Materialize
+        # the -2 factor as an (P, 1) tensor rather than a Python scalar.
+        neg_two = nl.full((P, 1), -2.0, dtype=uniforms_ref.dtype)
+        r = nl.sqrt(nl.multiply(nl.log(u1_safe), neg_two))
         theta = nl.multiply(u2, TWO_PI)
         z1 = nl.multiply(r, nl.cos(theta))
         z2 = nl.multiply(r, nl.sin(theta))
 
-        P = uniforms_ref.shape[0]
         out = nl.ndarray((P, 2), dtype=uniforms_ref.dtype, buffer=nl.shared_hbm)
         out[:, 0:1] = z1
         out[:, 1:2] = z2
