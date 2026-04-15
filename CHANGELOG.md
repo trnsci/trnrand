@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.3.0] - 2026-04-15
+
 ### Added
 
 - NKI 0.3.0 CPU simulator dispatch via `TRNRAND_USE_SIMULATOR=1`
@@ -23,6 +25,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `nki>=0.3.0` from the Neuron pip index).
 - `docs/developing_kernels.md` — kernel authoring guide, env var
   reference, trn1 NKI 0.3.0 gotchas encountered during Phase 1.
+- `_mul32_hi_lo_numpy` pure-numpy ground-truth port alongside the NKI
+  `_mul32_hi_lo` helper, plus `test_mul32_numpy_matches_ground_truth`
+  and `test_mul32_simulator_matches_numpy` tests to separate algorithm
+  bugs from NKI op-semantics bugs during kernel debugging.
 
 ### Changed
 
@@ -32,13 +38,29 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   AMI (Neuron SDK 2.29, April 2026).
 - Main CI `test` job marker filter now `-m "not neuron and not nki_simulator"`
   so the three test channels don't collide.
+- Philox 4×32-10 NKI kernel: 32×32 multiply reworked to an 8-bit byte
+  decomposition (16 sub-products, byte-wise carry chain). Algorithm is
+  validated bit-exact against Python unbounded-int ground truth via
+  `_mul32_hi_lo_numpy`.
 
-### Fixed
+### Known limitations
 
-- Philox 4×32-10 NKI kernel rewritten with a 16-bit half decomposition
-  of the 32×32 multiply to fit within NKI 0.3.0's 32-bit-max integer
-  dtypes. Compiles and executes on trn1; output correctness still
-  under investigation ([#1](https://github.com/trnsci/trnrand/issues/1)).
+- **NKI Philox kernel is not hardware-validated in this release.**
+  `aws-neuron-sdk#1308` — NKI ops on `uint32` tiles route through the
+  float32 activation engine on both CPU simulator and trn1 hardware.
+  Because float32 exactly represents integers only up to 2^24, any
+  uint32 tile value > 2^24 (including Philox counter state itself)
+  loses precision at the NKI op boundary. No kernel-level decomposition
+  can work around this — the issue is at `nl.copy(..., dtype=nl.uint32)`,
+  not just `nl.multiply`. Filed upstream with reproducer; `trnrand`
+  dispatch continues to use the PyTorch `torch.Generator` path by
+  default, which is the only user-visible path today. Tracked in
+  [#1](https://github.com/trnsci/trnrand/issues/1) alongside the
+  upstream issue; will reopen for hardware validation once AWS ships
+  a true integer multiply primitive.
+- Box-Muller NKI kernel still gated on trn1 compiler fix for
+  `NCC_IBIR605` (InstActivation bias parameter) — tracked in
+  [#2](https://github.com/trnsci/trnrand/issues/2). Unaffected by #1308.
 
 ## [0.2.0] - 2026-04-13
 
