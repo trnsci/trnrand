@@ -182,9 +182,12 @@ def test_mul32_simulator_matches_numpy():
         0x00000000, 0x00000001, 0x0000FFFF, 0x00010000,
         0xFFFE0001, 0x7FFFFFFF, 0x80000000, 0xD2511F53, 0xFFFFFFFF,
     ]
-    # Pad to 128 lanes (partition-axis requirement).
+    # Pad to 128 lanes (partition-axis requirement). Build as uint32 then
+    # reinterpret as int32 via view() — values like 0xFFFE0001 exceed
+    # INT32_MAX and would OverflowError through np.array(..., dtype=int32).
     padded = test_inputs + [0] * (_PHILOX_LANES_PER_TILE - len(test_inputs))
-    a_arr = np.array(padded, dtype=np.int32).reshape(-1, 1)
+    a_u32 = np.array(padded, dtype=np.uint32).reshape(-1, 1)
+    a_arr = a_u32.view(np.int32)
 
     # NKI simulator
     sim_hi, sim_lo = nki.simulate(_mul32_kernel)(
@@ -194,7 +197,7 @@ def test_mul32_simulator_matches_numpy():
     )
 
     # numpy ground truth (bit-exact by test_mul32_numpy_matches_ground_truth)
-    np_hi, np_lo = _mul32_hi_lo_numpy(a_arr.astype(np.uint32), 0x1F53, 0xD251)
+    np_hi, np_lo = _mul32_hi_lo_numpy(a_u32, 0x1F53, 0xD251)
 
     np.testing.assert_array_equal(
         np.asarray(sim_hi).astype(np.int64) & UINT32_MASK,
