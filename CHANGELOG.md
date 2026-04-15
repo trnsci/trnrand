@@ -9,9 +9,36 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- NKI 0.3.0 CPU simulator dispatch via `TRNRAND_USE_SIMULATOR=1`
+  ([#26](https://github.com/trnsci/trnrand/issues/26)). Lets contributors
+  iterate kernel correctness on any Linux x86_64 host — or the existing
+  trn1 DLAMI via SSM — without paying NEFF compile + hardware dispatch
+  cost. Seconds per cycle vs minutes on hardware.
+- `nki_simulator` pytest marker + `tests/test_nki_sim.py` curated suite
+  (Philox spec vectors, reference equivalence, Box-Muller distribution).
+- `scripts/run_simulator_tests.sh` — SSM runner for the simulator suite.
+- `scripts/run_neuron_tests.sh --philox-only` flag — deselects Box-Muller
+  kernel tests when isolating Philox's hardware status.
+- `nki-simulator` GitHub Actions job on `ubuntu-latest` (installs
+  `nki>=0.3.0` from the Neuron pip index).
+- `docs/developing_kernels.md` — kernel authoring guide, env var
+  reference, trn1 NKI 0.3.0 gotchas encountered during Phase 1.
+
 ### Changed
 
+- Migrated to NKI 0.3.0 canonical namespace: `import nki` / `nki.language`
+  / `nki.isa` replace the deprecated `neuronxcc.nki.*` path. `[neuron]`
+  extra pins `nki>=0.3.0`. NKI 0.3.0 ships on the latest Deep Learning
+  AMI (Neuron SDK 2.29, April 2026).
+- Main CI `test` job marker filter now `-m "not neuron and not nki_simulator"`
+  so the three test channels don't collide.
+
 ### Fixed
+
+- Philox 4×32-10 NKI kernel rewritten with a 16-bit half decomposition
+  of the 32×32 multiply to fit within NKI 0.3.0's 32-bit-max integer
+  dtypes. Compiles and executes on trn1; output correctness still
+  under investigation ([#1](https://github.com/trnsci/trnrand/issues/1)).
 
 ## [0.2.0] - 2026-04-13
 

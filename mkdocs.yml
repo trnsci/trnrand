@@ -26,6 +26,8 @@ nav:
       - Quasi-random: api/quasi.md
       - NKI Backend: api/nki.md
   - Architecture: architecture.md
+  - Contributing:
+      - Developing NKI kernels: developing_kernels.md
   - Design:
       - SBUF-resident streaming Generator (Phase 3 RFC): design/sbuf_resident_generator.md
       - Counter-partitioned multi-chip RNG (Phase 4 RFC): design/counter_partitioned_multichip.md
