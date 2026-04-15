@@ -212,11 +212,11 @@ def philox_uniform_cpu(
 def _mul32_hi_lo_numpy(a, b_l: int, b_h: int):
     """Pure-numpy reimplementation of `_mul32_hi_lo` — used for debugging.
 
-    Mirrors the NKI kernel line-by-line with the same dtype sequence
-    (all intermediates uint32). Lets us compare the algorithm against
-    Python ground-truth `(a * b) >> 32, (a * b) & 0xFFFFFFFF` without
-    going through NKI — isolates algorithm bugs from NKI op-semantics
-    bugs.
+    Mirrors the NKI kernel line-by-line with an 8-bit byte decomposition.
+    Every intermediate is ≤ 2^18, staying within float32's 2^24 exact-
+    integer ceiling — which matters because NKI's `nl.multiply` routes
+    through the activation engine's float path on both simulator and
+    hardware.
 
     Input `a` is a uint32 numpy array of any shape. `b_l`, `b_h` are
     the low/high 16 bits of the full uint32 multiplier. Returns
@@ -224,43 +224,65 @@ def _mul32_hi_lo_numpy(a, b_l: int, b_h: int):
     """
     import numpy as np
 
+    # Split b = b_h<<16 | b_l into four 8-bit bytes b0..b3 (low → high).
+    b0 = np.uint32(b_l & 0xFF)
+    b1 = np.uint32((b_l >> 8) & 0xFF)
+    b2 = np.uint32(b_h & 0xFF)
+    b3 = np.uint32((b_h >> 8) & 0xFF)
+
     a_u = a.astype(np.uint32)
-    a_l = np.bitwise_and(a_u, np.uint32(0xFFFF))
-    a_h = np.right_shift(a_u, np.uint32(16))
+    a0 = np.bitwise_and(a_u, np.uint32(0xFF))
+    a1 = np.bitwise_and(np.right_shift(a_u, np.uint32(8)), np.uint32(0xFF))
+    a2 = np.bitwise_and(np.right_shift(a_u, np.uint32(16)), np.uint32(0xFF))
+    a3 = np.right_shift(a_u, np.uint32(24))  # a3 already ≤ 0xFF
 
-    b_l_u = np.uint32(b_l)
-    b_h_u = np.uint32(b_h)
+    # 16 sub-products, each ≤ 0xFF·0xFF = 65025.
+    def mul(x, y):
+        return np.multiply(x, y, dtype=np.uint32)
 
-    p00 = np.multiply(a_l, b_l_u, dtype=np.uint32)
-    p01 = np.multiply(a_l, b_h_u, dtype=np.uint32)
-    p10 = np.multiply(a_h, b_l_u, dtype=np.uint32)
-    p11 = np.multiply(a_h, b_h_u, dtype=np.uint32)
+    def add(*args):
+        out = args[0]
+        for x in args[1:]:
+            out = np.add(out, x, dtype=np.uint32)
+        return out
 
-    p00_hi = np.right_shift(p00, np.uint32(16))
-    p01_lo = np.bitwise_and(p01, np.uint32(0xFFFF))
-    p01_hi = np.right_shift(p01, np.uint32(16))
-    p10_lo = np.bitwise_and(p10, np.uint32(0xFFFF))
-    p10_hi = np.right_shift(p10, np.uint32(16))
+    # Column sums at shift 8k, k = 0..6. Each ≤ 4 × 65025 ≈ 2^18.
+    c0 = mul(a0, b0)
+    c1 = add(mul(a0, b1), mul(a1, b0))
+    c2 = add(mul(a0, b2), mul(a1, b1), mul(a2, b0))
+    c3 = add(mul(a0, b3), mul(a1, b2), mul(a2, b1), mul(a3, b0))
+    c4 = add(mul(a1, b3), mul(a2, b2), mul(a3, b1))
+    c5 = add(mul(a2, b3), mul(a3, b2))
+    c6 = mul(a3, b3)
 
-    mid = np.add(
-        np.add(p00_hi, p01_lo, dtype=np.uint32),
-        p10_lo,
-        dtype=np.uint32,
-    )
+    # Byte-wise carry propagation. `acc` stays ≤ 2^18 + 2^10 ≈ 2^18.
+    def step(acc, col):
+        byte = np.bitwise_and(acc, np.uint32(0xFF))
+        carry = np.right_shift(acc, np.uint32(8))
+        return byte, np.add(carry, col, dtype=np.uint32)
+
+    byte0, acc = step(c0, c1)
+    byte1, acc = step(acc, c2)
+    byte2, acc = step(acc, c3)
+    byte3, acc = step(acc, c4)
+    byte4, acc = step(acc, c5)
+    byte5, acc = step(acc, c6)
+    byte6 = np.bitwise_and(acc, np.uint32(0xFF))
+    byte7 = np.bitwise_and(np.right_shift(acc, np.uint32(8)), np.uint32(0xFF))
 
     lo32_u = np.bitwise_or(
-        np.left_shift(np.bitwise_and(mid, np.uint32(0xFFFF)), np.uint32(16)),
-        np.bitwise_and(p00, np.uint32(0xFFFF)),
-    )
-
-    hi32_u = np.add(
-        np.add(p11, p01_hi, dtype=np.uint32),
-        np.add(
-            p10_hi,
-            np.right_shift(mid, np.uint32(16)),
-            dtype=np.uint32,
+        np.bitwise_or(byte0, np.left_shift(byte1, np.uint32(8))),
+        np.bitwise_or(
+            np.left_shift(byte2, np.uint32(16)),
+            np.left_shift(byte3, np.uint32(24)),
         ),
-        dtype=np.uint32,
+    )
+    hi32_u = np.bitwise_or(
+        np.bitwise_or(byte4, np.left_shift(byte5, np.uint32(8))),
+        np.bitwise_or(
+            np.left_shift(byte6, np.uint32(16)),
+            np.left_shift(byte7, np.uint32(24)),
+        ),
     )
 
     # Same bit pattern reinterpreted as int32 (matches NKI's nl.copy cast).
@@ -268,11 +290,16 @@ def _mul32_hi_lo_numpy(a, b_l: int, b_h: int):
 
 
 if HAS_NKI:
-    # NKI 0.3.0 has no int64 — max integer width is 32 bits. The 32×32
-    # Philox multiply decomposes into four 16×16 sub-multiplies that each
-    # fit in uint32, reassembled so every intermediate stays ≤ uint32 max.
-    # Helper must be module-level (inside the `if HAS_NKI:` block): NKI
-    # rejects inner function definitions inside @nki.jit kernels.
+    # NKI's `nl.multiply` routes uint32 operands through the activation
+    # engine's float32 path on both simulator and hardware. float32
+    # exactly represents integers only up to 2^24 (≈ 1.67e7), so the
+    # 32×32 multiply must decompose into chunks small enough that no
+    # intermediate product or sum exceeds 2^24. Byte-level (8-bit)
+    # decomposition keeps sub-products ≤ 0xFF·0xFF = 65025 ≈ 2^16
+    # and column sums ≤ 2^18.
+    #
+    # Helper must be module-level (inside the `if HAS_NKI:` block):
+    # NKI rejects inner function definitions inside @nki.jit kernels.
     _PHILOX_M0_L = PHILOX_M0 & 0xFFFF  # 0x1F53
     _PHILOX_M0_H = (PHILOX_M0 >> 16) & 0xFFFF  # 0xD251
     _PHILOX_M1_L = PHILOX_M1 & 0xFFFF  # 0x8D57
@@ -281,71 +308,90 @@ if HAS_NKI:
     def _mul32_hi_lo(a, b_l, b_h):
         """32×32→64 multiply returning (hi32, lo32) int32 tensors.
 
-        Carry-free 16-bit half decomposition — every intermediate fits
-        in uint32 by construction, no bool-based overflow detection:
+        8-bit byte decomposition:
 
-            a = a_h<<16 + a_l,   b = b_h<<16 + b_l
-            p00 = a_l * b_l   ≤ 0xFFFE0001
-            p01 = a_l * b_h   ≤ 0xFFFE0001
-            p10 = a_h * b_l   ≤ 0xFFFE0001
-            p11 = a_h * b_h   ≤ 0xFFFE0001
+            a = a3·2^24 + a2·2^16 + a1·2^8 + a0   (ai ∈ [0,255])
+            b = b3·2^24 + b2·2^16 + b1·2^8 + b0
 
-            mid  = (p00>>16) + (p01&0xFFFF) + (p10&0xFFFF)  ≤ 3·0xFFFF
-            lo32 = (mid&0xFFFF)<<16 | (p00&0xFFFF)
-            hi32 = (mid>>16) + (p01>>16) + (p10>>16) + p11  ≤ 0xFFFFFFFE
+            p_ij = ai · bj                       ≤ 65025   (2^16)
+            c_k  = Σ{i+j=k} p_ij                 ≤ 2^18    (k=0..6)
 
-        `a` is a uint32-valued int32 tile. `b_l`, `b_h` are int32 scalar
-        constants (low/high 16 bits of the uint32 multiplier).
+        Byte-wise carry propagation over c0..c6 yields eight output
+        bytes; low four pack lo32, high four pack hi32. Every
+        intermediate stays well below 2^24, avoiding the float32
+        precision loss on the activation-engine multiply path.
+
+        `a` is a uint32-valued int32 tile of shape (P, 1). `b_l`, `b_h`
+        are Python-int constants (low/high 16 bits of the full 32-bit
+        multiplier).
         """
-        # Cast `a` to uint32 up front so the dst/src dtype match in MLIR
-        # tensor_scalar_bitvec ops (bitwise_and, right_shift). Hardware
-        # verifier rejects src=i32/dst=ui32 mismatches.
+        # Cast `a` to uint32 up front so the dst/src dtype match in
+        # MLIR tensor_scalar_bitvec ops. Hardware verifier rejects
+        # src=i32/dst=ui32 mismatches.
         a_u = nl.copy(a, dtype=nl.uint32)
-        a_l = nl.bitwise_and(a_u, 0xFFFF, dtype=nl.uint32)
-        a_h = nl.right_shift(a_u, 16, dtype=nl.uint32)
+        a0 = nl.bitwise_and(a_u, 0xFF, dtype=nl.uint32)
+        a1 = nl.bitwise_and(nl.right_shift(a_u, 8, dtype=nl.uint32), 0xFF, dtype=nl.uint32)
+        a2 = nl.bitwise_and(nl.right_shift(a_u, 16, dtype=nl.uint32), 0xFF, dtype=nl.uint32)
+        a3 = nl.right_shift(a_u, 24, dtype=nl.uint32)  # already ≤ 0xFF
 
-        # Materialize b_l, b_h as uint32 tiles. Passing them as Python-int
-        # scalars to nl.multiply made the compiler see (uint32, int32),
-        # an "incompatible dtype" pair that NKI silently promotes to
-        # float32 — which can only exactly represent integers up to 2^24.
-        # Sub-products like 0xFFFF * 0xD251 ≈ 3.5e9 exceed that and lose
-        # precision. Forcing both operands to uint32 tiles keeps the
-        # internal path integer.
+        # Materialize the four b-bytes as uint32 tiles. Passing Python-int
+        # scalars to nl.multiply makes the compiler see (uint32, int32) —
+        # a mixed-dtype pair that promotes to float32 internally. Both
+        # operands as uint32 tiles keeps the path integer-typed (though
+        # the multiply itself still goes through float activation, now
+        # within the 2^24 exact-integer envelope).
         P = a.shape[0]
-        b_l_vec = nl.full((P, 1), b_l, dtype=nl.uint32)
-        b_h_vec = nl.full((P, 1), b_h, dtype=nl.uint32)
+        b0_vec = nl.full((P, 1), b_l & 0xFF, dtype=nl.uint32)
+        b1_vec = nl.full((P, 1), (b_l >> 8) & 0xFF, dtype=nl.uint32)
+        b2_vec = nl.full((P, 1), b_h & 0xFF, dtype=nl.uint32)
+        b3_vec = nl.full((P, 1), (b_h >> 8) & 0xFF, dtype=nl.uint32)
 
-        p00 = nl.multiply(a_l, b_l_vec, dtype=nl.uint32)
-        p01 = nl.multiply(a_l, b_h_vec, dtype=nl.uint32)
-        p10 = nl.multiply(a_h, b_l_vec, dtype=nl.uint32)
-        p11 = nl.multiply(a_h, b_h_vec, dtype=nl.uint32)
+        def mul(x, y):
+            return nl.multiply(x, y, dtype=nl.uint32)
 
-        p00_hi = nl.right_shift(p00, 16, dtype=nl.uint32)
-        p01_lo = nl.bitwise_and(p01, 0xFFFF)
-        p01_hi = nl.right_shift(p01, 16, dtype=nl.uint32)
-        p10_lo = nl.bitwise_and(p10, 0xFFFF)
-        p10_hi = nl.right_shift(p10, 16, dtype=nl.uint32)
+        def add2(x, y):
+            return nl.add(x, y, dtype=nl.uint32)
 
-        mid = nl.add(
-            nl.add(p00_hi, p01_lo, dtype=nl.uint32),
-            p10_lo,
-            dtype=nl.uint32,
-        )  # ≤ 3 × 0xFFFF = 0x2FFFD
+        # 16 sub-products → 7 column sums. Each column sum ≤ 2^18.
+        c0 = mul(a0, b0_vec)
+        c1 = add2(mul(a0, b1_vec), mul(a1, b0_vec))
+        c2 = add2(add2(mul(a0, b2_vec), mul(a1, b1_vec)), mul(a2, b0_vec))
+        c3 = add2(
+            add2(mul(a0, b3_vec), mul(a1, b2_vec)),
+            add2(mul(a2, b1_vec), mul(a3, b0_vec)),
+        )
+        c4 = add2(add2(mul(a1, b3_vec), mul(a2, b2_vec)), mul(a3, b1_vec))
+        c5 = add2(mul(a2, b3_vec), mul(a3, b2_vec))
+        c6 = mul(a3, b3_vec)
 
-        lo32_u = nl.bitwise_or(
-            nl.left_shift(nl.bitwise_and(mid, 0xFFFF), 16, dtype=nl.uint32),
-            nl.bitwise_and(p00, 0xFFFF),
+        # Byte-wise carry propagation. `acc` stays ≤ 2^18 + 2^10 ≈ 2^18.
+        def step(acc, col):
+            byte = nl.bitwise_and(acc, 0xFF, dtype=nl.uint32)
+            carry = nl.right_shift(acc, 8, dtype=nl.uint32)
+            return byte, add2(carry, col)
+
+        byte0, acc = step(c0, c1)
+        byte1, acc = step(acc, c2)
+        byte2, acc = step(acc, c3)
+        byte3, acc = step(acc, c4)
+        byte4, acc = step(acc, c5)
+        byte5, acc = step(acc, c6)
+        byte6 = nl.bitwise_and(acc, 0xFF, dtype=nl.uint32)
+        byte7 = nl.bitwise_and(
+            nl.right_shift(acc, 8, dtype=nl.uint32), 0xFF, dtype=nl.uint32
         )
 
-        hi32_u = nl.add(
-            nl.add(p11, p01_hi, dtype=nl.uint32),
-            nl.add(
-                p10_hi,
-                nl.right_shift(mid, 16, dtype=nl.uint32),
-                dtype=nl.uint32,
-            ),
-            dtype=nl.uint32,
-        )  # max 0xFFFFFFFE
+        def pack(b0, b1, b2, b3):
+            return nl.bitwise_or(
+                nl.bitwise_or(b0, nl.left_shift(b1, 8, dtype=nl.uint32)),
+                nl.bitwise_or(
+                    nl.left_shift(b2, 16, dtype=nl.uint32),
+                    nl.left_shift(b3, 24, dtype=nl.uint32),
+                ),
+            )
+
+        lo32_u = pack(byte0, byte1, byte2, byte3)
+        hi32_u = pack(byte4, byte5, byte6, byte7)
 
         # Return int32 for downstream XOR — same bit pattern.
         return nl.copy(hi32_u, dtype=nl.int32), nl.copy(lo32_u, dtype=nl.int32)
