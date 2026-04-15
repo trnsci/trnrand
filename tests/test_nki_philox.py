@@ -185,12 +185,10 @@ class TestPhiloxReference:
             got_lo_u = int(lo_got[i, 0]) & 0xFFFFFFFF
 
             assert got_hi_u == hi_expected, (
-                f"hi mismatch for a={a:#010x}: "
-                f"got {got_hi_u:#010x}, expected {hi_expected:#010x}"
+                f"hi mismatch for a={a:#010x}: got {got_hi_u:#010x}, expected {hi_expected:#010x}"
             )
             assert got_lo_u == lo_expected, (
-                f"lo mismatch for a={a:#010x}: "
-                f"got {got_lo_u:#010x}, expected {lo_expected:#010x}"
+                f"lo mismatch for a={a:#010x}: got {got_lo_u:#010x}, expected {lo_expected:#010x}"
             )
 
 

@@ -377,9 +377,7 @@ if HAS_NKI:
         byte4, acc = step(acc, c5)
         byte5, acc = step(acc, c6)
         byte6 = nl.bitwise_and(acc, 0xFF, dtype=nl.uint32)
-        byte7 = nl.bitwise_and(
-            nl.right_shift(acc, 8, dtype=nl.uint32), 0xFF, dtype=nl.uint32
-        )
+        byte7 = nl.bitwise_and(nl.right_shift(acc, 8, dtype=nl.uint32), 0xFF, dtype=nl.uint32)
 
         def pack(b0, b1, b2, b3):
             return nl.bitwise_or(
