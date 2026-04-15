@@ -209,6 +209,64 @@ def philox_uniform_cpu(
     return (out_u32.to(torch.float64) * (1.0 / 2**32)).to(dtype)
 
 
+def _mul32_hi_lo_numpy(a, b_l: int, b_h: int):
+    """Pure-numpy reimplementation of `_mul32_hi_lo` — used for debugging.
+
+    Mirrors the NKI kernel line-by-line with the same dtype sequence
+    (all intermediates uint32). Lets us compare the algorithm against
+    Python ground-truth `(a * b) >> 32, (a * b) & 0xFFFFFFFF` without
+    going through NKI — isolates algorithm bugs from NKI op-semantics
+    bugs.
+
+    Input `a` is a uint32 numpy array of any shape. `b_l`, `b_h` are
+    the low/high 16 bits of the full uint32 multiplier. Returns
+    `(hi32, lo32)` int32 numpy arrays with the same shape as `a`.
+    """
+    import numpy as np
+
+    a_u = a.astype(np.uint32)
+    a_l = np.bitwise_and(a_u, np.uint32(0xFFFF))
+    a_h = np.right_shift(a_u, np.uint32(16))
+
+    b_l_u = np.uint32(b_l)
+    b_h_u = np.uint32(b_h)
+
+    p00 = np.multiply(a_l, b_l_u, dtype=np.uint32)
+    p01 = np.multiply(a_l, b_h_u, dtype=np.uint32)
+    p10 = np.multiply(a_h, b_l_u, dtype=np.uint32)
+    p11 = np.multiply(a_h, b_h_u, dtype=np.uint32)
+
+    p00_hi = np.right_shift(p00, np.uint32(16))
+    p01_lo = np.bitwise_and(p01, np.uint32(0xFFFF))
+    p01_hi = np.right_shift(p01, np.uint32(16))
+    p10_lo = np.bitwise_and(p10, np.uint32(0xFFFF))
+    p10_hi = np.right_shift(p10, np.uint32(16))
+
+    mid = np.add(
+        np.add(p00_hi, p01_lo, dtype=np.uint32),
+        p10_lo,
+        dtype=np.uint32,
+    )
+
+    lo32_u = np.bitwise_or(
+        np.left_shift(np.bitwise_and(mid, np.uint32(0xFFFF)), np.uint32(16)),
+        np.bitwise_and(p00, np.uint32(0xFFFF)),
+    )
+
+    hi32_u = np.add(
+        np.add(p11, p01_hi, dtype=np.uint32),
+        np.add(
+            p10_hi,
+            np.right_shift(mid, np.uint32(16)),
+            dtype=np.uint32,
+        ),
+        dtype=np.uint32,
+    )
+
+    # Same bit pattern reinterpreted as int32 (matches NKI's nl.copy cast).
+    return hi32_u.astype(np.int32), lo32_u.astype(np.int32)
+
+
 if HAS_NKI:
     # NKI 0.3.0 has no int64 — max integer width is 32 bits. The 32×32
     # Philox multiply decomposes into four 16×16 sub-multiplies that each

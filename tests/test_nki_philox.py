@@ -141,6 +141,58 @@ class TestPhiloxReference:
         tail = philox_uniform_cpu(1024, seed=42, counter_offset=256)  # 256 blocks × 4 = 1024
         assert torch.equal(full[1024:], tail)
 
+    def test_mul32_numpy_matches_ground_truth(self):
+        """Pure-numpy 16-bit decomposition must match Python unbounded-int ground truth.
+
+        If this test fails, the 16-bit algorithm itself has a logic bug —
+        NKI isn't in the picture. Compare numpy output to Python
+        `(uint64(a) * uint64(b)) >> 32` and `& 0xFFFFFFFF`.
+        """
+        import numpy as np
+
+        from trnrand.nki.dispatch import _mul32_hi_lo_numpy
+
+        # Test inputs: boundary values + a handful of randoms.
+        test_inputs = [
+            0x00000000,
+            0x00000001,
+            0x00000002,
+            0x0000FFFF,
+            0x00010000,
+            0xFFFE0001,
+            0x7FFFFFFF,
+            0x80000000,
+            0xD2511F53,  # = PHILOX_M0
+            0xFFFFFFFF,
+        ]
+        rng = np.random.default_rng(42)
+        test_inputs.extend(int(x) for x in rng.integers(0, 2**32, size=10, dtype=np.uint64))
+
+        # Multiplier: PHILOX_M0 — the actual constant our kernel uses most.
+        m0_l = 0xD2511F53 & 0xFFFF
+        m0_h = (0xD2511F53 >> 16) & 0xFFFF
+
+        a_arr = np.array(test_inputs, dtype=np.uint32).reshape(-1, 1)
+        hi_got, lo_got = _mul32_hi_lo_numpy(a_arr, m0_l, m0_h)
+
+        for i, a in enumerate(test_inputs):
+            full = (a * 0xD2511F53) & ((1 << 64) - 1)  # Python unbounded
+            hi_expected = (full >> 32) & 0xFFFFFFFF
+            lo_expected = full & 0xFFFFFFFF
+
+            # Compare as uint32 bit pattern (got values are int32, same bits).
+            got_hi_u = int(hi_got[i, 0]) & 0xFFFFFFFF
+            got_lo_u = int(lo_got[i, 0]) & 0xFFFFFFFF
+
+            assert got_hi_u == hi_expected, (
+                f"hi mismatch for a={a:#010x}: "
+                f"got {got_hi_u:#010x}, expected {hi_expected:#010x}"
+            )
+            assert got_lo_u == lo_expected, (
+                f"lo mismatch for a={a:#010x}: "
+                f"got {got_lo_u:#010x}, expected {lo_expected:#010x}"
+            )
+
 
 # ── Box-Muller CPU reference ──────────────────────────────────────────────────
 

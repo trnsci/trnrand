@@ -144,6 +144,70 @@ def test_philox_kernel_distribution():
     assert abs(u.var() - 1 / 12) < 0.02
 
 
+# ── _mul32_hi_lo simulator parity vs numpy port ────────────────────────────
+
+
+def test_mul32_simulator_matches_numpy():
+    """NKI's `_mul32_hi_lo` (via `nki.simulate`) must bit-match the numpy port.
+
+    The numpy port is ground-truth-validated by
+    `test_mul32_numpy_matches_ground_truth`. If *this* test fails, the
+    bug is in NKI's uint32 op semantics — specific ops (`multiply`,
+    `bitwise_and`, `right_shift`, `left_shift`, `bitwise_or`, `add`,
+    `copy`) don't produce true uint32 arithmetic.
+
+    Not trivially runnable — NKI won't let us call a helper function
+    that isn't `@nki.jit`-decorated. We wrap the helper in a thin
+    `@nki.jit` kernel that just calls it and stores the output.
+    """
+    import nki
+    import nki.language as nl
+
+    from trnrand.nki.dispatch import _mul32_hi_lo, _mul32_hi_lo_numpy
+
+    @nki.jit
+    def _mul32_kernel(a_ref, out_hi_ref, out_lo_ref):
+        a = nl.load(a_ref)
+        hi, lo = _mul32_hi_lo(a, 0x1F53, 0xD251)
+        # Allocate output buffers via the output refs
+        P = a_ref.shape[0]
+        out_hi = nl.ndarray((P, 1), dtype=nl.int32, buffer=nl.shared_hbm)
+        out_lo = nl.ndarray((P, 1), dtype=nl.int32, buffer=nl.shared_hbm)
+        out_hi[:, 0:1] = hi
+        out_lo[:, 0:1] = lo
+        return out_hi, out_lo
+
+    # Same test inputs as the numpy ground-truth test.
+    test_inputs = [
+        0x00000000, 0x00000001, 0x0000FFFF, 0x00010000,
+        0xFFFE0001, 0x7FFFFFFF, 0x80000000, 0xD2511F53, 0xFFFFFFFF,
+    ]
+    # Pad to 128 lanes (partition-axis requirement).
+    padded = test_inputs + [0] * (_PHILOX_LANES_PER_TILE - len(test_inputs))
+    a_arr = np.array(padded, dtype=np.int32).reshape(-1, 1)
+
+    # NKI simulator
+    sim_hi, sim_lo = nki.simulate(_mul32_kernel)(
+        a_arr,
+        np.zeros_like(a_arr),  # placeholder; unused but kernel signature requires
+        np.zeros_like(a_arr),
+    )
+
+    # numpy ground truth (bit-exact by test_mul32_numpy_matches_ground_truth)
+    np_hi, np_lo = _mul32_hi_lo_numpy(a_arr.astype(np.uint32), 0x1F53, 0xD251)
+
+    np.testing.assert_array_equal(
+        np.asarray(sim_hi).astype(np.int64) & UINT32_MASK,
+        np_hi.astype(np.int64) & UINT32_MASK,
+        err_msg="NKI simulator hi32 differs from numpy port — NKI uint32 semantics gap",
+    )
+    np.testing.assert_array_equal(
+        np.asarray(sim_lo).astype(np.int64) & UINT32_MASK,
+        np_lo.astype(np.int64) & UINT32_MASK,
+        err_msg="NKI simulator lo32 differs from numpy port — NKI uint32 semantics gap",
+    )
+
+
 # ── Box-Muller correctness via nki.simulate ────────────────────────────────
 
 
