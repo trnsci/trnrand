@@ -304,10 +304,21 @@ if HAS_NKI:
         a_l = nl.bitwise_and(a_u, 0xFFFF, dtype=nl.uint32)
         a_h = nl.right_shift(a_u, 16, dtype=nl.uint32)
 
-        p00 = nl.multiply(a_l, b_l, dtype=nl.uint32)
-        p01 = nl.multiply(a_l, b_h, dtype=nl.uint32)
-        p10 = nl.multiply(a_h, b_l, dtype=nl.uint32)
-        p11 = nl.multiply(a_h, b_h, dtype=nl.uint32)
+        # Materialize b_l, b_h as uint32 tiles. Passing them as Python-int
+        # scalars to nl.multiply made the compiler see (uint32, int32),
+        # an "incompatible dtype" pair that NKI silently promotes to
+        # float32 — which can only exactly represent integers up to 2^24.
+        # Sub-products like 0xFFFF * 0xD251 ≈ 3.5e9 exceed that and lose
+        # precision. Forcing both operands to uint32 tiles keeps the
+        # internal path integer.
+        P = a.shape[0]
+        b_l_vec = nl.full((P, 1), b_l, dtype=nl.uint32)
+        b_h_vec = nl.full((P, 1), b_h, dtype=nl.uint32)
+
+        p00 = nl.multiply(a_l, b_l_vec, dtype=nl.uint32)
+        p01 = nl.multiply(a_l, b_h_vec, dtype=nl.uint32)
+        p10 = nl.multiply(a_h, b_l_vec, dtype=nl.uint32)
+        p11 = nl.multiply(a_h, b_h_vec, dtype=nl.uint32)
 
         p00_hi = nl.right_shift(p00, 16, dtype=nl.uint32)
         p01_lo = nl.bitwise_and(p01, 0xFFFF)
