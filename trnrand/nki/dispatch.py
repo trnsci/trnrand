@@ -290,12 +290,22 @@ if HAS_NKI:
         free). Output is `(P, 4)` — one int32 per round-output word per
         lane. The wrapper flattens to `(P*4,)` interleaved.
         """
+        P = counter_lo_ref.shape[0]
         c0 = nl.load(counter_lo_ref)
         c1 = nl.zeros_like(c0)
         c2 = nl.zeros_like(c0)
         c3 = nl.zeros_like(c0)
         k0 = nl.load(key_lo_ref)
         k1 = nl.load(key_hi_ref)
+
+        # Materialize the key-bump constants as uint32 vector-immediates
+        # up front. PHILOX_W0 = 0x9E3779B9 and PHILOX_W1 = 0xBB67AE85
+        # both exceed INT32_MAX, so passing them as Python-scalar args to
+        # `nl.add(..., dtype=nl.uint32)` may trip signed-int32 scalar-path
+        # handling before the uint32 cast takes effect. Materialized
+        # vector-immediates avoid the ambiguity entirely.
+        w0_vec = nl.full((P, 1), PHILOX_W0, dtype=nl.uint32)
+        w1_vec = nl.full((P, 1), PHILOX_W1, dtype=nl.uint32)
 
         # 10 rounds of Philox — multiply via the carry-free 16-bit
         # decomposition helper (module-level; NKI forbids inner defs).
@@ -309,14 +319,12 @@ if HAS_NKI:
             new_c3 = lo0
             c0, c1, c2, c3 = new_c0, new_c1, new_c2, new_c3
 
-            # Key bump: (k + W) mod 2^32. W fits in uint32 but exceeds
-            # INT32_MAX, so do the add as uint32 and cast back.
-            k0_u = nl.add(nl.copy(k0, dtype=nl.uint32), PHILOX_W0, dtype=nl.uint32)
-            k1_u = nl.add(nl.copy(k1, dtype=nl.uint32), PHILOX_W1, dtype=nl.uint32)
+            # Key bump: (k + W) mod 2^32 via the vector-immediate W.
+            k0_u = nl.add(nl.copy(k0, dtype=nl.uint32), w0_vec, dtype=nl.uint32)
+            k1_u = nl.add(nl.copy(k1, dtype=nl.uint32), w1_vec, dtype=nl.uint32)
             k0 = nl.copy(k0_u, dtype=nl.int32)
             k1 = nl.copy(k1_u, dtype=nl.int32)
 
-        P = counter_lo_ref.shape[0]
         out = nl.ndarray((P, 4), dtype=counter_lo_ref.dtype, buffer=nl.shared_hbm)
         out[:, 0:1] = c0
         out[:, 1:2] = c1
