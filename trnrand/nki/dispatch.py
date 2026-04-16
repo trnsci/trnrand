@@ -979,57 +979,107 @@ if HAS_NKI:
         k4_b = _xor32_b(_xor32_b(_xor32_b(_xor32_b(k0_b, k1_b), k2_b), k3_b), parity_b)
         ks_b = [k0_b, k1_b, k2_b, k3_b, k4_b]
 
-        x_b_list = [x0_b, x1_b, x2_b, x3_b]
-
         # Initial key injection (step 0) before round 0.
-        x_b_list = _key_inject_b(x_b_list, ks_b, 0)
+        # Use subscript READS (_ki[i]) to unpack into named variables —
+        # NKI hardware compiler rejects subscript WRITES (x_b_list[i] = ...)
+        # as LHS assignment targets inside @nki.jit kernels.
+        _ki = _key_inject_b([x0_b, x1_b, x2_b, x3_b], ks_b, 0)
+        x0_b = _ki[0]
+        x1_b = _ki[1]
+        x2_b = _ki[2]
+        x3_b = _ki[3]
 
         # 20 rounds, unrolled at compile time via nl.static_range.
-        # Rotation constants are indexed as: rot_pair_idx = r % 4,
-        # with [0] for the first MIX and [1] for the second MIX.
-        # Precomputed (q, r) index: _THREEFRY_ROT_QR[rot_pair_idx*2 + slot]
+        # Named-variable tuple unpacking (simple name LHS) avoids the
+        # subscript-assignment restriction.
         for round_num in nl.static_range(THREEFRY_ROUNDS):
             pair_idx = round_num % 4
             if round_num % 2 == 0:
                 # Even rounds: MIX(x0,x1) then MIX(x2,x3)
                 q0, r0 = _THREEFRY_ROT_QR[pair_idx * 2 + 0]
                 q1, r1 = _THREEFRY_ROT_QR[pair_idx * 2 + 1]
-                x_b_list[0], x_b_list[1] = _mix_b(x_b_list[0], x_b_list[1], q0, r0)
-                x_b_list[2], x_b_list[3] = _mix_b(x_b_list[2], x_b_list[3], q1, r1)
+                x0_b, x1_b = _mix_b(x0_b, x1_b, q0, r0)
+                x2_b, x3_b = _mix_b(x2_b, x3_b, q1, r1)
             else:
                 # Odd rounds: MIX(x0,x3) then MIX(x2,x1)
                 q0, r0 = _THREEFRY_ROT_QR[pair_idx * 2 + 0]
                 q1, r1 = _THREEFRY_ROT_QR[pair_idx * 2 + 1]
-                x_b_list[0], x_b_list[3] = _mix_b(x_b_list[0], x_b_list[3], q0, r0)
-                x_b_list[2], x_b_list[1] = _mix_b(x_b_list[2], x_b_list[1], q1, r1)
+                x0_b, x3_b = _mix_b(x0_b, x3_b, q0, r0)
+                x2_b, x1_b = _mix_b(x2_b, x1_b, q1, r1)
             # Key injection after every 4th round.
             if (round_num + 1) % 4 == 0:
-                x_b_list = _key_inject_b(x_b_list, ks_b, (round_num + 1) // 4)
+                _ki = _key_inject_b([x0_b, x1_b, x2_b, x3_b], ks_b, (round_num + 1) // 4)
+                x0_b = _ki[0]
+                x1_b = _ki[1]
+                x2_b = _ki[2]
+                x3_b = _ki[3]
 
         # Convert byte tiles → float32 uniforms in [0, 1).
         # Use 3 least-significant bytes: mantissa = b0 + b1*256 + b2*65536
         # which ≤ 16777215 = 2^24 - 1, exactly representable in float32.
         # Then divide by 2^24. This gives 24-bit uniform resolution.
+        # Unrolled for all 4 words — avoids nl.static_range + subscript access.
         inv24 = nl.full((P, 1), 1.0 / 16777216.0, dtype=nl.float32)
+        _s256 = nl.full((P, 1), 256.0, dtype=nl.float32)
+        _s65536 = nl.full((P, 1), 65536.0, dtype=nl.float32)
         out = nl.ndarray((P, 4), dtype=nl.float32, buffer=nl.shared_hbm)
-        for word_idx in nl.static_range(4):
-            b = x_b_list[word_idx]
-            b1_scaled = nl.multiply(
-                nl.copy(b[1], dtype=nl.float32),
-                nl.full((P, 1), 256.0, dtype=nl.float32),
+
+        b = x0_b
+        out[:, 0:1] = nl.multiply(
+            nl.add(
+                nl.add(
+                    nl.copy(b[0], dtype=nl.float32),
+                    nl.multiply(nl.copy(b[1], dtype=nl.float32), _s256, dtype=nl.float32),
+                    dtype=nl.float32,
+                ),
+                nl.multiply(nl.copy(b[2], dtype=nl.float32), _s65536, dtype=nl.float32),
                 dtype=nl.float32,
-            )
-            b2_scaled = nl.multiply(
-                nl.copy(b[2], dtype=nl.float32),
-                nl.full((P, 1), 65536.0, dtype=nl.float32),
+            ),
+            inv24,
+            dtype=nl.float32,
+        )
+        b = x1_b
+        out[:, 1:2] = nl.multiply(
+            nl.add(
+                nl.add(
+                    nl.copy(b[0], dtype=nl.float32),
+                    nl.multiply(nl.copy(b[1], dtype=nl.float32), _s256, dtype=nl.float32),
+                    dtype=nl.float32,
+                ),
+                nl.multiply(nl.copy(b[2], dtype=nl.float32), _s65536, dtype=nl.float32),
                 dtype=nl.float32,
-            )
-            mantissa = nl.add(
-                nl.add(nl.copy(b[0], dtype=nl.float32), b1_scaled, dtype=nl.float32),
-                b2_scaled,
+            ),
+            inv24,
+            dtype=nl.float32,
+        )
+        b = x2_b
+        out[:, 2:3] = nl.multiply(
+            nl.add(
+                nl.add(
+                    nl.copy(b[0], dtype=nl.float32),
+                    nl.multiply(nl.copy(b[1], dtype=nl.float32), _s256, dtype=nl.float32),
+                    dtype=nl.float32,
+                ),
+                nl.multiply(nl.copy(b[2], dtype=nl.float32), _s65536, dtype=nl.float32),
                 dtype=nl.float32,
-            )
-            out[:, word_idx : word_idx + 1] = nl.multiply(mantissa, inv24, dtype=nl.float32)
+            ),
+            inv24,
+            dtype=nl.float32,
+        )
+        b = x3_b
+        out[:, 3:4] = nl.multiply(
+            nl.add(
+                nl.add(
+                    nl.copy(b[0], dtype=nl.float32),
+                    nl.multiply(nl.copy(b[1], dtype=nl.float32), _s256, dtype=nl.float32),
+                    dtype=nl.float32,
+                ),
+                nl.multiply(nl.copy(b[2], dtype=nl.float32), _s65536, dtype=nl.float32),
+                dtype=nl.float32,
+            ),
+            inv24,
+            dtype=nl.float32,
+        )
         return out
 
     @nki.jit
@@ -1059,23 +1109,32 @@ if HAS_NKI:
         parity_b = _b_from_scalar(P, THREEFRY_SKEIN_KS_PARITY)
         k4_b = _xor32_b(_xor32_b(_xor32_b(_xor32_b(k0_b, k1_b), k2_b), k3_b), parity_b)
         ks_b = [k0_b, k1_b, k2_b, k3_b, k4_b]
-        x_b_list = [x0_b, x1_b, x2_b, x3_b]
-        x_b_list = _key_inject_b(x_b_list, ks_b, 0)
+
+        # Initial key injection — unpack via subscript reads into named vars.
+        _ki = _key_inject_b([x0_b, x1_b, x2_b, x3_b], ks_b, 0)
+        x0_b = _ki[0]
+        x1_b = _ki[1]
+        x2_b = _ki[2]
+        x3_b = _ki[3]
 
         for round_num in nl.static_range(THREEFRY_ROUNDS):
             pair_idx = round_num % 4
             if round_num % 2 == 0:
                 q0, r0 = _THREEFRY_ROT_QR[pair_idx * 2 + 0]
                 q1, r1 = _THREEFRY_ROT_QR[pair_idx * 2 + 1]
-                x_b_list[0], x_b_list[1] = _mix_b(x_b_list[0], x_b_list[1], q0, r0)
-                x_b_list[2], x_b_list[3] = _mix_b(x_b_list[2], x_b_list[3], q1, r1)
+                x0_b, x1_b = _mix_b(x0_b, x1_b, q0, r0)
+                x2_b, x3_b = _mix_b(x2_b, x3_b, q1, r1)
             else:
                 q0, r0 = _THREEFRY_ROT_QR[pair_idx * 2 + 0]
                 q1, r1 = _THREEFRY_ROT_QR[pair_idx * 2 + 1]
-                x_b_list[0], x_b_list[3] = _mix_b(x_b_list[0], x_b_list[3], q0, r0)
-                x_b_list[2], x_b_list[1] = _mix_b(x_b_list[2], x_b_list[1], q1, r1)
+                x0_b, x3_b = _mix_b(x0_b, x3_b, q0, r0)
+                x2_b, x1_b = _mix_b(x2_b, x1_b, q1, r1)
             if (round_num + 1) % 4 == 0:
-                x_b_list = _key_inject_b(x_b_list, ks_b, (round_num + 1) // 4)
+                _ki = _key_inject_b([x0_b, x1_b, x2_b, x3_b], ks_b, (round_num + 1) // 4)
+                x0_b = _ki[0]
+                x1_b = _ki[1]
+                x2_b = _ki[2]
+                x3_b = _ki[3]
 
         # Convert to 4 uniform floats (SBUF-resident, no HBM write yet).
         # Inlined explicitly for all 4 words — NKI hardware compiler rejects
@@ -1085,7 +1144,7 @@ if HAS_NKI:
         scale65536 = nl.full((P, 1), 65536.0, dtype=nl.float32)
         clamp_eps = nl.full((P, 1), 1e-7, dtype=nl.float32)  # avoid log(0)
 
-        b = x_b_list[0]
+        b = x0_b
         u0 = nl.maximum(
             nl.multiply(
                 nl.add(
@@ -1102,7 +1161,7 @@ if HAS_NKI:
             ),
             clamp_eps,
         )
-        b = x_b_list[1]
+        b = x1_b
         u1 = nl.maximum(
             nl.multiply(
                 nl.add(
@@ -1119,7 +1178,7 @@ if HAS_NKI:
             ),
             clamp_eps,
         )
-        b = x_b_list[2]
+        b = x2_b
         u2 = nl.maximum(
             nl.multiply(
                 nl.add(
@@ -1136,7 +1195,7 @@ if HAS_NKI:
             ),
             clamp_eps,
         )
-        b = x_b_list[3]
+        b = x3_b
         u3 = nl.maximum(
             nl.multiply(
                 nl.add(
