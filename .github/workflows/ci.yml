@@ -42,11 +42,9 @@ jobs:
 
   nki-simulator:
     runs-on: ubuntu-latest
-    # Until `nki>=0.3.0` hits the Neuron pip index this job fails at
-    # install. Keep CI green via continue-on-error so trnrand stays on
-    # main-branch-green while Amazon catches up; auto-activates when
-    # the package drops. Suite-wide pattern — see trnblas ci.yml.
-    continue-on-error: true
+    # NKI 0.3.0 Stable is on the Neuron pip index as of Neuron SDK 2.29
+    # (confirmed 2026-04-14). continue-on-error has been removed — this job
+    # is now a hard gate. Threefry simulator tests carry no xfail marks.
     env:
       TRNRAND_USE_SIMULATOR: "1"
     steps:
