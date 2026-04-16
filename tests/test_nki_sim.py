@@ -57,6 +57,8 @@ from trnrand.nki.dispatch import (  # noqa: E402
     box_muller_cpu,
     philox4x32_reference,
     philox_uniform_cpu,
+    threefry4x32_reference,
+    threefry_uniform_cpu,
 )
 
 try:
@@ -65,7 +67,17 @@ except ImportError:
     philox4x32_kernel = None
     box_muller_kernel = None
 
+try:
+    from trnrand.nki.dispatch import (  # noqa: E402
+        threefry4x32_kernel,
+        threefry_normal_kernel,
+    )
+except ImportError:
+    threefry4x32_kernel = None
+    threefry_normal_kernel = None
+
 _PHILOX_LANES_PER_TILE = 128
+_THREEFRY_LANES = 128
 
 
 # ── Philox conformance via nki.simulate ────────────────────────────────────
@@ -262,3 +274,105 @@ def test_box_muller_kernel_distribution():
     out = np.asarray(nki.simulate(box_muller_kernel)(uniforms))
     assert abs(float(out.mean())) < 0.15
     assert abs(float(out.std()) - 1.0) < 0.15
+
+
+# ── Threefry 4×32-20 correctness via nki.simulate ─────────────────────────────
+#
+# No _XFAIL_NKI_1308 marks: Threefry uses no integer multiply and works
+# entirely in byte-tile arithmetic where every intermediate ≤ 511 < 2^24.
+# These tests should PASS on the simulator without qualification.
+
+
+def _make_threefry_inputs(n_lanes, seed=0, batch=0):
+    """Build the 8 (n_lanes, 1) int32 input arrays for threefry4x32_kernel."""
+    c0 = np.arange(n_lanes, dtype=np.int32).reshape(-1, 1)
+    c1 = np.full((n_lanes, 1), batch & 0xFFFFFF, dtype=np.int32)
+    c2 = np.zeros((n_lanes, 1), dtype=np.int32)
+    c3 = np.zeros((n_lanes, 1), dtype=np.int32)
+    k0 = np.full((n_lanes, 1), seed & 0xFFFFFF, dtype=np.int32)
+    k1 = np.full((n_lanes, 1), (seed >> 24) & 0xFFFFFF, dtype=np.int32)
+    k2 = np.zeros((n_lanes, 1), dtype=np.int32)
+    k3 = np.zeros((n_lanes, 1), dtype=np.int32)
+    return c0, c1, c2, c3, k0, k1, k2, k3
+
+
+def test_threefry_kernel_matches_reference():
+    """Full 128-lane tile: simulator uniform output must match CPU reference.
+
+    The kernel emits float32 uniforms in [0, 1) from the 3 low bytes of
+    each Threefry output word. The CPU reference produces the same value
+    by the same formula: mantissa = b0 + b1*256 + b2*65536; u = m/2^24.
+    """
+    import nki
+
+    lanes = _THREEFRY_LANES
+    seed = 0x12345678
+    inputs = _make_threefry_inputs(lanes, seed=seed)
+    out_np = np.asarray(nki.simulate(threefry4x32_kernel)(*inputs))  # (lanes, 4) float32
+
+    # Build expected: same 3-byte mantissa extraction from threefry4x32_reference.
+    ctr = torch.zeros(lanes, 4, dtype=torch.int64)
+    ctr[:, 0] = torch.from_numpy(inputs[0].reshape(-1)).to(torch.int64)
+    ctr[:, 1] = torch.from_numpy(inputs[1].reshape(-1)).to(torch.int64)
+    key = torch.zeros(lanes, 4, dtype=torch.int64)
+    key[:, 0] = seed & 0xFFFFFF
+    key[:, 1] = (seed >> 24) & 0xFFFFFF
+    ref_u32 = threefry4x32_reference(ctr, key).numpy()  # (lanes, 4) int64
+    expected = ((ref_u32 & 0xFFFFFF) / 16777216.0).astype(np.float32)
+
+    np.testing.assert_allclose(
+        out_np, expected, rtol=1e-5, atol=1e-5,
+        err_msg="Threefry simulator output differs from CPU reference",
+    )
+
+
+def test_threefry_spec_vectors_via_simulator():
+    """Lane 0 of a 128-lane tile must emit the Random123 KAT vectors.
+
+    Each run uses counter=(i, 0, 0, 0), key=(0,0,0,0). We check the raw
+    float output equals the 3-LSB mantissa of the known-answer uint32 words.
+    """
+    import nki
+
+    lanes = _THREEFRY_LANES
+    # Random123 KAT vector 1: ctr=(0,0,0,0), key=(0,0,0,0)
+    # Expected uint32: (0x3425621E, 0x64AF086C, 0x4939F9F4, 0x02F34BF4)
+    kat_u32 = [0x3425621E, 0x64AF086C, 0x4939F9F4, 0x02F34BF4]
+    kat_expected = np.array([(x & 0xFFFFFF) / 16777216.0 for x in kat_u32], dtype=np.float32)
+
+    c0 = np.zeros((lanes, 1), dtype=np.int32)   # lane 0 counter = 0
+    zeros = np.zeros((lanes, 1), dtype=np.int32)
+    out_np = np.asarray(nki.simulate(threefry4x32_kernel)(
+        c0, zeros, zeros, zeros, zeros, zeros, zeros, zeros
+    ))
+    lane0 = out_np[0]  # shape (4,)
+
+    np.testing.assert_allclose(
+        lane0, kat_expected, rtol=1e-5, atol=1e-5,
+        err_msg="Threefry simulator lane 0 KAT vector mismatch",
+    )
+
+
+def test_threefry_kernel_distribution():
+    """128-lane × 4 float32 outputs should be ~U[0, 1) — mean/var check."""
+    import nki
+
+    lanes = _THREEFRY_LANES
+    inputs = _make_threefry_inputs(lanes, seed=7)
+    out_np = np.asarray(nki.simulate(threefry4x32_kernel)(*inputs))  # (lanes, 4)
+    u = out_np.reshape(-1)
+    assert 0.0 <= u.min() < 1.0
+    assert abs(float(u.mean()) - 0.5) < 0.1
+    assert abs(float(u.var()) - 1 / 12) < 0.02
+
+
+def test_threefry_normal_kernel_distribution():
+    """Fused Threefry + Box-Muller kernel: output should be ~N(0, 1)."""
+    import nki
+
+    lanes = _THREEFRY_LANES
+    inputs = _make_threefry_inputs(lanes, seed=42)
+    out_np = np.asarray(nki.simulate(threefry_normal_kernel)(*inputs))  # (lanes, 4)
+    z = out_np.reshape(-1)
+    assert abs(float(z.mean())) < 0.2
+    assert abs(float(z.std()) - 1.0) < 0.2
