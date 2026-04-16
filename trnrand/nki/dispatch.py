@@ -289,6 +289,179 @@ def _mul32_hi_lo_numpy(a, b_l: int, b_h: int):
     return hi32_u.astype(np.int32), lo32_u.astype(np.int32)
 
 
+# ── Threefry 4×32-20 ──────────────────────────────────────────────────────────
+#
+# Threefry4×32-20 (Salmon et al. SC'11, same paper as Philox) is the correct
+# algorithm when fast integer multiply is unavailable — designed explicitly for
+# FPGAs and embedded processors. Uses only: 32-bit addition, XOR, rotation.
+# All three operations decompose into byte arithmetic where every intermediate
+# stays ≤ 511 < 2^10, far below float32's 2^24 exact-integer ceiling.
+# This is the architecturally correct choice for Trainium while aws-neuron-sdk#1308
+# (NKI has no true GpSimd integer ops yet) remains open.
+#
+# Reference: Salmon, Moraes, Dror, Shaw — "Parallel Random Numbers: As Easy as
+# 1, 2, 3", SC'11, https://doi.org/10.1145/2063384.2063405
+# Test vectors: Random123 library (DE Shaw Research)
+
+THREEFRY_SKEIN_KS_PARITY = 0x1BD11BDA  # Skein key schedule parity constant
+THREEFRY_ROUNDS = 20
+# Rotation constants for Threefry4×32-20 — 4 pairs, cycling every 4 rounds.
+# From Table 4, Salmon et al. SC'11 (Skein hash variant used by Random123).
+THREEFRY_ROTATIONS = [(10, 26), (11, 21), (13, 27), (23, 5)]
+
+
+def threefry4x32_reference(counter: torch.Tensor, key: torch.Tensor) -> torch.Tensor:
+    """CPU reference implementation of Threefry4×32-20.
+
+    Used as the conformance oracle for the NKI kernel. Algorithm uses only
+    32-bit addition, XOR, and rotation — no multiply. All ops are exact at
+    any uint32 value in Python (unbounded integers, then masked to 32 bits).
+
+    Args:
+        counter: int64 tensor of shape (..., 4) — the 4 counter words.
+        key:     int64 tensor of shape (..., 4) — the 4 key words.
+
+    Returns:
+        int64 tensor of shape (..., 4) holding the 4 output uint32 words
+        (stored in the low 32 bits of int64 for arithmetic safety).
+    """
+    assert counter.shape[-1] == 4 and key.shape[-1] == 4
+
+    M = UINT32_MASK
+    x0 = counter[..., 0] & M
+    x1 = counter[..., 1] & M
+    x2 = counter[..., 2] & M
+    x3 = counter[..., 3] & M
+    k0 = key[..., 0] & M
+    k1 = key[..., 1] & M
+    k2 = key[..., 2] & M
+    k3 = key[..., 3] & M
+    k4 = (k0 ^ k1 ^ k2 ^ k3 ^ THREEFRY_SKEIN_KS_PARITY) & M
+
+    ks = [k0, k1, k2, k3, k4]  # 5-word key schedule
+
+    def rotl32(v, r):
+        return ((v << r) | (v >> (32 - r))) & M
+
+    def mix(a, b, rot):
+        a = (a + b) & M
+        b = rotl32(b, rot) ^ a
+        return a, b
+
+    def inject(x0, x1, x2, x3, step):
+        x0 = (x0 + ks[(step + 0) % 5]) & M
+        x1 = (x1 + ks[(step + 1) % 5]) & M
+        x2 = (x2 + ks[(step + 2) % 5]) & M
+        x3 = (x3 + ks[(step + 3) % 5] + step) & M
+        return x0, x1, x2, x3
+
+    # Key injection before round 0.
+    x0, x1, x2, x3 = inject(x0, x1, x2, x3, 0)
+
+    for r in range(THREEFRY_ROUNDS):
+        rot_pair = THREEFRY_ROTATIONS[r % 4]
+        if r % 2 == 0:
+            # Even rounds: MIX(x0,x1) then MIX(x2,x3)
+            x0, x1 = mix(x0, x1, rot_pair[0])
+            x2, x3 = mix(x2, x3, rot_pair[1])
+        else:
+            # Odd rounds: MIX(x0,x3) then MIX(x2,x1)
+            x0, x3 = mix(x0, x3, rot_pair[0])
+            x2, x1 = mix(x2, x1, rot_pair[1])
+        # Key injection after every 4th round (at rounds 3, 7, 11, 15, 19).
+        if (r + 1) % 4 == 0:
+            x0, x1, x2, x3 = inject(x0, x1, x2, x3, (r + 1) // 4)
+
+    return torch.stack([x0, x1, x2, x3], dim=-1)
+
+
+def threefry_uniform_cpu(
+    n_elements: int,
+    seed: int,
+    counter_offset: int = 0,
+    dtype: torch.dtype = torch.float32,
+) -> torch.Tensor:
+    """CPU Threefry uniform stream — used as fallback and oracle for tests.
+
+    Generates `n_elements` floats in [0, 1) using Threefry4×32-20 with
+    sequential counters. Seed maps to the first two key words; k2=k3=0.
+    Counter: (block_index, 0, 0, 0) starting at `counter_offset`.
+    """
+    n_blocks = (n_elements + 3) // 4
+    counters = torch.zeros(n_blocks, 4, dtype=torch.int64)
+    counters[:, 0] = torch.arange(counter_offset, counter_offset + n_blocks, dtype=torch.int64)
+    k0 = seed & UINT32_MASK
+    k1 = (seed >> 32) & UINT32_MASK
+    key = torch.tensor([k0, k1, 0, 0], dtype=torch.int64).expand(n_blocks, 4)
+    out_u32 = threefry4x32_reference(counters, key).reshape(-1)[:n_elements]
+    # uint32 → float32 in [0, 1) via mantissa-only conversion (cuRAND convention).
+    return (out_u32.to(torch.float64) * (1.0 / 2**32)).to(dtype)
+
+
+def _add32_bytes_numpy(a_u32, b_u32):
+    """Pure-numpy carry-propagating 32-bit addition via byte decomposition.
+
+    Inputs are uint32 numpy arrays of the same shape. Every intermediate
+    is ≤ 511 < 2^10, within float32's exact-integer envelope.
+    Returns a uint32 numpy array with the same shape as inputs.
+    """
+    a0 = a_u32 & np.uint32(0xFF)
+    a1 = (a_u32 >> np.uint32(8)) & np.uint32(0xFF)
+    a2 = (a_u32 >> np.uint32(16)) & np.uint32(0xFF)
+    a3 = (a_u32 >> np.uint32(24)) & np.uint32(0xFF)
+    b0 = b_u32 & np.uint32(0xFF)
+    b1 = (b_u32 >> np.uint32(8)) & np.uint32(0xFF)
+    b2 = (b_u32 >> np.uint32(16)) & np.uint32(0xFF)
+    b3 = (b_u32 >> np.uint32(24)) & np.uint32(0xFF)
+
+    s0 = a0.astype(np.uint32) + b0.astype(np.uint32)   # ≤ 510
+    c0 = s0 >> np.uint32(8)
+    r0 = s0 & np.uint32(0xFF)
+    s1 = a1 + b1 + c0
+    c1 = s1 >> np.uint32(8)
+    r1 = s1 & np.uint32(0xFF)
+    s2 = a2 + b2 + c1
+    c2 = s2 >> np.uint32(8)
+    r2 = s2 & np.uint32(0xFF)
+    s3 = a3 + b3 + c2
+    r3 = s3 & np.uint32(0xFF)  # carry out discarded (mod 2^32)
+
+    return (r0 | (r1 << np.uint32(8)) | (r2 << np.uint32(16)) | (r3 << np.uint32(24))).astype(np.uint32)
+
+
+def _rotl32_bytes_numpy(a_u32, R: int):
+    """Pure-numpy 32-bit rotate-left via byte decomposition.
+
+    Decomposed as byte-shift (q = R//8) + sub-byte rotation (r = R%8).
+    The sub-byte step: hi = byte << r (≤ 32640 < 2^15), lo = byte >> (8-r).
+    Every intermediate stays well below 2^24.
+    Returns a uint32 numpy array with the same shape as `a_u32`.
+    """
+    assert 0 < R < 32, "rotation must be in (0, 32)"
+    q = R // 8   # byte-level shift
+    r = R % 8    # sub-byte bit shift
+
+    # Split into 4 bytes (byte 0 = LSB).
+    bytes_ = [(a_u32 >> np.uint32(8 * i)) & np.uint32(0xFF) for i in range(4)]
+
+    if r == 0:
+        # Pure byte rotation: no sub-byte work needed.
+        out_bytes = [bytes_[(i - q) % 4] for i in range(4)]
+    else:
+        out_bytes = []
+        for i in range(4):
+            hi = (bytes_[(i - q) % 4].astype(np.uint32) << np.uint32(r)) & np.uint32(0xFF)
+            lo = (bytes_[(i - q - 1) % 4].astype(np.uint32) >> np.uint32(8 - r)) & np.uint32(0xFF)
+            out_bytes.append((hi | lo).astype(np.uint32))
+
+    return (
+        out_bytes[0]
+        | (out_bytes[1] << np.uint32(8))
+        | (out_bytes[2] << np.uint32(16))
+        | (out_bytes[3] << np.uint32(24))
+    ).astype(np.uint32)
+
+
 if HAS_NKI:
     # NKI's `nl.multiply` routes uint32 operands through the activation
     # engine's float32 path on both simulator and hardware. float32
@@ -560,3 +733,410 @@ if HAS_NKI:
                 out_tile = box_muller_kernel(u).reshape(-1).to(orig)
             chunks.append(out_tile)
         return torch.cat(chunks) if len(chunks) > 1 else chunks[0]
+
+    # ── Threefry 4×32-20 NKI kernel (byte-tile representation) ───────────────
+    #
+    # Core invariant: EVERY 32-bit word is stored as 4 separate (P, 1) tiles
+    # (b3, b2, b1, b0) with values in [0, 255]. All NKI operations receive
+    # inputs ≤ 255 (or ≤ 511 for addition with carry), well within float32's
+    # 2^24 exact-integer ceiling. This sidesteps aws-neuron-sdk#1308 entirely:
+    # we never form a uint32 tile element, so the float32 activation path
+    # is exact for all our inputs.
+    #
+    # Rotation constants precomputed as (q=R//8, r=R%8) pairs at module level.
+    # NKI kernels must not have inner function definitions, so all helpers are
+    # defined here at module scope inside `if HAS_NKI:`.
+
+    # Precompute (q, r) for each of the 8 rotation constants.
+    # THREEFRY_ROTATIONS = [(10,26),(11,21),(13,27),(23,5)]
+    # Flattened: [10, 26, 11, 21, 13, 27, 23, 5]
+    _THREEFRY_ROT_QR = tuple(
+        (rot // 8, rot % 8)
+        for pair in THREEFRY_ROTATIONS
+        for rot in pair
+    )
+    # 128 lanes per tile (Trainium partition-axis limit).
+    _THREEFRY_LANES = 128
+
+    def _b_split(v_ref):
+        """Load a (P,1) int32 tile and split into 4 byte tiles, each in [0,255].
+
+        Returns [b0, b1, b2, b3] where b0 is the least-significant byte.
+        All returned tiles are uint32-typed with values ≤ 255.
+        """
+        v = nl.load(v_ref)
+        v_u = nl.copy(v, dtype=nl.uint32)
+        b0 = nl.bitwise_and(v_u, 0xFF, dtype=nl.uint32)
+        b1 = nl.bitwise_and(nl.right_shift(v_u, 8, dtype=nl.uint32), 0xFF, dtype=nl.uint32)
+        b2 = nl.bitwise_and(nl.right_shift(v_u, 16, dtype=nl.uint32), 0xFF, dtype=nl.uint32)
+        b3 = nl.right_shift(v_u, 24, dtype=nl.uint32)
+        return [b0, b1, b2, b3]
+
+    def _b_from_scalar(P, val):
+        """Materialize a Python int (< 2^32) as 4 byte tiles."""
+        val = int(val) & 0xFFFFFFFF
+        b0 = nl.full((P, 1), val & 0xFF, dtype=nl.uint32)
+        b1 = nl.full((P, 1), (val >> 8) & 0xFF, dtype=nl.uint32)
+        b2 = nl.full((P, 1), (val >> 16) & 0xFF, dtype=nl.uint32)
+        b3 = nl.full((P, 1), (val >> 24) & 0xFF, dtype=nl.uint32)
+        return [b0, b1, b2, b3]
+
+    def _add32_b(a_b, b_b):
+        """Carry-propagating 32-bit addition in byte-tile representation.
+
+        Each byte tile is in [0, 255]; sums ≤ 511 < 2^10 (exact in float32).
+        Returns 4 byte tiles representing (a + b) mod 2^32.
+        """
+        s0 = nl.add(a_b[0], b_b[0], dtype=nl.uint32)   # ≤ 510
+        c0 = nl.right_shift(s0, 8, dtype=nl.uint32)
+        r0 = nl.bitwise_and(s0, 0xFF, dtype=nl.uint32)
+        s1 = nl.add(nl.add(a_b[1], b_b[1], dtype=nl.uint32), c0, dtype=nl.uint32)
+        c1 = nl.right_shift(s1, 8, dtype=nl.uint32)
+        r1 = nl.bitwise_and(s1, 0xFF, dtype=nl.uint32)
+        s2 = nl.add(nl.add(a_b[2], b_b[2], dtype=nl.uint32), c1, dtype=nl.uint32)
+        c2 = nl.right_shift(s2, 8, dtype=nl.uint32)
+        r2 = nl.bitwise_and(s2, 0xFF, dtype=nl.uint32)
+        s3 = nl.add(nl.add(a_b[3], b_b[3], dtype=nl.uint32), c2, dtype=nl.uint32)
+        r3 = nl.bitwise_and(s3, 0xFF, dtype=nl.uint32)  # carry out discarded
+        return [r0, r1, r2, r3]
+
+    def _xor32_b(a_b, b_b):
+        """Byte-by-byte XOR. Result bytes in [0, 255]."""
+        return [
+            nl.bitwise_xor(a_b[i], b_b[i], dtype=nl.uint32)
+            for i in range(4)
+        ]
+
+    def _rotl32_b(x_b, q, r):
+        """Rotate-left by (q bytes + r bits) in byte-tile representation.
+
+        q = rotation // 8  (byte-level shift, precomputed)
+        r = rotation % 8   (sub-byte bit shift)
+
+        For r == 0: pure byte rotation, result bytes ∈ [0, 255].
+        For r > 0:  hi = byte << r (≤ 32640 < 2^15), lo = byte >> (8-r) (≤ 127),
+                    combined = hi | lo — but since we mask to 8 bits:
+                    out_byte = bitwise_and(left_shift(src_hi, r) | right_shift(src_lo, 8-r), 0xFF)
+                    All intermediates < 2^15, exact in float32.
+        """
+        if r == 0:
+            # Pure byte-level rotation.
+            return [x_b[(i - q) % 4] for i in range(4)]
+
+        out = []
+        for i in range(4):
+            hi = nl.left_shift(x_b[(i - q) % 4], r, dtype=nl.uint32)      # ≤ 32640
+            lo = nl.right_shift(x_b[(i - q - 1) % 4], 8 - r, dtype=nl.uint32)  # ≤ 127
+            out.append(nl.bitwise_and(nl.bitwise_or(hi, lo, dtype=nl.uint32), 0xFF, dtype=nl.uint32))
+        return out
+
+    def _mix_b(a_b, b_b, q, r):
+        """Threefry MIX operation in byte-tile representation.
+
+        MIX(a, b, rot):
+            a = (a + b) mod 2^32
+            b = rotl32(b, rot) ^ a
+        """
+        a_new = _add32_b(a_b, b_b)
+        b_rot = _rotl32_b(b_b, q, r)
+        b_new = _xor32_b(b_rot, a_new)
+        return a_new, b_new
+
+    def _key_inject_b(x_b_list, ks_b, step):
+        """Add Threefry key schedule words to state words.
+
+        Threefry4×32-20 key injection at step s:
+            x[i] += ks[(s+i) % 5]   for i in 0..2
+            x[3] += ks[(s+3) % 5] + s   (step added to last word)
+
+        `x_b_list`: list of 4 state words, each as [b0,b1,b2,b3] byte tiles.
+        `ks_b`:     list of 5 key schedule words, each as [b0,b1,b2,b3].
+        `step`:     Python int (0..4), small enough to add directly to b0.
+        Returns updated x_b_list (4 words).
+        """
+        P = x_b_list[0][0].shape[0]
+        out = []
+        for i in range(3):
+            out.append(_add32_b(x_b_list[i], ks_b[(step + i) % 5]))
+        # x[3] += ks[(step+3) % 5] + step
+        step_b = _b_from_scalar(P, step)
+        ks_plus_step = _add32_b(ks_b[(step + 3) % 5], step_b)
+        out.append(_add32_b(x_b_list[3], ks_plus_step))
+        return out
+
+    @nki.jit
+    def threefry4x32_kernel(c0_ref, c1_ref, c2_ref, c3_ref,
+                             k0_ref, k1_ref, k2_ref, k3_ref):
+        """Threefry4×32-20 NKI kernel using byte-tile arithmetic.
+
+        Every 32-bit word is held as 4 separate (P,1) uint32 tiles with
+        values in [0, 255]. All NKI multiply and shift ops receive inputs
+        ≤ 511 — well within float32's 2^24 exact-integer ceiling.
+
+        Inputs: 8 × (P, 1) int32 tiles representing counter (c0..c3) and
+                key (k0..k3) words. Values must fit in [0, 2^24) — the host
+                wrapper ensures this by design (lane indices 0..127 as c0,
+                batch index as c1, higher words remain 0).
+        Output: (P, 4) float32 uniforms in [0, 1) — assembled from the 3
+                least-significant bytes of each output word (23-bit mantissa),
+                which avoids uint32 assembly entirely.
+        """
+        P = c0_ref.shape[0]
+
+        # Load counter words and split into byte tiles.
+        x0_b = _b_split(c0_ref)
+        x1_b = _b_split(c1_ref)
+        x2_b = _b_split(c2_ref)
+        x3_b = _b_split(c3_ref)
+        k0_b = _b_split(k0_ref)
+        k1_b = _b_split(k1_ref)
+        k2_b = _b_split(k2_ref)
+        k3_b = _b_split(k3_ref)
+
+        # Compute k4 = k0 ^ k1 ^ k2 ^ k3 ^ SKEIN_KS_PARITY (byte-by-byte XOR).
+        parity_b = _b_from_scalar(P, THREEFRY_SKEIN_KS_PARITY)
+        k4_b = _xor32_b(_xor32_b(_xor32_b(_xor32_b(k0_b, k1_b), k2_b), k3_b), parity_b)
+        ks_b = [k0_b, k1_b, k2_b, k3_b, k4_b]
+
+        x_b_list = [x0_b, x1_b, x2_b, x3_b]
+
+        # Initial key injection (step 0) before round 0.
+        x_b_list = _key_inject_b(x_b_list, ks_b, 0)
+
+        # 20 rounds, unrolled at compile time via nl.static_range.
+        # Rotation constants are indexed as: rot_pair_idx = r % 4,
+        # with [0] for the first MIX and [1] for the second MIX.
+        # Precomputed (q, r) index: _THREEFRY_ROT_QR[rot_pair_idx*2 + slot]
+        for round_num in nl.static_range(THREEFRY_ROUNDS):
+            pair_idx = round_num % 4
+            if round_num % 2 == 0:
+                # Even rounds: MIX(x0,x1) then MIX(x2,x3)
+                q0, r0 = _THREEFRY_ROT_QR[pair_idx * 2 + 0]
+                q1, r1 = _THREEFRY_ROT_QR[pair_idx * 2 + 1]
+                x_b_list[0], x_b_list[1] = _mix_b(x_b_list[0], x_b_list[1], q0, r0)
+                x_b_list[2], x_b_list[3] = _mix_b(x_b_list[2], x_b_list[3], q1, r1)
+            else:
+                # Odd rounds: MIX(x0,x3) then MIX(x2,x1)
+                q0, r0 = _THREEFRY_ROT_QR[pair_idx * 2 + 0]
+                q1, r1 = _THREEFRY_ROT_QR[pair_idx * 2 + 1]
+                x_b_list[0], x_b_list[3] = _mix_b(x_b_list[0], x_b_list[3], q0, r0)
+                x_b_list[2], x_b_list[1] = _mix_b(x_b_list[2], x_b_list[1], q1, r1)
+            # Key injection after every 4th round.
+            if (round_num + 1) % 4 == 0:
+                x_b_list = _key_inject_b(x_b_list, ks_b, (round_num + 1) // 4)
+
+        # Convert byte tiles → float32 uniforms in [0, 1).
+        # Use 3 least-significant bytes: mantissa = b0 + b1*256 + b2*65536
+        # which ≤ 16777215 = 2^24 - 1, exactly representable in float32.
+        # Then divide by 2^24. This gives 24-bit uniform resolution.
+        inv24 = nl.full((P, 1), 1.0 / 16777216.0, dtype=nl.float32)
+        out = nl.ndarray((P, 4), dtype=nl.float32, buffer=nl.shared_hbm)
+        for word_idx in nl.static_range(4):
+            b = x_b_list[word_idx]
+            b1_scaled = nl.multiply(
+                nl.copy(b[1], dtype=nl.float32),
+                nl.full((P, 1), 256.0, dtype=nl.float32),
+                dtype=nl.float32,
+            )
+            b2_scaled = nl.multiply(
+                nl.copy(b[2], dtype=nl.float32),
+                nl.full((P, 1), 65536.0, dtype=nl.float32),
+                dtype=nl.float32,
+            )
+            mantissa = nl.add(
+                nl.add(nl.copy(b[0], dtype=nl.float32), b1_scaled, dtype=nl.float32),
+                b2_scaled,
+                dtype=nl.float32,
+            )
+            out[:, word_idx : word_idx + 1] = nl.multiply(mantissa, inv24, dtype=nl.float32)
+        return out
+
+    @nki.jit
+    def threefry_normal_kernel(c0_ref, c1_ref, c2_ref, c3_ref,
+                                k0_ref, k1_ref, k2_ref, k3_ref):
+        """Fused Threefry4×32-20 + Box-Muller kernel: counter inputs → N(0,1).
+
+        Chains Threefry output directly into Box-Muller on the Vector Engine.
+        Output tiles remain SBUF-resident between stages — no HBM round-trip.
+        This is the four-engine framing end-to-end: GpSimd (byte arithmetic)
+        → Vector Engine (transcendentals) → SBUF → downstream consumer.
+
+        Inputs: same 8 × (P, 1) counter/key tiles as threefry4x32_kernel.
+        Output: (P, 4) float32 standard-normal samples.
+        """
+        P = c0_ref.shape[0]
+
+        # ── Stage 1: Threefry byte-tile RNG → 4 uniform floats per lane ──
+        x0_b = _b_split(c0_ref)
+        x1_b = _b_split(c1_ref)
+        x2_b = _b_split(c2_ref)
+        x3_b = _b_split(c3_ref)
+        k0_b = _b_split(k0_ref)
+        k1_b = _b_split(k1_ref)
+        k2_b = _b_split(k2_ref)
+        k3_b = _b_split(k3_ref)
+
+        parity_b = _b_from_scalar(P, THREEFRY_SKEIN_KS_PARITY)
+        k4_b = _xor32_b(_xor32_b(_xor32_b(_xor32_b(k0_b, k1_b), k2_b), k3_b), parity_b)
+        ks_b = [k0_b, k1_b, k2_b, k3_b, k4_b]
+        x_b_list = [x0_b, x1_b, x2_b, x3_b]
+        x_b_list = _key_inject_b(x_b_list, ks_b, 0)
+
+        for round_num in nl.static_range(THREEFRY_ROUNDS):
+            pair_idx = round_num % 4
+            if round_num % 2 == 0:
+                q0, r0 = _THREEFRY_ROT_QR[pair_idx * 2 + 0]
+                q1, r1 = _THREEFRY_ROT_QR[pair_idx * 2 + 1]
+                x_b_list[0], x_b_list[1] = _mix_b(x_b_list[0], x_b_list[1], q0, r0)
+                x_b_list[2], x_b_list[3] = _mix_b(x_b_list[2], x_b_list[3], q1, r1)
+            else:
+                q0, r0 = _THREEFRY_ROT_QR[pair_idx * 2 + 0]
+                q1, r1 = _THREEFRY_ROT_QR[pair_idx * 2 + 1]
+                x_b_list[0], x_b_list[3] = _mix_b(x_b_list[0], x_b_list[3], q0, r0)
+                x_b_list[2], x_b_list[1] = _mix_b(x_b_list[2], x_b_list[1], q1, r1)
+            if (round_num + 1) % 4 == 0:
+                x_b_list = _key_inject_b(x_b_list, ks_b, (round_num + 1) // 4)
+
+        # Convert to 4 uniform floats (SBUF-resident, no HBM write yet).
+        inv24 = nl.full((P, 1), 1.0 / 16777216.0, dtype=nl.float32)
+        clamp_eps = nl.full((P, 1), 1e-7, dtype=nl.float32)  # avoid log(0)
+        uniforms = []
+        for word_idx in range(4):
+            b = x_b_list[word_idx]
+            b1s = nl.multiply(nl.copy(b[1], dtype=nl.float32),
+                              nl.full((P, 1), 256.0, dtype=nl.float32), dtype=nl.float32)
+            b2s = nl.multiply(nl.copy(b[2], dtype=nl.float32),
+                              nl.full((P, 1), 65536.0, dtype=nl.float32), dtype=nl.float32)
+            m = nl.add(nl.add(nl.copy(b[0], dtype=nl.float32), b1s, dtype=nl.float32),
+                       b2s, dtype=nl.float32)
+            u = nl.multiply(m, inv24, dtype=nl.float32)
+            u = nl.maximum(u, clamp_eps)   # clamp away from 0 for log safety
+            uniforms.append(u)
+
+        # ── Stage 2: Box-Muller pairs (u0,u1) → (z0,z1), (u2,u3) → (z2,z3) ──
+        neg_two = nl.full((P, 1), -2.0, dtype=nl.float32)
+        two_pi = nl.full((P, 1), TWO_PI, dtype=nl.float32)
+
+        r0 = nl.sqrt(nl.multiply(nl.log(uniforms[0]), neg_two))
+        theta0 = nl.multiply(uniforms[1], two_pi)
+        z0 = nl.multiply(r0, nl.cos(theta0))
+        z1 = nl.multiply(r0, nl.sin(theta0))
+
+        r1 = nl.sqrt(nl.multiply(nl.log(uniforms[2]), neg_two))
+        theta1 = nl.multiply(uniforms[3], two_pi)
+        z2 = nl.multiply(r1, nl.cos(theta1))
+        z3 = nl.multiply(r1, nl.sin(theta1))
+
+        out = nl.ndarray((P, 4), dtype=nl.float32, buffer=nl.shared_hbm)
+        out[:, 0:1] = z0
+        out[:, 1:2] = z1
+        out[:, 2:3] = z2
+        out[:, 3:4] = z3
+        return out
+
+    def threefry_uniform_nki(
+        n_elements: int,
+        seed: int = 0,
+        counter_offset: int = 0,
+    ) -> torch.Tensor:
+        """Host-side wrapper: Threefry4×32-20 → float32 uniforms in [0, 1).
+
+        Counter design (ensures all tile inputs < 2^24 for the host's
+        typical workload up to ~128 * 2^16 = ~8M elements per call):
+            c0 = lane index within tile (0..127)
+            c1 = batch/tile index (0..n_batches-1)
+            c2 = counter_offset high word
+            c3 = 0
+        Key: k0=seed&0xFFFFFF, k1=(seed>>24)&0xFFFFFF, k2=k3=0
+        (trimmed to 24 bits to guarantee < 2^24 at tile load time).
+        """
+        LANES = _THREEFRY_LANES
+        n_words = (n_elements + 3) // 4   # each lane emits 4 words
+        n_batches = (n_words + LANES - 1) // LANES
+
+        k0_val = seed & 0xFFFFFF
+        k1_val = (seed >> 24) & 0xFFFFFF
+
+        chunks = []
+        for batch in range(n_batches):
+            tile_lanes = min(LANES, n_words - batch * LANES)
+            c0_np = np.arange(tile_lanes, dtype=np.int32).reshape(-1, 1)
+            c1_np = np.full((tile_lanes, 1), (batch + counter_offset) & 0xFFFFFF, dtype=np.int32)
+            c2_np = np.zeros((tile_lanes, 1), dtype=np.int32)
+            c3_np = np.zeros((tile_lanes, 1), dtype=np.int32)
+            k0_np = np.full((tile_lanes, 1), k0_val, dtype=np.int32)
+            k1_np = np.full((tile_lanes, 1), k1_val, dtype=np.int32)
+            k2_np = np.zeros((tile_lanes, 1), dtype=np.int32)
+            k3_np = np.zeros((tile_lanes, 1), dtype=np.int32)
+
+            if _use_simulator():
+                out_np = nki.simulate(threefry4x32_kernel)(
+                    c0_np, c1_np, c2_np, c3_np,
+                    k0_np, k1_np, k2_np, k3_np,
+                )
+                out_tile = torch.from_numpy(np.asarray(out_np).reshape(-1))
+            else:
+                def _t(arr):
+                    return torch.from_numpy(arr)
+                (c0t, c1t, c2t, c3t, k0t, k1t, k2t, k3t), orig = _to_xla(
+                    _t(c0_np), _t(c1_np), _t(c2_np), _t(c3_np),
+                    _t(k0_np), _t(k1_np), _t(k2_np), _t(k3_np),
+                )
+                out_tile = threefry4x32_kernel(
+                    c0t, c1t, c2t, c3t, k0t, k1t, k2t, k3t
+                ).reshape(-1).to(orig)
+            chunks.append(out_tile)
+
+        result = torch.cat(chunks) if len(chunks) > 1 else chunks[0]
+        return result.float()[:n_elements]
+
+    def threefry_normal_nki(
+        n_elements: int,
+        seed: int = 0,
+        counter_offset: int = 0,
+    ) -> torch.Tensor:
+        """Host-side wrapper: Threefry4×32-20 + Box-Muller → N(0,1) floats.
+
+        Uses the fused `threefry_normal_kernel`. Each tile emits 4 normals
+        per lane (2 Box-Muller pairs). Counter layout matches
+        `threefry_uniform_nki`.
+        """
+        LANES = _THREEFRY_LANES
+        n_words = (n_elements + 3) // 4
+        n_batches = (n_words + LANES - 1) // LANES
+
+        k0_val = seed & 0xFFFFFF
+        k1_val = (seed >> 24) & 0xFFFFFF
+
+        chunks = []
+        for batch in range(n_batches):
+            tile_lanes = min(LANES, n_words - batch * LANES)
+            c0_np = np.arange(tile_lanes, dtype=np.int32).reshape(-1, 1)
+            c1_np = np.full((tile_lanes, 1), (batch + counter_offset) & 0xFFFFFF, dtype=np.int32)
+            c2_np = np.zeros((tile_lanes, 1), dtype=np.int32)
+            c3_np = np.zeros((tile_lanes, 1), dtype=np.int32)
+            k0_np = np.full((tile_lanes, 1), k0_val, dtype=np.int32)
+            k1_np = np.full((tile_lanes, 1), k1_val, dtype=np.int32)
+            k2_np = np.zeros((tile_lanes, 1), dtype=np.int32)
+            k3_np = np.zeros((tile_lanes, 1), dtype=np.int32)
+
+            if _use_simulator():
+                out_np = nki.simulate(threefry_normal_kernel)(
+                    c0_np, c1_np, c2_np, c3_np,
+                    k0_np, k1_np, k2_np, k3_np,
+                )
+                out_tile = torch.from_numpy(np.asarray(out_np).reshape(-1))
+            else:
+                def _t(arr):
+                    return torch.from_numpy(arr)
+                (c0t, c1t, c2t, c3t, k0t, k1t, k2t, k3t), orig = _to_xla(
+                    _t(c0_np), _t(c1_np), _t(c2_np), _t(c3_np),
+                    _t(k0_np), _t(k1_np), _t(k2_np), _t(k3_np),
+                )
+                out_tile = threefry_normal_kernel(
+                    c0t, c1t, c2t, c3t, k0t, k1t, k2t, k3t
+                ).reshape(-1).to(orig)
+            chunks.append(out_tile)
+
+        result = torch.cat(chunks) if len(chunks) > 1 else chunks[0]
+        return result.float()[:n_elements]

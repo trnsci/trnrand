@@ -15,16 +15,24 @@ from __future__ import annotations
 import pytest
 import torch
 
+import numpy as np
+
 from trnrand.nki import HAS_NKI
 from trnrand.nki.dispatch import (
     PHILOX_M0,
     PHILOX_M1,
     PHILOX_W0,
     PHILOX_W1,
+    THREEFRY_ROTATIONS,
+    THREEFRY_SKEIN_KS_PARITY,
     UINT32_MASK,
+    _add32_bytes_numpy,
+    _rotl32_bytes_numpy,
     box_muller_cpu,
     philox4x32_reference,
     philox_uniform_cpu,
+    threefry4x32_reference,
+    threefry_uniform_cpu,
 )
 
 # ── CPU reference: spec invariants ────────────────────────────────────────────
@@ -190,6 +198,147 @@ class TestPhiloxReference:
             assert got_lo_u == lo_expected, (
                 f"lo mismatch for a={a:#010x}: got {got_lo_u:#010x}, expected {lo_expected:#010x}"
             )
+
+
+# ── Threefry 4×32-20 CPU reference ───────────────────────────────────────────
+
+
+class TestThreefryReference:
+    def test_constants(self):
+        assert THREEFRY_SKEIN_KS_PARITY == 0x1BD11BDA
+        assert THREEFRY_ROTATIONS == [(10, 26), (11, 21), (13, 27), (23, 5)]
+
+    @pytest.mark.parametrize(
+        "counter,key,expected",
+        [
+            # Random123 library KAT vectors for Threefry4×32-20.
+            # Source: DE Shaw Research random123 test suite.
+            (
+                (0x00000000, 0x00000000, 0x00000000, 0x00000000),
+                (0x00000000, 0x00000000, 0x00000000, 0x00000000),
+                (0x3425621E, 0x64AF086C, 0x4939F9F4, 0x02F34BF4),
+            ),
+            (
+                (0xFFFFFFFF, 0xFFFFFFFF, 0xFFFFFFFF, 0xFFFFFFFF),
+                (0xFFFFFFFF, 0xFFFFFFFF, 0xFFFFFFFF, 0xFFFFFFFF),
+                (0xFF0E3F66, 0x66CE18C2, 0xEBF1FE02, 0xC14E9FCA),
+            ),
+            (
+                (0x243F6A88, 0x85A308D3, 0x13198A2E, 0x03707344),
+                (0xA4093822, 0x299F31D0, 0x082EFA98, 0xEC4E6C89),
+                (0x55FF6421, 0x9A904ECF, 0x02EB6042, 0xA0FC59B8),
+            ),
+        ],
+    )
+    def test_spec_vectors(self, counter, key, expected):
+        ctr = torch.tensor([list(counter)], dtype=torch.int64)
+        k = torch.tensor([list(key)], dtype=torch.int64)
+        out = threefry4x32_reference(ctr, k)[0].tolist()
+        assert out == list(expected), (
+            f"Threefry4×32-20 output mismatch: got "
+            f"({out[0]:#010x}, {out[1]:#010x}, {out[2]:#010x}, {out[3]:#010x}), "
+            f"expected ({expected[0]:#010x}, {expected[1]:#010x}, "
+            f"{expected[2]:#010x}, {expected[3]:#010x})"
+        )
+
+    def test_zero_input_deterministic(self):
+        ctr = torch.zeros(1, 4, dtype=torch.int64)
+        key = torch.zeros(1, 4, dtype=torch.int64)
+        out_a = threefry4x32_reference(ctr, key)
+        out_b = threefry4x32_reference(ctr, key)
+        assert torch.equal(out_a, out_b)
+
+    def test_output_range(self):
+        ctr = torch.arange(8, dtype=torch.int64).unsqueeze(-1).repeat(1, 4)
+        key = torch.zeros(8, 4, dtype=torch.int64)
+        out = threefry4x32_reference(ctr, key)
+        assert out.min().item() >= 0
+        assert out.max().item() <= UINT32_MASK
+
+    def test_different_counters_differ(self):
+        ctr1 = torch.zeros(1, 4, dtype=torch.int64)
+        ctr2 = torch.tensor([[1, 0, 0, 0]], dtype=torch.int64)
+        key = torch.zeros(1, 4, dtype=torch.int64)
+        out1 = threefry4x32_reference(ctr1, key)
+        out2 = threefry4x32_reference(ctr2, key)
+        assert not torch.equal(out1, out2)
+
+    def test_different_keys_differ(self):
+        ctr = torch.zeros(1, 4, dtype=torch.int64)
+        key1 = torch.zeros(1, 4, dtype=torch.int64)
+        key2 = torch.tensor([[42, 0, 0, 0]], dtype=torch.int64)
+        out1 = threefry4x32_reference(ctr, key1)
+        out2 = threefry4x32_reference(ctr, key2)
+        assert not torch.equal(out1, out2)
+
+    def test_disjoint_counter_ranges_no_overlap(self):
+        key = torch.zeros(64, 4, dtype=torch.int64)
+        ctr_a = torch.zeros(64, 4, dtype=torch.int64)
+        ctr_a[:, 0] = torch.arange(64)
+        ctr_b = torch.zeros(64, 4, dtype=torch.int64)
+        ctr_b[:, 0] = torch.arange(64, 128)
+        out_a = threefry4x32_reference(ctr_a, key).reshape(-1)
+        out_b = threefry4x32_reference(ctr_b, key).reshape(-1)
+        a_set = set(out_a.tolist())
+        overlap = sum(1 for x in out_b.tolist() if x in a_set)
+        assert overlap <= 1
+
+    def test_uniform_cpu_range(self):
+        u = threefry_uniform_cpu(10_000, seed=42)
+        assert u.min().item() >= 0.0
+        assert u.max().item() < 1.0
+        assert u.dtype == torch.float32
+
+    def test_uniform_cpu_distribution(self):
+        u = threefry_uniform_cpu(100_000, seed=42)
+        assert abs(u.mean().item() - 0.5) < 0.01
+        assert abs(u.var().item() - 1 / 12) < 0.005
+
+    def test_uniform_cpu_seed_reproducible(self):
+        u1 = threefry_uniform_cpu(1024, seed=42)
+        u2 = threefry_uniform_cpu(1024, seed=42)
+        assert torch.equal(u1, u2)
+
+    def test_uniform_cpu_different_seeds_differ(self):
+        u1 = threefry_uniform_cpu(1024, seed=42)
+        u2 = threefry_uniform_cpu(1024, seed=99)
+        assert not torch.equal(u1, u2)
+
+    def test_add32_bytes_numpy(self):
+        """Byte-decomposed add must match Python unbounded-int ground truth."""
+        test_pairs = [
+            (0x00000000, 0x00000000),
+            (0x00000001, 0x00000001),
+            (0xFFFFFFFF, 0x00000001),
+            (0xFFFFFFFF, 0xFFFFFFFF),
+            (0x12345678, 0x9ABCDEF0),
+            (0x7FFFFFFF, 0x80000001),
+            (0xD2511F53, 0x9E3779B9),
+        ]
+        for a, b in test_pairs:
+            expected = (a + b) & 0xFFFFFFFF
+            a_arr = np.array([a], dtype=np.uint32)
+            b_arr = np.array([b], dtype=np.uint32)
+            got = int(_add32_bytes_numpy(a_arr, b_arr)[0])
+            assert got == expected, (
+                f"add32_bytes({a:#010x}, {b:#010x}): got {got:#010x}, "
+                f"expected {expected:#010x}"
+            )
+
+    def test_rotl32_bytes_numpy(self):
+        """Byte-decomposed rotate-left must match Python ground truth."""
+        test_inputs = [0x00000001, 0x12345678, 0xFFFFFFFF, 0x80000000, 0xABCDEF01]
+        # All rotation constants used by Threefry4×32-20.
+        rotations = [10, 26, 11, 21, 13, 27, 23, 5]
+        for a in test_inputs:
+            for R in rotations:
+                expected = ((a << R) | (a >> (32 - R))) & 0xFFFFFFFF
+                a_arr = np.array([a], dtype=np.uint32)
+                got = int(_rotl32_bytes_numpy(a_arr, R)[0])
+                assert got == expected, (
+                    f"rotl32({a:#010x}, {R}): got {got:#010x}, "
+                    f"expected {expected:#010x}"
+                )
 
 
 # ── Box-Muller CPU reference ──────────────────────────────────────────────────
