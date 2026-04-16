@@ -480,6 +480,32 @@ if HAS_NKI:
     _PHILOX_M1_L = PHILOX_M1 & 0xFFFF  # 0x8D57
     _PHILOX_M1_H = (PHILOX_M1 >> 16) & 0xFFFF  # 0xCD9E
 
+    # Module-level NKI arithmetic helpers for `_mul32_hi_lo`.
+    # NKI rejects inner function definitions inside functions called from
+    # @nki.jit kernels, so all helpers must live at module scope.
+
+    def _nki_mul_u32(x, y):
+        return nl.multiply(x, y, dtype=nl.uint32)
+
+    def _nki_add_u32(x, y):
+        return nl.add(x, y, dtype=nl.uint32)
+
+    def _nki_carry_step(acc, col):
+        """Extract low byte and carry, add carry to next column."""
+        byte = nl.bitwise_and(acc, 0xFF, dtype=nl.uint32)
+        carry = nl.right_shift(acc, 8, dtype=nl.uint32)
+        return byte, nl.add(carry, col, dtype=nl.uint32)
+
+    def _nki_pack4_u32(b0, b1, b2, b3):
+        """Pack 4 byte tiles into a single uint32 tile."""
+        return nl.bitwise_or(
+            nl.bitwise_or(b0, nl.left_shift(b1, 8, dtype=nl.uint32)),
+            nl.bitwise_or(
+                nl.left_shift(b2, 16, dtype=nl.uint32),
+                nl.left_shift(b3, 24, dtype=nl.uint32),
+            ),
+        )
+
     def _mul32_hi_lo(a, b_l, b_h):
         """32×32→64 multiply returning (hi32, lo32) int32 tensors.
 
@@ -521,50 +547,36 @@ if HAS_NKI:
         b2_vec = nl.full((P, 1), b_h & 0xFF, dtype=nl.uint32)
         b3_vec = nl.full((P, 1), (b_h >> 8) & 0xFF, dtype=nl.uint32)
 
-        def mul(x, y):
-            return nl.multiply(x, y, dtype=nl.uint32)
-
-        def add2(x, y):
-            return nl.add(x, y, dtype=nl.uint32)
-
         # 16 sub-products → 7 column sums. Each column sum ≤ 2^18.
-        c0 = mul(a0, b0_vec)
-        c1 = add2(mul(a0, b1_vec), mul(a1, b0_vec))
-        c2 = add2(add2(mul(a0, b2_vec), mul(a1, b1_vec)), mul(a2, b0_vec))
-        c3 = add2(
-            add2(mul(a0, b3_vec), mul(a1, b2_vec)),
-            add2(mul(a2, b1_vec), mul(a3, b0_vec)),
+        c0 = _nki_mul_u32(a0, b0_vec)
+        c1 = _nki_add_u32(_nki_mul_u32(a0, b1_vec), _nki_mul_u32(a1, b0_vec))
+        c2 = _nki_add_u32(
+            _nki_add_u32(_nki_mul_u32(a0, b2_vec), _nki_mul_u32(a1, b1_vec)),
+            _nki_mul_u32(a2, b0_vec),
         )
-        c4 = add2(add2(mul(a1, b3_vec), mul(a2, b2_vec)), mul(a3, b1_vec))
-        c5 = add2(mul(a2, b3_vec), mul(a3, b2_vec))
-        c6 = mul(a3, b3_vec)
+        c3 = _nki_add_u32(
+            _nki_add_u32(_nki_mul_u32(a0, b3_vec), _nki_mul_u32(a1, b2_vec)),
+            _nki_add_u32(_nki_mul_u32(a2, b1_vec), _nki_mul_u32(a3, b0_vec)),
+        )
+        c4 = _nki_add_u32(
+            _nki_add_u32(_nki_mul_u32(a1, b3_vec), _nki_mul_u32(a2, b2_vec)),
+            _nki_mul_u32(a3, b1_vec),
+        )
+        c5 = _nki_add_u32(_nki_mul_u32(a2, b3_vec), _nki_mul_u32(a3, b2_vec))
+        c6 = _nki_mul_u32(a3, b3_vec)
 
         # Byte-wise carry propagation. `acc` stays ≤ 2^18 + 2^10 ≈ 2^18.
-        def step(acc, col):
-            byte = nl.bitwise_and(acc, 0xFF, dtype=nl.uint32)
-            carry = nl.right_shift(acc, 8, dtype=nl.uint32)
-            return byte, add2(carry, col)
-
-        byte0, acc = step(c0, c1)
-        byte1, acc = step(acc, c2)
-        byte2, acc = step(acc, c3)
-        byte3, acc = step(acc, c4)
-        byte4, acc = step(acc, c5)
-        byte5, acc = step(acc, c6)
+        byte0, acc = _nki_carry_step(c0, c1)
+        byte1, acc = _nki_carry_step(acc, c2)
+        byte2, acc = _nki_carry_step(acc, c3)
+        byte3, acc = _nki_carry_step(acc, c4)
+        byte4, acc = _nki_carry_step(acc, c5)
+        byte5, acc = _nki_carry_step(acc, c6)
         byte6 = nl.bitwise_and(acc, 0xFF, dtype=nl.uint32)
         byte7 = nl.bitwise_and(nl.right_shift(acc, 8, dtype=nl.uint32), 0xFF, dtype=nl.uint32)
 
-        def pack(b0, b1, b2, b3):
-            return nl.bitwise_or(
-                nl.bitwise_or(b0, nl.left_shift(b1, 8, dtype=nl.uint32)),
-                nl.bitwise_or(
-                    nl.left_shift(b2, 16, dtype=nl.uint32),
-                    nl.left_shift(b3, 24, dtype=nl.uint32),
-                ),
-            )
-
-        lo32_u = pack(byte0, byte1, byte2, byte3)
-        hi32_u = pack(byte4, byte5, byte6, byte7)
+        lo32_u = _nki_pack4_u32(byte0, byte1, byte2, byte3)
+        hi32_u = _nki_pack4_u32(byte4, byte5, byte6, byte7)
 
         # Return int32 for downstream XOR — same bit pattern.
         return nl.copy(hi32_u, dtype=nl.int32), nl.copy(lo32_u, dtype=nl.int32)
@@ -800,7 +812,12 @@ if HAS_NKI:
 
     def _xor32_b(a_b, b_b):
         """Byte-by-byte XOR. Result bytes in [0, 255]."""
-        return [nl.bitwise_xor(a_b[i], b_b[i], dtype=nl.uint32) for i in range(4)]
+        return [
+            nl.bitwise_xor(a_b[0], b_b[0], dtype=nl.uint32),
+            nl.bitwise_xor(a_b[1], b_b[1], dtype=nl.uint32),
+            nl.bitwise_xor(a_b[2], b_b[2], dtype=nl.uint32),
+            nl.bitwise_xor(a_b[3], b_b[3], dtype=nl.uint32),
+        ]
 
     def _rotl32_b(x_b, q, r):
         """Rotate-left by (q bytes + r bits) in byte-tile representation.
@@ -809,23 +826,88 @@ if HAS_NKI:
         r = rotation % 8   (sub-byte bit shift)
 
         For r == 0: pure byte rotation, result bytes ∈ [0, 255].
-        For r > 0:  hi = byte << r (≤ 32640 < 2^15), lo = byte >> (8-r) (≤ 127),
-                    combined = hi | lo — but since we mask to 8 bits:
-                    out_byte = bitwise_and(left_shift(src_hi, r) | right_shift(src_lo, 8-r), 0xFF)
+        For r > 0:  out_byte = ((h << r) | (l >> (8-r))) & 0xFF
+                    where h = x_b[(i-q)%4], l = x_b[(i-q-1)%4].
                     All intermediates < 2^15, exact in float32.
+
+        Fully unrolled (no list comprehensions, no append loops) —
+        NKI hardware compiler rejects both constructs inside jit-traced
+        functions (list comprehensions raise "unsupported expression";
+        inner defs raise their own error).
         """
         if r == 0:
-            # Pure byte-level rotation.
-            return [x_b[(i - q) % 4] for i in range(4)]
+            # Pure byte-level rotation — select source bytes by position.
+            # output byte i = input byte (i - q) % 4.
+            if q == 0:
+                return [x_b[0], x_b[1], x_b[2], x_b[3]]
+            elif q == 1:
+                return [x_b[3], x_b[0], x_b[1], x_b[2]]
+            elif q == 2:
+                return [x_b[2], x_b[3], x_b[0], x_b[1]]
+            else:  # q == 3
+                return [x_b[1], x_b[2], x_b[3], x_b[0]]
 
-        out = []
-        for i in range(4):
-            hi = nl.left_shift(x_b[(i - q) % 4], r, dtype=nl.uint32)  # ≤ 32640
-            lo = nl.right_shift(x_b[(i - q - 1) % 4], 8 - r, dtype=nl.uint32)  # ≤ 127
-            out.append(
-                nl.bitwise_and(nl.bitwise_or(hi, lo, dtype=nl.uint32), 0xFF, dtype=nl.uint32)
-            )
-        return out
+        # Sub-byte rotation: for output byte i,
+        #   hi_src = x_b[(i - q) % 4],  lo_src = x_b[(i - q - 1) % 4]
+        # Select (hi, lo) pairs for output bytes 0..3 per q value.
+        r8 = 8 - r
+        if q == 0:
+            h0, l0 = x_b[0], x_b[3]
+            h1, l1 = x_b[1], x_b[0]
+            h2, l2 = x_b[2], x_b[1]
+            h3, l3 = x_b[3], x_b[2]
+        elif q == 1:
+            h0, l0 = x_b[3], x_b[2]
+            h1, l1 = x_b[0], x_b[3]
+            h2, l2 = x_b[1], x_b[0]
+            h3, l3 = x_b[2], x_b[1]
+        elif q == 2:
+            h0, l0 = x_b[2], x_b[1]
+            h1, l1 = x_b[3], x_b[2]
+            h2, l2 = x_b[0], x_b[3]
+            h3, l3 = x_b[1], x_b[0]
+        else:  # q == 3
+            h0, l0 = x_b[1], x_b[0]
+            h1, l1 = x_b[2], x_b[1]
+            h2, l2 = x_b[3], x_b[2]
+            h3, l3 = x_b[0], x_b[3]
+        out0 = nl.bitwise_and(
+            nl.bitwise_or(
+                nl.left_shift(h0, r, dtype=nl.uint32),
+                nl.right_shift(l0, r8, dtype=nl.uint32),
+                dtype=nl.uint32,
+            ),
+            0xFF,
+            dtype=nl.uint32,
+        )
+        out1 = nl.bitwise_and(
+            nl.bitwise_or(
+                nl.left_shift(h1, r, dtype=nl.uint32),
+                nl.right_shift(l1, r8, dtype=nl.uint32),
+                dtype=nl.uint32,
+            ),
+            0xFF,
+            dtype=nl.uint32,
+        )
+        out2 = nl.bitwise_and(
+            nl.bitwise_or(
+                nl.left_shift(h2, r, dtype=nl.uint32),
+                nl.right_shift(l2, r8, dtype=nl.uint32),
+                dtype=nl.uint32,
+            ),
+            0xFF,
+            dtype=nl.uint32,
+        )
+        out3 = nl.bitwise_and(
+            nl.bitwise_or(
+                nl.left_shift(h3, r, dtype=nl.uint32),
+                nl.right_shift(l3, r8, dtype=nl.uint32),
+                dtype=nl.uint32,
+            ),
+            0xFF,
+            dtype=nl.uint32,
+        )
+        return [out0, out1, out2, out3]
 
     def _mix_b(a_b, b_b, q, r):
         """Threefry MIX operation in byte-tile representation.
@@ -850,16 +932,19 @@ if HAS_NKI:
         `ks_b`:     list of 5 key schedule words, each as [b0,b1,b2,b3].
         `step`:     Python int (0..4), small enough to add directly to b0.
         Returns updated x_b_list (4 words).
+
+        Unrolled explicitly — NKI hardware compiler may reject for-loops
+        with list.append() inside jit-traced call trees.
         """
         P = x_b_list[0][0].shape[0]
-        out = []
-        for i in range(3):
-            out.append(_add32_b(x_b_list[i], ks_b[(step + i) % 5]))
+        out0 = _add32_b(x_b_list[0], ks_b[(step + 0) % 5])
+        out1 = _add32_b(x_b_list[1], ks_b[(step + 1) % 5])
+        out2 = _add32_b(x_b_list[2], ks_b[(step + 2) % 5])
         # x[3] += ks[(step+3) % 5] + step
         step_b = _b_from_scalar(P, step)
         ks_plus_step = _add32_b(ks_b[(step + 3) % 5], step_b)
-        out.append(_add32_b(x_b_list[3], ks_plus_step))
-        return out
+        out3 = _add32_b(x_b_list[3], ks_plus_step)
+        return [out0, out1, out2, out3]
 
     @nki.jit
     def threefry4x32_kernel(c0_ref, c1_ref, c2_ref, c3_ref, k0_ref, k1_ref, k2_ref, k3_ref):
@@ -993,41 +1078,93 @@ if HAS_NKI:
                 x_b_list = _key_inject_b(x_b_list, ks_b, (round_num + 1) // 4)
 
         # Convert to 4 uniform floats (SBUF-resident, no HBM write yet).
+        # Inlined explicitly for all 4 words — NKI hardware compiler rejects
+        # inner function definitions and list.append() loops inside @nki.jit.
         inv24 = nl.full((P, 1), 1.0 / 16777216.0, dtype=nl.float32)
+        scale256 = nl.full((P, 1), 256.0, dtype=nl.float32)
+        scale65536 = nl.full((P, 1), 65536.0, dtype=nl.float32)
         clamp_eps = nl.full((P, 1), 1e-7, dtype=nl.float32)  # avoid log(0)
-        uniforms = []
-        for word_idx in range(4):
-            b = x_b_list[word_idx]
-            b1s = nl.multiply(
-                nl.copy(b[1], dtype=nl.float32),
-                nl.full((P, 1), 256.0, dtype=nl.float32),
+
+        b = x_b_list[0]
+        u0 = nl.maximum(
+            nl.multiply(
+                nl.add(
+                    nl.add(
+                        nl.copy(b[0], dtype=nl.float32),
+                        nl.multiply(nl.copy(b[1], dtype=nl.float32), scale256, dtype=nl.float32),
+                        dtype=nl.float32,
+                    ),
+                    nl.multiply(nl.copy(b[2], dtype=nl.float32), scale65536, dtype=nl.float32),
+                    dtype=nl.float32,
+                ),
+                inv24,
                 dtype=nl.float32,
-            )
-            b2s = nl.multiply(
-                nl.copy(b[2], dtype=nl.float32),
-                nl.full((P, 1), 65536.0, dtype=nl.float32),
+            ),
+            clamp_eps,
+        )
+        b = x_b_list[1]
+        u1 = nl.maximum(
+            nl.multiply(
+                nl.add(
+                    nl.add(
+                        nl.copy(b[0], dtype=nl.float32),
+                        nl.multiply(nl.copy(b[1], dtype=nl.float32), scale256, dtype=nl.float32),
+                        dtype=nl.float32,
+                    ),
+                    nl.multiply(nl.copy(b[2], dtype=nl.float32), scale65536, dtype=nl.float32),
+                    dtype=nl.float32,
+                ),
+                inv24,
                 dtype=nl.float32,
-            )
-            m = nl.add(
-                nl.add(nl.copy(b[0], dtype=nl.float32), b1s, dtype=nl.float32),
-                b2s,
+            ),
+            clamp_eps,
+        )
+        b = x_b_list[2]
+        u2 = nl.maximum(
+            nl.multiply(
+                nl.add(
+                    nl.add(
+                        nl.copy(b[0], dtype=nl.float32),
+                        nl.multiply(nl.copy(b[1], dtype=nl.float32), scale256, dtype=nl.float32),
+                        dtype=nl.float32,
+                    ),
+                    nl.multiply(nl.copy(b[2], dtype=nl.float32), scale65536, dtype=nl.float32),
+                    dtype=nl.float32,
+                ),
+                inv24,
                 dtype=nl.float32,
-            )
-            u = nl.multiply(m, inv24, dtype=nl.float32)
-            u = nl.maximum(u, clamp_eps)  # clamp away from 0 for log safety
-            uniforms.append(u)
+            ),
+            clamp_eps,
+        )
+        b = x_b_list[3]
+        u3 = nl.maximum(
+            nl.multiply(
+                nl.add(
+                    nl.add(
+                        nl.copy(b[0], dtype=nl.float32),
+                        nl.multiply(nl.copy(b[1], dtype=nl.float32), scale256, dtype=nl.float32),
+                        dtype=nl.float32,
+                    ),
+                    nl.multiply(nl.copy(b[2], dtype=nl.float32), scale65536, dtype=nl.float32),
+                    dtype=nl.float32,
+                ),
+                inv24,
+                dtype=nl.float32,
+            ),
+            clamp_eps,
+        )
 
         # ── Stage 2: Box-Muller pairs (u0,u1) → (z0,z1), (u2,u3) → (z2,z3) ──
         neg_two = nl.full((P, 1), -2.0, dtype=nl.float32)
         two_pi = nl.full((P, 1), TWO_PI, dtype=nl.float32)
 
-        r0 = nl.sqrt(nl.multiply(nl.log(uniforms[0]), neg_two))
-        theta0 = nl.multiply(uniforms[1], two_pi)
+        r0 = nl.sqrt(nl.multiply(nl.log(u0), neg_two))
+        theta0 = nl.multiply(u1, two_pi)
         z0 = nl.multiply(r0, nl.cos(theta0))
         z1 = nl.multiply(r0, nl.sin(theta0))
 
-        r1 = nl.sqrt(nl.multiply(nl.log(uniforms[2]), neg_two))
-        theta1 = nl.multiply(uniforms[3], two_pi)
+        r1 = nl.sqrt(nl.multiply(nl.log(u2), neg_two))
+        theta1 = nl.multiply(u3, two_pi)
         z2 = nl.multiply(r1, nl.cos(theta1))
         z3 = nl.multiply(r1, nl.sin(theta1))
 
