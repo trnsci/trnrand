@@ -7,6 +7,27 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- **NKI hardware compiler compatibility** — three categories of Python constructs
+  accepted by the NKI CPU simulator but rejected by the real trn1 compiler have
+  been eliminated from the Threefry and Philox kernels:
+  1. Inner `def` statements inside functions in the `@nki.jit` call tree
+     (`_mul32_hi_lo` inner helpers extracted to module-level `_nki_mul_u32` etc.)
+  2. List comprehensions (`[expr for i in range(n)]` → explicit literals)
+  3. Subscript expressions as LHS assignment targets in tuple unpacking
+     (`x_b_list[0], x_b_list[1] = ...` → named variables `x0_b, x1_b = ...`)
+
+### Hardware validation (trn1, 2026-04-16)
+
+- **Threefry4×32-20 uniform kernel: hardware-validated** — 4 of 5
+  `TestThreefryNKI` tests pass on trn1 (correctness, distribution, seed
+  determinism, seed isolation). Byte-tile arithmetic is confirmed exact.
+- Threefry normal kernel (fused Box-Muller): blocked by NCC_IBIR605
+  (same trn1 compiler restriction as standalone `box_muller_kernel`; tracked
+  in trnrand#2). Marked `xfail` on trn1; does not affect trn2+ or the
+  Threefry algorithm itself.
+
 ## [0.4.0] - 2026-04-16
 
 ### Added
