@@ -414,7 +414,7 @@ def _add32_bytes_numpy(a_u32, b_u32):
     b2 = (b_u32 >> np.uint32(16)) & np.uint32(0xFF)
     b3 = (b_u32 >> np.uint32(24)) & np.uint32(0xFF)
 
-    s0 = a0.astype(np.uint32) + b0.astype(np.uint32)   # ≤ 510
+    s0 = a0.astype(np.uint32) + b0.astype(np.uint32)  # ≤ 510
     c0 = s0 >> np.uint32(8)
     r0 = s0 & np.uint32(0xFF)
     s1 = a1 + b1 + c0
@@ -426,7 +426,9 @@ def _add32_bytes_numpy(a_u32, b_u32):
     s3 = a3 + b3 + c2
     r3 = s3 & np.uint32(0xFF)  # carry out discarded (mod 2^32)
 
-    return (r0 | (r1 << np.uint32(8)) | (r2 << np.uint32(16)) | (r3 << np.uint32(24))).astype(np.uint32)
+    return (r0 | (r1 << np.uint32(8)) | (r2 << np.uint32(16)) | (r3 << np.uint32(24))).astype(
+        np.uint32
+    )
 
 
 def _rotl32_bytes_numpy(a_u32, R: int):
@@ -438,8 +440,8 @@ def _rotl32_bytes_numpy(a_u32, R: int):
     Returns a uint32 numpy array with the same shape as `a_u32`.
     """
     assert 0 < R < 32, "rotation must be in (0, 32)"
-    q = R // 8   # byte-level shift
-    r = R % 8    # sub-byte bit shift
+    q = R // 8  # byte-level shift
+    r = R % 8  # sub-byte bit shift
 
     # Split into 4 bytes (byte 0 = LSB).
     bytes_ = [(a_u32 >> np.uint32(8 * i)) & np.uint32(0xFF) for i in range(4)]
@@ -750,11 +752,7 @@ if HAS_NKI:
     # Precompute (q, r) for each of the 8 rotation constants.
     # THREEFRY_ROTATIONS = [(10,26),(11,21),(13,27),(23,5)]
     # Flattened: [10, 26, 11, 21, 13, 27, 23, 5]
-    _THREEFRY_ROT_QR = tuple(
-        (rot // 8, rot % 8)
-        for pair in THREEFRY_ROTATIONS
-        for rot in pair
-    )
+    _THREEFRY_ROT_QR = tuple((rot // 8, rot % 8) for pair in THREEFRY_ROTATIONS for rot in pair)
     # 128 lanes per tile (Trainium partition-axis limit).
     _THREEFRY_LANES = 128
 
@@ -787,7 +785,7 @@ if HAS_NKI:
         Each byte tile is in [0, 255]; sums ≤ 511 < 2^10 (exact in float32).
         Returns 4 byte tiles representing (a + b) mod 2^32.
         """
-        s0 = nl.add(a_b[0], b_b[0], dtype=nl.uint32)   # ≤ 510
+        s0 = nl.add(a_b[0], b_b[0], dtype=nl.uint32)  # ≤ 510
         c0 = nl.right_shift(s0, 8, dtype=nl.uint32)
         r0 = nl.bitwise_and(s0, 0xFF, dtype=nl.uint32)
         s1 = nl.add(nl.add(a_b[1], b_b[1], dtype=nl.uint32), c0, dtype=nl.uint32)
@@ -802,10 +800,7 @@ if HAS_NKI:
 
     def _xor32_b(a_b, b_b):
         """Byte-by-byte XOR. Result bytes in [0, 255]."""
-        return [
-            nl.bitwise_xor(a_b[i], b_b[i], dtype=nl.uint32)
-            for i in range(4)
-        ]
+        return [nl.bitwise_xor(a_b[i], b_b[i], dtype=nl.uint32) for i in range(4)]
 
     def _rotl32_b(x_b, q, r):
         """Rotate-left by (q bytes + r bits) in byte-tile representation.
@@ -825,9 +820,11 @@ if HAS_NKI:
 
         out = []
         for i in range(4):
-            hi = nl.left_shift(x_b[(i - q) % 4], r, dtype=nl.uint32)      # ≤ 32640
+            hi = nl.left_shift(x_b[(i - q) % 4], r, dtype=nl.uint32)  # ≤ 32640
             lo = nl.right_shift(x_b[(i - q - 1) % 4], 8 - r, dtype=nl.uint32)  # ≤ 127
-            out.append(nl.bitwise_and(nl.bitwise_or(hi, lo, dtype=nl.uint32), 0xFF, dtype=nl.uint32))
+            out.append(
+                nl.bitwise_and(nl.bitwise_or(hi, lo, dtype=nl.uint32), 0xFF, dtype=nl.uint32)
+            )
         return out
 
     def _mix_b(a_b, b_b, q, r):
@@ -865,8 +862,7 @@ if HAS_NKI:
         return out
 
     @nki.jit
-    def threefry4x32_kernel(c0_ref, c1_ref, c2_ref, c3_ref,
-                             k0_ref, k1_ref, k2_ref, k3_ref):
+    def threefry4x32_kernel(c0_ref, c1_ref, c2_ref, c3_ref, k0_ref, k1_ref, k2_ref, k3_ref):
         """Threefry4×32-20 NKI kernel using byte-tile arithmetic.
 
         Every 32-bit word is held as 4 separate (P,1) uint32 tiles with
@@ -952,8 +948,7 @@ if HAS_NKI:
         return out
 
     @nki.jit
-    def threefry_normal_kernel(c0_ref, c1_ref, c2_ref, c3_ref,
-                                k0_ref, k1_ref, k2_ref, k3_ref):
+    def threefry_normal_kernel(c0_ref, c1_ref, c2_ref, c3_ref, k0_ref, k1_ref, k2_ref, k3_ref):
         """Fused Threefry4×32-20 + Box-Muller kernel: counter inputs → N(0,1).
 
         Chains Threefry output directly into Box-Muller on the Vector Engine.
@@ -1003,14 +998,23 @@ if HAS_NKI:
         uniforms = []
         for word_idx in range(4):
             b = x_b_list[word_idx]
-            b1s = nl.multiply(nl.copy(b[1], dtype=nl.float32),
-                              nl.full((P, 1), 256.0, dtype=nl.float32), dtype=nl.float32)
-            b2s = nl.multiply(nl.copy(b[2], dtype=nl.float32),
-                              nl.full((P, 1), 65536.0, dtype=nl.float32), dtype=nl.float32)
-            m = nl.add(nl.add(nl.copy(b[0], dtype=nl.float32), b1s, dtype=nl.float32),
-                       b2s, dtype=nl.float32)
+            b1s = nl.multiply(
+                nl.copy(b[1], dtype=nl.float32),
+                nl.full((P, 1), 256.0, dtype=nl.float32),
+                dtype=nl.float32,
+            )
+            b2s = nl.multiply(
+                nl.copy(b[2], dtype=nl.float32),
+                nl.full((P, 1), 65536.0, dtype=nl.float32),
+                dtype=nl.float32,
+            )
+            m = nl.add(
+                nl.add(nl.copy(b[0], dtype=nl.float32), b1s, dtype=nl.float32),
+                b2s,
+                dtype=nl.float32,
+            )
             u = nl.multiply(m, inv24, dtype=nl.float32)
-            u = nl.maximum(u, clamp_eps)   # clamp away from 0 for log safety
+            u = nl.maximum(u, clamp_eps)  # clamp away from 0 for log safety
             uniforms.append(u)
 
         # ── Stage 2: Box-Muller pairs (u0,u1) → (z0,z1), (u2,u3) → (z2,z3) ──
@@ -1051,7 +1055,7 @@ if HAS_NKI:
         (trimmed to 24 bits to guarantee < 2^24 at tile load time).
         """
         LANES = _THREEFRY_LANES
-        n_words = (n_elements + 3) // 4   # each lane emits 4 words
+        n_words = (n_elements + 3) // 4  # each lane emits 4 words
         n_batches = (n_words + LANES - 1) // LANES
 
         k0_val = seed & 0xFFFFFF
@@ -1071,20 +1075,34 @@ if HAS_NKI:
 
             if _use_simulator():
                 out_np = nki.simulate(threefry4x32_kernel)(
-                    c0_np, c1_np, c2_np, c3_np,
-                    k0_np, k1_np, k2_np, k3_np,
+                    c0_np,
+                    c1_np,
+                    c2_np,
+                    c3_np,
+                    k0_np,
+                    k1_np,
+                    k2_np,
+                    k3_np,
                 )
                 out_tile = torch.from_numpy(np.asarray(out_np).reshape(-1))
             else:
+
                 def _t(arr):
                     return torch.from_numpy(arr)
+
                 (c0t, c1t, c2t, c3t, k0t, k1t, k2t, k3t), orig = _to_xla(
-                    _t(c0_np), _t(c1_np), _t(c2_np), _t(c3_np),
-                    _t(k0_np), _t(k1_np), _t(k2_np), _t(k3_np),
+                    _t(c0_np),
+                    _t(c1_np),
+                    _t(c2_np),
+                    _t(c3_np),
+                    _t(k0_np),
+                    _t(k1_np),
+                    _t(k2_np),
+                    _t(k3_np),
                 )
-                out_tile = threefry4x32_kernel(
-                    c0t, c1t, c2t, c3t, k0t, k1t, k2t, k3t
-                ).reshape(-1).to(orig)
+                out_tile = (
+                    threefry4x32_kernel(c0t, c1t, c2t, c3t, k0t, k1t, k2t, k3t).reshape(-1).to(orig)
+                )
             chunks.append(out_tile)
 
         result = torch.cat(chunks) if len(chunks) > 1 else chunks[0]
@@ -1122,20 +1140,36 @@ if HAS_NKI:
 
             if _use_simulator():
                 out_np = nki.simulate(threefry_normal_kernel)(
-                    c0_np, c1_np, c2_np, c3_np,
-                    k0_np, k1_np, k2_np, k3_np,
+                    c0_np,
+                    c1_np,
+                    c2_np,
+                    c3_np,
+                    k0_np,
+                    k1_np,
+                    k2_np,
+                    k3_np,
                 )
                 out_tile = torch.from_numpy(np.asarray(out_np).reshape(-1))
             else:
+
                 def _t(arr):
                     return torch.from_numpy(arr)
+
                 (c0t, c1t, c2t, c3t, k0t, k1t, k2t, k3t), orig = _to_xla(
-                    _t(c0_np), _t(c1_np), _t(c2_np), _t(c3_np),
-                    _t(k0_np), _t(k1_np), _t(k2_np), _t(k3_np),
+                    _t(c0_np),
+                    _t(c1_np),
+                    _t(c2_np),
+                    _t(c3_np),
+                    _t(k0_np),
+                    _t(k1_np),
+                    _t(k2_np),
+                    _t(k3_np),
                 )
-                out_tile = threefry_normal_kernel(
-                    c0t, c1t, c2t, c3t, k0t, k1t, k2t, k3t
-                ).reshape(-1).to(orig)
+                out_tile = (
+                    threefry_normal_kernel(c0t, c1t, c2t, c3t, k0t, k1t, k2t, k3t)
+                    .reshape(-1)
+                    .to(orig)
+                )
             chunks.append(out_tile)
 
         result = torch.cat(chunks) if len(chunks) > 1 else chunks[0]

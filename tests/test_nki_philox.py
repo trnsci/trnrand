@@ -12,10 +12,9 @@ Hardware only:        pytest tests/test_nki_philox.py -v -m neuron
 
 from __future__ import annotations
 
+import numpy as np
 import pytest
 import torch
-
-import numpy as np
 
 from trnrand.nki import HAS_NKI
 from trnrand.nki.dispatch import (
@@ -321,8 +320,7 @@ class TestThreefryReference:
             b_arr = np.array([b], dtype=np.uint32)
             got = int(_add32_bytes_numpy(a_arr, b_arr)[0])
             assert got == expected, (
-                f"add32_bytes({a:#010x}, {b:#010x}): got {got:#010x}, "
-                f"expected {expected:#010x}"
+                f"add32_bytes({a:#010x}, {b:#010x}): got {got:#010x}, expected {expected:#010x}"
             )
 
     def test_rotl32_bytes_numpy(self):
@@ -336,8 +334,7 @@ class TestThreefryReference:
                 a_arr = np.array([a], dtype=np.uint32)
                 got = int(_rotl32_bytes_numpy(a_arr, R)[0])
                 assert got == expected, (
-                    f"rotl32({a:#010x}, {R}): got {got:#010x}, "
-                    f"expected {expected:#010x}"
+                    f"rotl32({a:#010x}, {R}): got {got:#010x}, expected {expected:#010x}"
                 )
 
 

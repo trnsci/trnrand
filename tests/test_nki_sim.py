@@ -321,7 +321,10 @@ def test_threefry_kernel_matches_reference():
     expected = ((ref_u32 & 0xFFFFFF) / 16777216.0).astype(np.float32)
 
     np.testing.assert_allclose(
-        out_np, expected, rtol=1e-5, atol=1e-5,
+        out_np,
+        expected,
+        rtol=1e-5,
+        atol=1e-5,
         err_msg="Threefry simulator output differs from CPU reference",
     )
 
@@ -340,15 +343,18 @@ def test_threefry_spec_vectors_via_simulator():
     kat_u32 = [0x3425621E, 0x64AF086C, 0x4939F9F4, 0x02F34BF4]
     kat_expected = np.array([(x & 0xFFFFFF) / 16777216.0 for x in kat_u32], dtype=np.float32)
 
-    c0 = np.zeros((lanes, 1), dtype=np.int32)   # lane 0 counter = 0
+    c0 = np.zeros((lanes, 1), dtype=np.int32)  # lane 0 counter = 0
     zeros = np.zeros((lanes, 1), dtype=np.int32)
-    out_np = np.asarray(nki.simulate(threefry4x32_kernel)(
-        c0, zeros, zeros, zeros, zeros, zeros, zeros, zeros
-    ))
+    out_np = np.asarray(
+        nki.simulate(threefry4x32_kernel)(c0, zeros, zeros, zeros, zeros, zeros, zeros, zeros)
+    )
     lane0 = out_np[0]  # shape (4,)
 
     np.testing.assert_allclose(
-        lane0, kat_expected, rtol=1e-5, atol=1e-5,
+        lane0,
+        kat_expected,
+        rtol=1e-5,
+        atol=1e-5,
         err_msg="Threefry simulator lane 0 KAT vector mismatch",
     )
 
