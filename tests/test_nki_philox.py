@@ -442,3 +442,96 @@ class TestPhiloxNKI:
         u = (out.to(torch.int64) & UINT32_MASK).to(torch.float64) / 2**32
         assert abs(u.mean().item() - 0.5) < 0.005
         assert abs(u.var().item() - 1 / 12) < 0.002
+
+
+# ── NKI hardware: Threefry kernel matches CPU reference ───────────────────────
+
+
+@pytest.mark.neuron
+@pytest.mark.skipif(not HAS_NKI, reason="requires neuronxcc")
+class TestThreefryNKI:
+    """Validates the Threefry NKI kernels against the CPU reference on trn1/trn2.
+
+    These tests close trnrand#1 for Threefry hardware validation.
+    Threefry uses byte-tile arithmetic (all intermediates ≤ 511 < 2²⁴),
+    so aws-neuron-sdk#1308 does not apply — these tests carry no xfail marks.
+
+    The NKI kernel emits float32 uniforms using 3 low bytes of each output
+    word (mantissa = b0 + b1×256 + b2×65536, divided by 2²⁴). The expected
+    values below use the same formula applied to the CPU reference output.
+    """
+
+    def test_uniform_kernel_matches_cpu_reference(self):
+        """NKI uniform output must match CPU reference (same 3-byte mantissa)."""
+        from trnrand.nki.dispatch import threefry_uniform_nki
+
+        # One full tile: 128 lanes × 4 words = 512 elements, batch 0.
+        # Counter layout: c0=lane (0..127), c1=c2=c3=0.
+        # Key layout: k0=seed&0xFFFFFF, k1=(seed>>24)&0xFFFFFF, k2=k3=0.
+        seed = 0xABCD1234
+        n = 512
+        LANES = 128
+
+        out = threefry_uniform_nki(n, seed=seed).cpu()
+
+        ctr = torch.zeros(LANES, 4, dtype=torch.int64)
+        ctr[:, 0] = torch.arange(LANES, dtype=torch.int64)
+        k0 = seed & 0xFFFFFF
+        k1 = (seed >> 24) & 0xFFFFFF
+        key = torch.tensor([k0, k1, 0, 0], dtype=torch.int64).expand(LANES, 4)
+        ref_u32 = threefry4x32_reference(ctr, key)  # (128, 4) int64
+        expected = ((ref_u32 & 0xFFFFFF) / 16777216.0).to(torch.float32).reshape(-1)
+
+        torch.testing.assert_close(out, expected, rtol=1e-5, atol=1e-5)
+
+    def test_uniform_kernel_distribution(self):
+        """100k Threefry NKI uniforms should be ~U[0, 1)."""
+        from trnrand.nki.dispatch import threefry_uniform_nki
+
+        u = threefry_uniform_nki(100_000, seed=42).cpu().to(torch.float64)
+        assert u.min().item() >= 0.0
+        assert u.max().item() < 1.0
+        assert abs(u.mean().item() - 0.5) < 0.01
+        assert abs(u.var().item() - 1 / 12) < 0.005
+
+    def test_uniform_kernel_seed_deterministic(self):
+        """Same seed must produce identical output across two calls."""
+        from trnrand.nki.dispatch import threefry_uniform_nki
+
+        u1 = threefry_uniform_nki(1024, seed=99).cpu()
+        u2 = threefry_uniform_nki(1024, seed=99).cpu()
+        assert torch.equal(u1, u2)
+
+    def test_uniform_kernel_different_seeds_differ(self):
+        """Different seeds must produce different output."""
+        from trnrand.nki.dispatch import threefry_uniform_nki
+
+        u1 = threefry_uniform_nki(512, seed=1).cpu()
+        u2 = threefry_uniform_nki(512, seed=2).cpu()
+        assert not torch.equal(u1, u2)
+
+    def test_normal_kernel_distribution(self):
+        """100k Threefry+Box-Muller NKI normals should be ~N(0, 1)."""
+        from trnrand.nki.dispatch import threefry_normal_nki
+
+        z = threefry_normal_nki(100_000, seed=7).cpu()
+        assert abs(z.mean().item()) < 0.02
+        assert abs(z.std().item() - 1.0) < 0.02
+
+    def test_normal_kernel_matches_box_muller_cpu(self):
+        """Fused NKI normal output must match CPU Box-Muller applied to same uniforms."""
+        from trnrand.nki.dispatch import threefry_normal_nki, threefry_uniform_nki
+
+        seed = 0x1234ABCD
+        n = 512  # one full tile, pairs for Box-Muller
+
+        # NKI fused path.
+        z_nki = threefry_normal_nki(n, seed=seed).cpu()
+
+        # CPU reference: same Threefry uniforms → same Box-Muller.
+        u_cpu = threefry_uniform_nki(n, seed=seed).cpu()
+        z_cpu = box_muller_cpu(u_cpu)
+
+        # Hardware transcendentals (cos/sin/log/sqrt) may differ slightly
+        # from libm — allow small tolerance.
+        torch.testing.assert_close(z_nki, z_cpu, rtol=1e-3, atol=1e-3)
