@@ -7,6 +7,41 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.4.0] - 2026-04-16
+
+### Added
+
+- **Threefry4×32-20 NKI kernel** — integer-multiply-free PRNG for Trainium,
+  implemented entirely in byte-tile arithmetic. Every tile element stays ≤ 511,
+  well below float32's 2²⁴ exact-integer ceiling, sidestepping
+  [aws-neuron-sdk#1308](https://github.com/aws-neuron/aws-neuron-sdk/issues/1308)
+  at the algorithm level rather than the decomposition level.
+  Uses only 32-bit addition, XOR, and rotation — the operations Threefry was
+  designed for (Salmon et al. SC'11, same paper as Philox).
+- `threefry4x32_reference()` — CPU oracle verified against 3 Random123 KAT vectors.
+- `threefry_uniform_cpu()` — uniform float stream, mirrors `philox_uniform_cpu` API.
+- `threefry4x32_kernel` — NKI kernel: 8×(P,1) counter/key → (P,4) float32 U[0,1).
+  Output built directly from 3 low bytes of each output word (23-bit mantissa),
+  bypassing uint32 tile assembly entirely.
+- `threefry_normal_kernel` — fused Threefry + Box-Muller NKI kernel. GpSimd byte
+  arithmetic feeds directly into Vector Engine transcendentals with tiles remaining
+  SBUF-resident between stages — no HBM round-trip between RNG and transform.
+- `threefry_uniform_nki()`, `threefry_normal_nki()` — host-side wrappers.
+- `_add32_bytes_numpy()`, `_rotl32_bytes_numpy()` — pure-numpy byte-arithmetic
+  references for NKI kernel parity testing.
+- 4 new simulator tests (no `xfail` marks): KAT vector check, 128-lane reference
+  parity, U[0,1) distribution, N(0,1) distribution for the fused kernel.
+- `TestThreefryReference` class: 12 CPU tests including KAT vectors, distributional
+  checks, and byte-helper ground-truth comparisons.
+
+### Architecture note
+
+The four-engine RNG framing is now fully realised for normals: GpSimd handles
+Threefry byte arithmetic; Vector Engine handles Box-Muller transcendentals;
+SBUF holds output between stages. Philox remains as the CPU reference and will
+become the hardware path once AWS ships GpSimd integer multiply
+([aws-neuron-sdk#1308](https://github.com/aws-neuron/aws-neuron-sdk/issues/1308)).
+
 ## [0.3.0] - 2026-04-15
 
 ### Added
