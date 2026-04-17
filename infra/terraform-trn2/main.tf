@@ -28,14 +28,10 @@ variable "instance_tag" {
   default     = "trnrand-ci-trn2"
 }
 
-variable "vpc_id" {
-  description = "VPC to place the instance in (must be in aws_region)"
+variable "az_suffix" {
+  description = "AZ suffix for the subnet (a, b, or c). Change if InsufficientInstanceCapacity."
   type        = string
-}
-
-variable "subnet_id" {
-  description = "Subnet for the instance (public or private with NAT)"
-  type        = string
+  default     = "a"
 }
 
 provider "aws" {
@@ -58,6 +54,45 @@ data "aws_ami" "neuron" {
     name   = "name"
     values = ["Deep Learning AMI Neuron PyTorch 2.*Ubuntu 24.04*"]
   }
+}
+
+# ---------------------------------------------------------------------------
+# VPC + public subnet (sa-east-1 has no pre-existing VPC for this CI account)
+# ---------------------------------------------------------------------------
+
+resource "aws_vpc" "ci" {
+  cidr_block           = "10.0.0.0/16"
+  enable_dns_hostnames = true
+  tags = { Name = "${var.instance_tag}-vpc" }
+}
+
+resource "aws_internet_gateway" "ci" {
+  vpc_id = aws_vpc.ci.id
+  tags   = { Name = "${var.instance_tag}-igw" }
+}
+
+resource "aws_subnet" "ci" {
+  vpc_id                  = aws_vpc.ci.id
+  cidr_block              = "10.0.1.0/24"
+  availability_zone       = "${var.aws_region}${var.az_suffix}"
+  map_public_ip_on_launch = true
+  tags = { Name = "${var.instance_tag}-subnet" }
+}
+
+resource "aws_route_table" "ci" {
+  vpc_id = aws_vpc.ci.id
+
+  route {
+    cidr_block = "0.0.0.0/0"
+    gateway_id = aws_internet_gateway.ci.id
+  }
+
+  tags = { Name = "${var.instance_tag}-rt" }
+}
+
+resource "aws_route_table_association" "ci" {
+  subnet_id      = aws_subnet.ci.id
+  route_table_id = aws_route_table.ci.id
 }
 
 # ---------------------------------------------------------------------------
@@ -93,7 +128,7 @@ resource "aws_iam_instance_profile" "instance" {
 resource "aws_security_group" "instance" {
   name        = "${var.instance_tag}-sg"
   description = "SSM-only access for trnrand CI (trn2)"
-  vpc_id      = var.vpc_id
+  vpc_id      = aws_vpc.ci.id
 
   egress {
     from_port   = 0
@@ -110,7 +145,7 @@ resource "aws_security_group" "instance" {
 resource "aws_instance" "ci" {
   ami                         = data.aws_ami.neuron.id
   instance_type               = var.instance_type
-  subnet_id                   = var.subnet_id
+  subnet_id                   = aws_subnet.ci.id
   iam_instance_profile        = aws_iam_instance_profile.instance.name
   vpc_security_group_ids      = [aws_security_group.instance.id]
   associate_public_ip_address = true # Needed for SSM agent to reach regional endpoint
@@ -157,4 +192,14 @@ output "aws_region" {
 output "ami_id" {
   value       = data.aws_ami.neuron.id
   description = "Neuron Deep Learning AMI resolved at apply time"
+}
+
+output "vpc_id" {
+  value       = aws_vpc.ci.id
+  description = "VPC created for the CI instance"
+}
+
+output "subnet_id" {
+  value       = aws_subnet.ci.id
+  description = "Public subnet created for the CI instance"
 }

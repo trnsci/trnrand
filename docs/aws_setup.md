@@ -40,12 +40,19 @@ AWS_PROFILE=aws terraform apply \
 ```bash
 cd infra/terraform-trn2
 AWS_PROFILE=aws terraform init
-AWS_PROFILE=aws terraform apply \
-  -var="vpc_id=vpc-xxxxxx" \
-  -var="subnet_id=subnet-xxxxxx"
+AWS_PROFILE=aws terraform apply
 ```
 
-You'll need a VPC and subnet in the target region. User-data takes ~5 minutes to install the Neuron SDK and clone trnrand.
+The trn2 root is self-contained — it creates its own VPC, public subnet, internet gateway,
+and route table in sa-east-1. No `vpc_id` or `subnet_id` variables required.
+
+If `apply` fails with `InsufficientInstanceCapacity`, the default AZ is `sa-east-1a`.
+Retry with a different AZ:
+```bash
+AWS_PROFILE=aws terraform apply -var="az_suffix=b"   # or az_suffix=c
+```
+
+User-data takes ~5 minutes to install the Neuron SDK and clone trnrand.
 
 Stop the instance once ready:
 
@@ -58,7 +65,8 @@ AWS_PROFILE=aws aws ec2 stop-instances \
 # trn2
 cd infra/terraform-trn2
 AWS_PROFILE=aws aws ec2 stop-instances \
-  --instance-ids $(AWS_PROFILE=aws terraform output -raw instance_id) --region sa-east-1
+  --instance-ids $(AWS_PROFILE=aws terraform output -raw instance_id) \
+  --region $(AWS_PROFILE=aws terraform output -raw aws_region)
 ```
 
 ## Running neuron tests
