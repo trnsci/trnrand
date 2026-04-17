@@ -18,6 +18,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   3. Subscript expressions as LHS assignment targets in tuple unpacking
      (`x_b_list[0], x_b_list[1] = ...` → named variables `x0_b, x1_b = ...`)
 
+### Hardware validation (trn2, 2026-04-17)
+
+- **Threefry normal kernel: hardware-validated on trn2.3xlarge (sa-east-1)** —
+  `test_normal_kernel_distribution` and `test_normal_kernel_matches_box_muller_cpu`
+  pass on trn2 (XPASS). NCC_IBIR605 confirmed trn1-only; does not affect trn2+.
+  All 5 `TestThreefryNKI` tests now pass on trn2.
+- `xfail` marks removed from both tests; trn1 CI is unaffected (`--philox-only`
+  already deselects them on trn1).
+
 ### Hardware validation (trn1, 2026-04-16)
 
 - **Threefry4×32-20 uniform kernel: hardware-validated** — 4 of 5
@@ -25,8 +34,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   determinism, seed isolation). Byte-tile arithmetic is confirmed exact.
 - Threefry normal kernel (fused Box-Muller): blocked by NCC_IBIR605
   (same trn1 compiler restriction as standalone `box_muller_kernel`; tracked
-  in trnrand#2). Marked `xfail` on trn1; does not affect trn2+ or the
-  Threefry algorithm itself.
+  in trnrand#2). Confirmed trn1-only; passes on trn2.3xlarge.
 
 ## [0.4.0] - 2026-04-16
 

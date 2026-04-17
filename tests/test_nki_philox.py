@@ -520,14 +520,6 @@ class TestThreefryNKI:
         u2 = threefry_uniform_nki(512, seed=2).cpu()
         assert not torch.equal(u1, u2)
 
-    @pytest.mark.xfail(
-        strict=False,
-        reason=(
-            "NCC_IBIR605: trn1 compiler rejects nl.log activation with non-immediate "
-            "bias parameter. Same restriction that blocks box_muller_kernel on trn1. "
-            "Tracked in trnrand#2. Does not apply to trn2+ architectures."
-        ),
-    )
     def test_normal_kernel_distribution(self):
         """100k Threefry+Box-Muller NKI normals should be ~N(0, 1)."""
         from trnrand.nki.dispatch import threefry_normal_nki
@@ -536,14 +528,6 @@ class TestThreefryNKI:
         assert abs(z.mean().item()) < 0.02
         assert abs(z.std().item() - 1.0) < 0.02
 
-    @pytest.mark.xfail(
-        strict=False,
-        reason=(
-            "NCC_IBIR605: trn1 compiler rejects nl.log activation with non-immediate "
-            "bias parameter. Same restriction that blocks box_muller_kernel on trn1. "
-            "Tracked in trnrand#2. Does not apply to trn2+ architectures."
-        ),
-    )
     def test_normal_kernel_matches_box_muller_cpu(self):
         """Fused NKI normal output must match CPU Box-Muller applied to same uniforms."""
         from trnrand.nki.dispatch import threefry_normal_nki, threefry_uniform_nki
