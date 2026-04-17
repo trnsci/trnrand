@@ -66,7 +66,10 @@ available trn2 instance.
 ```bash
 cd infra/terraform-trn2
 AWS_PROFILE=aws terraform init
-AWS_PROFILE=aws terraform apply -var="vpc_id=vpc-xxxxxx" -var="subnet_id=subnet-xxxxxx"
+AWS_PROFILE=aws terraform apply   # no vpc_id/subnet_id needed — root is self-contained
+
+# If InsufficientInstanceCapacity in sa-east-1a, try another AZ:
+# AWS_PROFILE=aws terraform apply -var="az_suffix=b"
 
 # Run tests (note AWS_REGION override):
 AWS_PROFILE=aws AWS_REGION=sa-east-1 ../../scripts/run_neuron_tests.sh trn2
