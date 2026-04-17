@@ -5,9 +5,13 @@
 # Usage:
 #   AWS_PROFILE=aws ./scripts/run_neuron_tests.sh [instance_type]
 #
+#   For trn2 (sa-east-1, provisioned via infra/terraform-trn2/):
+#   AWS_PROFILE=aws AWS_REGION=sa-east-1 ./scripts/run_neuron_tests.sh trn2
+#
 # Default instance_type is trn1 (looks for Name=trnrand-ci-trn1).
-# Provision the instance with:
-#   cd infra/terraform && terraform apply -var=vpc_id=... -var=subnet_id=...
+# Provision with:
+#   trn1: cd infra/terraform    && terraform apply -var=vpc_id=... -var=subnet_id=...
+#   trn2: cd infra/terraform-trn2 && terraform apply -var=vpc_id=... -var=subnet_id=...
 #
 # This script:
 #   1. Starts the tagged instance (if stopped)

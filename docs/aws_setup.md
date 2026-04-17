@@ -12,32 +12,63 @@ GitHub Actions does **not** touch AWS. All AWS interaction is human-initiated.
 
 ### 1. Provision the CI instance
 
-Pick a VPC + subnet in a region with trn1/trn2/inf2 capacity. `trn1.2xlarge` is cheapest for basic validation.
+Two separate Terraform roots, one per hardware family:
 
+| Hardware | Terraform root | Default region | Instance |
+|---|---|---|---|
+| Trainium1 | `infra/terraform/` | `us-east-1` | `trn1.2xlarge` |
+| Trainium2 | `infra/terraform-trn2/` | `sa-east-1` | `trn2.3xlarge` |
+
+**trn2 availability (as of 2026-04-16):**
+
+| Instance type | Region | AZs |
+|---|---|---|
+| trn2.xlarge | — | not yet offered |
+| trn2.3xlarge | sa-east-1 | a, b, c |
+| trn2.48xlarge | us-east-2 | a, b, c |
+
+**Trainium1 (trn1) — us-east-1:**
 ```bash
 cd infra/terraform
-
 AWS_PROFILE=aws terraform init
 AWS_PROFILE=aws terraform apply \
   -var="vpc_id=vpc-xxxxxx" \
-  -var="subnet_id=subnet-xxxxxx" \
-  -var="instance_type=trn1.2xlarge"
+  -var="subnet_id=subnet-xxxxxx"
 ```
 
-Capture `instance_id` from the outputs. User-data takes ~5 minutes to install the Neuron SDK and clone trnrand.
+**Trainium2 (trn2) — sa-east-1:**
+```bash
+cd infra/terraform-trn2
+AWS_PROFILE=aws terraform init
+AWS_PROFILE=aws terraform apply \
+  -var="vpc_id=vpc-xxxxxx" \
+  -var="subnet_id=subnet-xxxxxx"
+```
+
+You'll need a VPC and subnet in the target region. User-data takes ~5 minutes to install the Neuron SDK and clone trnrand.
 
 Stop the instance once ready:
 
 ```bash
-AWS_PROFILE=aws aws ec2 stop-instances --instance-ids $(terraform output -raw instance_id)
+# trn1
+cd infra/terraform
+AWS_PROFILE=aws aws ec2 stop-instances \
+  --instance-ids $(AWS_PROFILE=aws terraform output -raw instance_id) --region us-east-1
+
+# trn2
+cd infra/terraform-trn2
+AWS_PROFILE=aws aws ec2 stop-instances \
+  --instance-ids $(AWS_PROFILE=aws terraform output -raw instance_id) --region sa-east-1
 ```
 
 ## Running neuron tests
 
 ```bash
+# trn1 (default)
 AWS_PROFILE=aws ./scripts/run_neuron_tests.sh
-# or for trn2 / inf2:
-AWS_PROFILE=aws ./scripts/run_neuron_tests.sh trn2
+
+# trn2 — note AWS_REGION override (instance is in sa-east-1)
+AWS_PROFILE=aws AWS_REGION=sa-east-1 ./scripts/run_neuron_tests.sh trn2
 ```
 
 The script will:
@@ -70,7 +101,7 @@ Stopped = EBS only (~$10/mo for 100 GB gp3). Running:
 | Type | Hourly | Typical run (10 min) |
 |------|-------:|---------------------:|
 | trn1.2xlarge | $1.34 | $0.22 |
-| trn2.8xlarge | $10.00 | $1.67 |
+| trn2.3xlarge | $10.00 | $1.67 |
 | inf2.xlarge | $0.76 | $0.13 |
 
 ## Troubleshooting
