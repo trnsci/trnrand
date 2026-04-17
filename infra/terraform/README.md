@@ -36,8 +36,8 @@ AWS_PROFILE=aws aws ec2 stop-instances \
 
 | Variable | Default | Notes |
 |----------|---------|-------|
-| `aws_region` | `us-east-1` | Trainium: us-east-1, us-west-2, eu-west-1 |
-| `instance_type` | `trn1.2xlarge` | Also: `trn2.8xlarge`, `inf2.xlarge` |
+| `aws_region` | `us-east-1` | trn1: us-east-1, us-west-2, eu-west-1 · trn2.3xlarge: sa-east-1 · trn2.48xlarge: us-east-2 |
+| `instance_type` | `trn1.2xlarge` | Also: `trn2.3xlarge` (sa-east-1), `trn2.48xlarge` (us-east-2), `inf2.xlarge` |
 | `instance_tag` | `trnrand-ci-trn1` | Must match `scripts/run_neuron_tests.sh [type]` arg |
 | `vpc_id` | (required) | |
 | `subnet_id` | (required) | Must be in an AZ with capacity for `instance_type` |
@@ -56,3 +56,18 @@ Trainium capacity is AZ-specific and often exhausted in popular AZs. If
 apply fails with `InsufficientInstanceCapacity`, try a different subnet
 in another AZ in the same region. For us-east-1, `us-east-1f` often has
 capacity when `us-east-1a` does not.
+
+## trn2 (sa-east-1)
+
+Use the separate `infra/terraform-trn2/` root for `trn2.3xlarge` in `sa-east-1`
+(AZs a, b, c). `trn2.xlarge` does not exist; `trn2.3xlarge` is the smallest
+available trn2 instance.
+
+```bash
+cd infra/terraform-trn2
+AWS_PROFILE=aws terraform init
+AWS_PROFILE=aws terraform apply -var="vpc_id=vpc-xxxxxx" -var="subnet_id=subnet-xxxxxx"
+
+# Run tests (note AWS_REGION override):
+AWS_PROFILE=aws AWS_REGION=sa-east-1 ../../scripts/run_neuron_tests.sh trn2
+```

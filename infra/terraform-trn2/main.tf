@@ -8,27 +8,28 @@ terraform {
   }
 }
 
+# trn2.3xlarge is available in sa-east-1 (a, b, c) as of 2026-04-16.
+# trn2.xlarge does not exist; trn2.3xlarge is the smallest trn2 instance.
 variable "aws_region" {
-  description = "AWS region for the CI instance"
+  description = "AWS region for the CI instance (trn2.3xlarge available in sa-east-1)"
   type        = string
-  default     = "us-east-1"
+  default     = "sa-east-1"
 }
 
 variable "instance_type" {
   description = "EC2 instance type"
   type        = string
-  default     = "trn1.2xlarge"
-  # Other options: trn2.3xlarge in sa-east-1 (see infra/terraform-trn2/), inf2.xlarge (~$0.76/hr)
+  default     = "trn2.3xlarge"
 }
 
 variable "instance_tag" {
-  description = "Tag used by neuron.yml workflow to find the instance"
+  description = "Name tag used by run_neuron_tests.sh to find the instance"
   type        = string
-  default     = "trnrand-ci-trn1"
+  default     = "trnrand-ci-trn2"
 }
 
 variable "vpc_id" {
-  description = "VPC to place the instance in"
+  description = "VPC to place the instance in (must be in aws_region)"
   type        = string
 }
 
@@ -50,9 +51,9 @@ data "aws_ami" "neuron" {
   owners      = ["amazon"]
 
   # Any PyTorch-2.x Neuron AMI on Ubuntu 24.04. most_recent=true picks the
-  # newest, which (as of Neuron SDK 2.29, April 2026) will bundle
-  # neuronxcc 2.29 / NKI 0.3.0 once AWS rolls the DLAMI. Widening the
-  # filter rather than pinning 2.9 lets AMI releases land without a TF edit.
+  # newest, which (as of Neuron SDK 2.29, April 2026) bundles
+  # neuronxcc 2.29 / NKI 0.3.0. Widening the filter rather than pinning
+  # a specific PyTorch minor lets AMI releases land without a TF edit.
   filter {
     name   = "name"
     values = ["Deep Learning AMI Neuron PyTorch 2.*Ubuntu 24.04*"]
@@ -91,7 +92,7 @@ resource "aws_iam_instance_profile" "instance" {
 
 resource "aws_security_group" "instance" {
   name        = "${var.instance_tag}-sg"
-  description = "SSM-only access for trnrand CI"
+  description = "SSM-only access for trnrand CI (trn2)"
   vpc_id      = var.vpc_id
 
   egress {
@@ -112,10 +113,10 @@ resource "aws_instance" "ci" {
   subnet_id                   = var.subnet_id
   iam_instance_profile        = aws_iam_instance_profile.instance.name
   vpc_security_group_ids      = [aws_security_group.instance.id]
-  associate_public_ip_address = true  # Needed for SSM agent to reach regional endpoint without VPC endpoints
+  associate_public_ip_address = true # Needed for SSM agent to reach regional endpoint
 
   root_block_device {
-    volume_size = 100
+    volume_size = 200 # trn2 NEFF caches grow larger; extra headroom vs trn1's 100 GB
     volume_type = "gp3"
   }
 
@@ -150,5 +151,10 @@ output "instance_tag" {
 
 output "aws_region" {
   value       = var.aws_region
-  description = "Region to pass to AWS CLI commands"
+  description = "Pass to run script: AWS_REGION=$(terraform output -raw aws_region)"
+}
+
+output "ami_id" {
+  value       = data.aws_ami.neuron.id
+  description = "Neuron Deep Learning AMI resolved at apply time"
 }
