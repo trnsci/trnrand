@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.4.1] - 2026-04-18
+
 ### Fixed
 
 - **NKI hardware compiler compatibility** — three categories of Python constructs
@@ -18,7 +20,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   3. Subscript expressions as LHS assignment targets in tuple unpacking
      (`x_b_list[0], x_b_list[1] = ...` → named variables `x0_b, x1_b = ...`)
 
-### Hardware validation (trn2, 2026-04-17)
+### Hardware validation (trn2, 2026-04-18)
 
 - **Threefry normal kernel: hardware-validated on trn2.3xlarge (sa-east-1)** —
   `test_normal_kernel_distribution` and `test_normal_kernel_matches_box_muller_cpu`
