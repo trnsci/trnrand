@@ -16,6 +16,16 @@ from __future__ import annotations
 
 import torch
 
+from .nki import HAS_NKI, get_backend
+
+
+def _nki_active() -> bool:
+    """True when the NKI path should be used for this call."""
+    backend = get_backend()
+    if backend == "pytorch":
+        return False
+    return HAS_NKI
+
 
 def sobol(
     n_points: int,
@@ -35,6 +45,13 @@ def sobol(
     Returns:
         Tensor of shape (n_points, n_dims) with values in [0, 1)
     """
+    if _nki_active():
+        try:
+            from .nki.dispatch import sobol_nki
+
+            return sobol_nki(n_points, n_dims, seed=seed or 0).to(dtype)
+        except ImportError:
+            pass  # sobol_nki not yet available; fall through to CPU path
     engine = torch.quasirandom.SobolEngine(
         dimension=n_dims,
         scramble=scramble,
@@ -60,6 +77,13 @@ def halton(
     Returns:
         Tensor of shape (n_points, n_dims) with values in (0, 1)
     """
+    if _nki_active():
+        try:
+            from .nki.dispatch import halton_nki
+
+            return halton_nki(n_points, n_dims).to(dtype)
+        except ImportError:
+            pass  # halton_nki not yet available; fall through to CPU path
     primes = _first_n_primes(n_dims)
     result = torch.zeros(n_points, n_dims, dtype=dtype)
     for d in range(n_dims):
