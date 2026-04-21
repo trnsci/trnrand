@@ -1530,3 +1530,193 @@ if HAS_NKI:
             counter_offset=counter_offset,
         )
         return (x / (x + y)).float()
+
+    # ── Sobol quasi-random sequence (GpSimd XOR accumulation) ─────────────────
+    #
+    # Sobol coordinates are computed via Gray-code-indexed XOR accumulation:
+    #   s[p, d] = XOR{ v[d][k]  for k=0..B-1  if bit k of gray(i_p) is set }
+    # where v[d][k] is the Joe-Kuo 2010 direction vector for dimension d,
+    # bit position k, and gray(i) = i XOR (i >> 1) is the Gray code.
+    #
+    # Using 24-bit direction vectors (_SOBOL_BITS = 24) keeps all operands
+    # well inside float32's 2^24 exact-integer envelope.  The XOR loops are
+    # unrolled at @nki.jit trace time via nl.static_range.
+    #
+    # Reference: Joe & Kuo (2010), "Constructing Sobol sequences with better
+    # two-dimensional projections", SIAM J. Sci. Comput. 30(5):2635–2654.
+
+    _SOBOL_BITS = 24         # bits of precision — supports up to 2^24 ≈ 16.7M points
+    _SOBOL_MAX_DIMS = 10     # Joe-Kuo table covers dims 2-10; dim 1 is Van der Corput
+    _SOBOL_SCALE = 1.0 / 16777216.0  # 1 / 2^24 — same constant as Threefry inv24
+
+    def _init_sobol_directions():
+        """Compute 24-bit Joe-Kuo 2010 direction vectors for the first 10 dims.
+
+        Returns a tuple of 10 tuples, each of length _SOBOL_BITS.
+        _SOBOL_DIR_VECS[d][k] is the 24-bit integer for dimension d, bit k.
+        Computed once at module import; embedded as nl.full constants in the kernel.
+        """
+        joe_kuo = [
+            (1, 0, [1]),                    # dim 2
+            (2, 1, [1, 1]),                 # dim 3
+            (3, 1, [1, 1, 1]),              # dim 4
+            (3, 2, [1, 1, 3]),              # dim 5
+            (4, 1, [1, 1, 1, 1]),           # dim 6
+            (4, 4, [1, 3, 5, 13]),          # dim 7
+            (5, 2, [1, 1, 5, 5, 17]),       # dim 8
+            (5, 4, [1, 1, 5, 5, 5]),        # dim 9
+            (5, 7, [1, 1, 7, 11, 19]),      # dim 10
+        ]
+        B = _SOBOL_BITS
+        dirs = []
+        # Dim 0: Van der Corput base-2 (v[k] = 2^(B-1-k))
+        dirs.append(tuple(1 << (B - 1 - k) for k in range(B)))
+        # Dims 1-9: Joe-Kuo recurrence
+        #   v[k] = v[k-s] XOR (v[k-s] >> s)
+        #          XOR c_{s-1}*v[k-1] XOR ... XOR c_0*v[k-s+1]
+        for s, a, m_init in joe_kuo:
+            v = [0] * B
+            for k in range(s):
+                v[k] = m_init[k] << (B - 1 - k)
+            for k in range(s, B):
+                val = v[k - s] ^ (v[k - s] >> s)
+                for j in range(1, s):
+                    if (a >> (s - 1 - j)) & 1:
+                        val ^= v[k - j]
+                v[k] = val
+            dirs.append(tuple(v))
+        return tuple(dirs)
+
+    _SOBOL_DIR_VECS = _init_sobol_directions()
+
+    @nki.jit
+    def sobol_gray_code_kernel(gray_ref):
+        """GpSimd Sobol XOR accumulation: Gray codes → float32 Sobol coordinates.
+
+        For each lane p and dimension d (0.._SOBOL_MAX_DIMS-1):
+            s[p,d] = XOR{ v[d][k]  for k=0.._SOBOL_BITS-1
+                          if bit k of gray_ref[p] is set }
+        Converts s to float via 3-byte reconstruction (same as threefry4x32_kernel):
+            out[p,d] = (b0 + b1*256 + b2*65536) / 2^24  in [0, 1)
+
+        All direction vector constants v[d][k] < 2^24 are float32-exact.
+        bit_k ∈ {0,1}, so multiply(bit_k, v_dk) ≤ v_dk < 2^24 — also exact.
+
+        Args:
+            gray_ref: (P, 1) int32 tile — pre-computed Gray codes.
+
+        Returns:
+            (P, _SOBOL_MAX_DIMS) float32 tile — Sobol coordinates in [0, 1).
+        """
+        P = gray_ref.shape[0]
+        g = nl.load(gray_ref)
+        g = nl.copy(g, dtype=nl.uint32)
+
+        out = nl.ndarray((P, _SOBOL_MAX_DIMS), dtype=nl.float32, buffer=nl.shared_hbm)
+
+        # Shared float constants for byte→float conversion
+        inv24 = nl.full((P, 1), _SOBOL_SCALE, dtype=nl.float32)
+        _s256 = nl.full((P, 1), 256.0, dtype=nl.float32)
+        _s65536 = nl.full((P, 1), 65536.0, dtype=nl.float32)
+
+        for d_idx in nl.static_range(_SOBOL_MAX_DIMS):
+            # Accumulate XOR of direction vectors for set bits of the Gray code
+            s = nl.full((P, 1), 0, dtype=nl.uint32)
+            for k in nl.static_range(_SOBOL_BITS):
+                v_dk = _SOBOL_DIR_VECS[d_idx][k]
+                if v_dk != 0:
+                    # Extract bit k from each lane's Gray code
+                    bit_k = nl.bitwise_and(
+                        nl.right_shift(g, k, dtype=nl.uint32),
+                        1,
+                        dtype=nl.uint32,
+                    )
+                    # XOR direction vector contribution into accumulator.
+                    # bit_k ∈ {0,1} and v_dk < 2^24 → product < 2^24 (float32-exact)
+                    s = nl.bitwise_xor(
+                        s,
+                        nl.multiply(bit_k, nl.full((P, 1), v_dk, dtype=nl.uint32), dtype=nl.uint32),
+                        dtype=nl.uint32,
+                    )
+            # Convert s (uint32 in [0, 2^24)) to float32 in [0, 1) via
+            # the same 3-byte decomposition used in threefry4x32_kernel.
+            b0 = nl.bitwise_and(s, 0xFF, dtype=nl.uint32)
+            b1 = nl.bitwise_and(nl.right_shift(s, 8, dtype=nl.uint32), 0xFF, dtype=nl.uint32)
+            b2 = nl.bitwise_and(nl.right_shift(s, 16, dtype=nl.uint32), 0xFF, dtype=nl.uint32)
+            out[:, d_idx : d_idx + 1] = nl.multiply(
+                nl.add(
+                    nl.add(
+                        nl.copy(b0, dtype=nl.float32),
+                        nl.multiply(nl.copy(b1, dtype=nl.float32), _s256, dtype=nl.float32),
+                        dtype=nl.float32,
+                    ),
+                    nl.multiply(nl.copy(b2, dtype=nl.float32), _s65536, dtype=nl.float32),
+                    dtype=nl.float32,
+                ),
+                inv24,
+                dtype=nl.float32,
+            )
+
+        return out
+
+    def sobol_nki(
+        n_points: int,
+        n_dims: int,
+        seed: int = 0,
+        start_index: int = 0,
+    ) -> torch.Tensor:
+        """Sobol quasi-random sequence via GpSimd Gray-code XOR accumulation.
+
+        Generates an Owen-scrambled (randomly shifted) Sobol sequence.
+        Supports up to _SOBOL_MAX_DIMS=10 dimensions and up to 2^24 ≈ 16.7M points.
+
+        Args:
+            n_points: Number of points to generate.
+            n_dims: Dimensionality (1 ≤ n_dims ≤ _SOBOL_MAX_DIMS).
+            seed: Scrambling seed (0 = no scrambling). Uses additive shift in [0,1).
+            start_index: First index in the Sobol sequence (default 0).
+
+        Returns:
+            Float32 tensor of shape (n_points, n_dims) with values in [0, 1).
+        """
+        assert 1 <= n_dims <= _SOBOL_MAX_DIMS, (
+            f"sobol_nki supports 1 ≤ n_dims ≤ {_SOBOL_MAX_DIMS}, got {n_dims}"
+        )
+        assert n_points > 0
+
+        LANES = _THREEFRY_LANES  # 128 — same tile size as Threefry wrappers
+
+        # Compute Gray codes host-side: g(i) = i XOR (i >> 1)
+        indices = torch.arange(start_index, start_index + n_points, dtype=torch.int32)
+        gray_codes = (indices ^ (indices >> 1)).reshape(-1, 1).contiguous()
+
+        # Pad to multiple of LANES for clean tiling
+        n_padded = ((n_points + LANES - 1) // LANES) * LANES
+        if n_padded > n_points:
+            pad = torch.zeros(n_padded - n_points, 1, dtype=torch.int32)
+            gray_codes = torch.cat([gray_codes, pad], dim=0)
+
+        chunks = []
+        for tile_start in range(0, n_padded, LANES):
+            gray_tile = gray_codes[tile_start : tile_start + LANES].contiguous()
+
+            if _use_simulator():
+                out_np = nki.simulate(sobol_gray_code_kernel)(gray_tile.numpy())
+                chunks.append(torch.from_numpy(np.asarray(out_np)))
+            else:
+                (gray_xla,), orig = _to_xla(gray_tile)
+                out_tile = sobol_gray_code_kernel(gray_xla).to(orig)
+                chunks.append(out_tile)
+
+        # (n_padded, _SOBOL_MAX_DIMS) → (n_points, n_dims) float32
+        result = torch.cat(chunks, dim=0)[:n_points, :n_dims]
+
+        # Randomly shifted Sobol: add a per-dimension uniform offset and wrap.
+        # This breaks the regular structure while preserving low discrepancy.
+        if seed != 0:
+            rng = torch.Generator()
+            rng.manual_seed(seed)
+            shifts = torch.rand(n_dims, generator=rng, dtype=torch.float32)
+            result = torch.fmod(result + shifts.unsqueeze(0), 1.0)
+
+        return result.float()
