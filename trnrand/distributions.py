@@ -24,6 +24,27 @@ import math
 import torch
 
 from .generator import Generator, get_default_generator
+from .nki import HAS_NKI, get_backend
+
+
+def _nki_active() -> bool:
+    """True when the NKI path should be used for this call."""
+    backend = get_backend()
+    if backend == "pytorch":
+        return False
+    return HAS_NKI
+
+
+def _nki_seed(gen_obj: Generator) -> int:
+    """Advance generator state and return a 24-bit seed for NKI dispatch.
+
+    Drawing one random int from the torch generator advances its internal
+    state so successive NKI calls with the same generator produce independent
+    streams — the same guarantee the PyTorch path provides.
+    """
+    return int(
+        torch.randint(0, 2**24, (1,), generator=gen_obj.torch_generator).item()
+    )
 
 
 def uniform(
@@ -34,6 +55,14 @@ def uniform(
     generator: Generator | None = None,
 ) -> torch.Tensor:
     """Uniform distribution on [low, high)."""
+    if _nki_active():
+        from .nki.dispatch import threefry_uniform_nki
+
+        gen = generator or get_default_generator()
+        seed = _nki_seed(gen)
+        n = math.prod(size)
+        out = threefry_uniform_nki(n, seed=seed)
+        return (out * (high - low) + low).to(dtype).reshape(size)
     gen = (generator or get_default_generator()).torch_generator
     return torch.empty(*size, dtype=dtype).uniform_(low, high, generator=gen)
 
@@ -46,6 +75,14 @@ def normal(
     generator: Generator | None = None,
 ) -> torch.Tensor:
     """Normal (Gaussian) distribution."""
+    if _nki_active():
+        from .nki.dispatch import threefry_normal_nki
+
+        gen = generator or get_default_generator()
+        seed = _nki_seed(gen)
+        n = math.prod(size)
+        out = threefry_normal_nki(n, seed=seed)
+        return (out * std + mean).to(dtype).reshape(size)
     gen = (generator or get_default_generator()).torch_generator
     return torch.empty(*size, dtype=dtype).normal_(mean, std, generator=gen)
 
@@ -70,6 +107,15 @@ def exponential(
     PDF: f(x) = λ exp(-λx)
     Mean: 1/λ
     """
+    if _nki_active():
+        from .nki.dispatch import threefry_uniform_nki
+
+        gen = generator or get_default_generator()
+        seed = _nki_seed(gen)
+        n = math.prod(size)
+        u = threefry_uniform_nki(n, seed=seed)
+        u = torch.clamp(u, min=1e-10)
+        return (-torch.log(u) / rate).to(dtype).reshape(size)
     gen = (generator or get_default_generator()).torch_generator
     u = torch.empty(*size, dtype=dtype).uniform_(0, 1, generator=gen)
     # Clamp to avoid log(0)
