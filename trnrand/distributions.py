@@ -42,9 +42,7 @@ def _nki_seed(gen_obj: Generator) -> int:
     state so successive NKI calls with the same generator produce independent
     streams — the same guarantee the PyTorch path provides.
     """
-    return int(
-        torch.randint(0, 2**24, (1,), generator=gen_obj.torch_generator).item()
-    )
+    return int(torch.randint(0, 2**24, (1,), generator=gen_obj.torch_generator).item())
 
 
 def uniform(

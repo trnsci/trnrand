@@ -1519,9 +1519,7 @@ if HAS_NKI:
             Float32 tensor of shape (n_elements,) with values in (0, 1).
         """
         assert alpha > 0 and beta_param > 0
-        x = gamma_nki(
-            n_elements, shape=alpha, scale=1.0, seed=seed, counter_offset=counter_offset
-        )
+        x = gamma_nki(n_elements, shape=alpha, scale=1.0, seed=seed, counter_offset=counter_offset)
         y = gamma_nki(
             n_elements,
             shape=beta_param,
@@ -1545,8 +1543,8 @@ if HAS_NKI:
     # Reference: Joe & Kuo (2010), "Constructing Sobol sequences with better
     # two-dimensional projections", SIAM J. Sci. Comput. 30(5):2635–2654.
 
-    _SOBOL_BITS = 24         # bits of precision — supports up to 2^24 ≈ 16.7M points
-    _SOBOL_MAX_DIMS = 10     # Joe-Kuo table covers dims 2-10; dim 1 is Van der Corput
+    _SOBOL_BITS = 24  # bits of precision — supports up to 2^24 ≈ 16.7M points
+    _SOBOL_MAX_DIMS = 10  # Joe-Kuo table covers dims 2-10; dim 1 is Van der Corput
     _SOBOL_SCALE = 1.0 / 16777216.0  # 1 / 2^24 — same constant as Threefry inv24
 
     def _init_sobol_directions():
@@ -1557,15 +1555,15 @@ if HAS_NKI:
         Computed once at module import; embedded as nl.full constants in the kernel.
         """
         joe_kuo = [
-            (1, 0, [1]),                    # dim 2
-            (2, 1, [1, 1]),                 # dim 3
-            (3, 1, [1, 1, 1]),              # dim 4
-            (3, 2, [1, 1, 3]),              # dim 5
-            (4, 1, [1, 1, 1, 1]),           # dim 6
-            (4, 4, [1, 3, 5, 13]),          # dim 7
-            (5, 2, [1, 1, 5, 5, 17]),       # dim 8
-            (5, 4, [1, 1, 5, 5, 5]),        # dim 9
-            (5, 7, [1, 1, 7, 11, 19]),      # dim 10
+            (1, 0, [1]),  # dim 2
+            (2, 1, [1, 1]),  # dim 3
+            (3, 1, [1, 1, 1]),  # dim 4
+            (3, 2, [1, 1, 3]),  # dim 5
+            (4, 1, [1, 1, 1, 1]),  # dim 6
+            (4, 4, [1, 3, 5, 13]),  # dim 7
+            (5, 2, [1, 1, 5, 5, 17]),  # dim 8
+            (5, 4, [1, 1, 5, 5, 5]),  # dim 9
+            (5, 7, [1, 1, 7, 11, 19]),  # dim 10
         ]
         B = _SOBOL_BITS
         dirs = []
@@ -1778,7 +1776,7 @@ if HAS_NKI:
         out = nl.ndarray((P, _HALTON_MAX_DIMS), dtype=nl.float32, buffer=nl.shared_hbm)
 
         for d_idx in nl.static_range(_HALTON_MAX_DIMS):
-            p = _HALTON_PRIMES[d_idx]      # Python int — compile-time constant
+            p = _HALTON_PRIMES[d_idx]  # Python int — compile-time constant
             depth = _HALTON_DEPTHS[d_idx]  # Python int — compile-time constant
             inv_p = nl.full((P, 1), 1.0 / p, dtype=nl.float32)
             p_float = nl.full((P, 1), float(p), dtype=nl.float32)
@@ -1805,7 +1803,7 @@ if HAS_NKI:
                     dtype=nl.float32,
                 )
                 i_float = q  # advance: quotient becomes index for next digit
-                f /= p       # Python-level update — compile-time constant next iter
+                f /= p  # Python-level update — compile-time constant next iter
 
             out[:, d_idx : d_idx + 1] = result
 
