@@ -172,6 +172,14 @@ def gamma(
     Gamma(shape+1) and multiplies by U^(1/shape) (the "boost" identity).
     """
     assert shape > 0 and scale > 0, "gamma requires shape > 0 and scale > 0"
+    if _nki_active():
+        from .nki.dispatch import gamma_nki
+
+        gen = generator or get_default_generator()
+        seed = _nki_seed(gen)
+        n = math.prod(size)
+        out = gamma_nki(n, shape=shape, scale=scale, seed=seed)
+        return out.to(dtype).reshape(size)
     gen = (generator or get_default_generator()).torch_generator
 
     if len(size) == 1 and isinstance(size[0], (tuple, list)):
@@ -225,6 +233,14 @@ def chi_squared(
     Equivalent to Gamma(df/2, scale=2). Mean: df; Variance: 2·df.
     """
     assert df > 0, "chi_squared requires df > 0"
+    if _nki_active():
+        from .nki.dispatch import chi_squared_nki
+
+        gen = generator or get_default_generator()
+        seed = _nki_seed(gen)
+        n = math.prod(size)
+        out = chi_squared_nki(n, df=df, seed=seed)
+        return out.to(dtype).reshape(size)
     return gamma(*size, shape=df / 2.0, scale=2.0, dtype=dtype, generator=generator)
 
 
@@ -243,6 +259,14 @@ def beta(
     Mean: α/(α+β); Variance: αβ/((α+β)²(α+β+1)).
     """
     assert alpha > 0 and beta > 0, "beta requires alpha > 0 and beta > 0"
+    if _nki_active():
+        from .nki.dispatch import beta_nki
+
+        gen = generator or get_default_generator()
+        seed = _nki_seed(gen)
+        n = math.prod(size)
+        out = beta_nki(n, alpha=alpha, beta_param=beta, seed=seed)
+        return out.to(dtype).reshape(size)
     x = gamma(*size, shape=alpha, scale=1.0, dtype=torch.float64, generator=generator)
     y = gamma(*size, shape=beta, scale=1.0, dtype=torch.float64, generator=generator)
     # Both x, y > 0 with probability 1; the sum never underflows for reasonable shapes.
@@ -279,6 +303,14 @@ def truncated_normal(
 
     Uses rejection sampling. Useful for bounded weight initialization.
     """
+    if _nki_active():
+        from .nki.dispatch import truncated_normal_nki
+
+        gen = generator or get_default_generator()
+        seed = _nki_seed(gen)
+        n = math.prod(size)
+        out = truncated_normal_nki(n, low=low, high=high, mean=mean, std=std, seed=seed)
+        return out.to(dtype).reshape(size)
     result = torch.empty(*size, dtype=dtype)
     gen = (generator or get_default_generator()).torch_generator
 
