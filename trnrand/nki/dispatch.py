@@ -1720,3 +1720,158 @@ if HAS_NKI:
             result = torch.fmod(result + shifts.unsqueeze(0), 1.0)
 
         return result.float()
+
+    # ── Halton quasi-random sequence (GpSimd + Vector Engine) ─────────────────
+    #
+    # The Halton radical inverse in prime base p for index i is:
+    #   H(i, p) = sum_k d_k * p^(-k-1)
+    # where d_k = floor(i / p^k) % p is the k-th digit of i in base p.
+    #
+    # Iterative digit extraction in float32:
+    #   q = floor(i_float / p)   [exact for i < 2^22 — see proof below]
+    #   digit = i_float - p * q  [exact since digit is integer ≤ p-1 ≤ 28]
+    #   result += digit / p^(k+1)
+    #   i_float = q
+    #
+    # Exactness proof (i < 2^22, p ≤ 29):
+    #   ULP(i/p) ≤ ULP(2^22/2) = ULP(2^21) = 2^(21-23) = 2^-2 = 0.25.
+    #   Minimum non-zero fractional part of i/p = 1/p ≥ 1/29 ≈ 0.034.
+    #   Since 0.5*ULP ≤ 0.125 < 1/29: floor(float32(i/p)) = floor(i/p) exactly.
+    #   After floor: b * floor(i/p) is an integer ≤ i < 2^22 < 2^24 (float32-exact).
+    #   digit = i - b*floor(i/p) = i%p — an integer in [0, p-1]. ✓
+    #
+    # All operations route through the Vector Engine (nl.floor) or activation
+    # engine (nl.multiply, nl.add). nl.static_range unrolls both loops at
+    # @nki.jit trace time.
+    #
+    # Maximum supported: _HALTON_MAX_DIMS=10 dimensions, _HALTON_MAX_POINTS=2^22 points.
+
+    _HALTON_PRIMES = (2, 3, 5, 7, 11, 13, 17, 19, 23, 29)
+    _HALTON_DEPTHS = (22, 14, 10, 8, 7, 6, 6, 6, 5, 5)  # digits to cover i < 2^22
+    _HALTON_MAX_DIMS = 10
+    _HALTON_MAX_POINTS = 1 << 22  # 4,194,304 — float32 digit extraction exact below this
+
+    @nki.jit
+    def halton_kernel(indices_ref):
+        """GpSimd/VE Halton radical inverse: indices → float32 Halton coordinates.
+
+        For each lane p and dimension d (0.._HALTON_MAX_DIMS-1), computes the
+        Van der Corput / Halton radical inverse of the integer index in the
+        prime base _HALTON_PRIMES[d] using iterative digit extraction.
+
+        Digit extraction loop per dimension:
+            q = nl.floor(i / p)   — Vector Engine floor (exact for i < 2^22)
+            digit = i - p * q     — remainder digit in [0, p-1]
+            result += digit / p^(k+1)  — accumulate contribution
+            i = q                 — advance to next digit position
+
+        Args:
+            indices_ref: (P, 1) int32 tile — point indices (must be ≥ 1).
+
+        Returns:
+            (P, _HALTON_MAX_DIMS) float32 tile — Halton coordinates in (0, 1).
+        """
+        P = indices_ref.shape[0]
+        i_load = nl.load(indices_ref)
+        i_base = nl.copy(i_load, dtype=nl.float32)  # starting index as float32
+
+        out = nl.ndarray((P, _HALTON_MAX_DIMS), dtype=nl.float32, buffer=nl.shared_hbm)
+
+        for d_idx in nl.static_range(_HALTON_MAX_DIMS):
+            p = _HALTON_PRIMES[d_idx]      # Python int — compile-time constant
+            depth = _HALTON_DEPTHS[d_idx]  # Python int — compile-time constant
+            inv_p = nl.full((P, 1), 1.0 / p, dtype=nl.float32)
+            p_float = nl.full((P, 1), float(p), dtype=nl.float32)
+
+            # Accumulate radical inverse in float32.
+            result = nl.full((P, 1), 0.0, dtype=nl.float32)
+            i_float = i_base  # reset to original index for this dimension
+
+            f = 1.0 / p  # Python-level contribution factor (decreases by 1/p each step)
+            for k in nl.static_range(depth):
+                f_tile = nl.full((P, 1), f, dtype=nl.float32)
+                # floor(i_float / p) — exact for i_float < 2^22 (see comment above)
+                q = nl.floor(nl.multiply(i_float, inv_p, dtype=nl.float32))
+                # digit = i_float - p * q = i_float % p (integer in [0, p-1])
+                digit = nl.subtract(
+                    i_float,
+                    nl.multiply(q, p_float, dtype=nl.float32),
+                    dtype=nl.float32,
+                )
+                # Accumulate digit contribution: digit / p^(k+1)
+                result = nl.add(
+                    result,
+                    nl.multiply(digit, f_tile, dtype=nl.float32),
+                    dtype=nl.float32,
+                )
+                i_float = q  # advance: quotient becomes index for next digit
+                f /= p       # Python-level update — compile-time constant next iter
+
+            out[:, d_idx : d_idx + 1] = result
+
+        return out
+
+    def halton_nki(
+        n_points: int,
+        n_dims: int,
+        start_index: int = 0,
+    ) -> torch.Tensor:
+        """Halton quasi-random sequence via GpSimd/VE radical inverse.
+
+        Generates the Halton sequence for the first _HALTON_MAX_DIMS=10 prime
+        bases (2, 3, 5, 7, 11, 13, 17, 19, 23, 29). The sequence is deterministic
+        (no scrambling — Halton has no seed parameter unlike Sobol).
+
+        Correctness requires all indices < 2^22 = 4,194,304. An assertion is
+        raised if this bound is exceeded.
+
+        Args:
+            n_points: Number of points to generate.
+            n_dims: Dimensionality (1 ≤ n_dims ≤ 10).
+            start_index: First index in the Halton sequence (default 0 → starts at i=1).
+                         Halton(0, b) = 0 for all b, so the sequence conventionally
+                         starts at index 1. If start_index > 0, uses start_index + 1.
+
+        Returns:
+            Float32 tensor of shape (n_points, n_dims) with values in (0, 1).
+        """
+        assert 1 <= n_dims <= _HALTON_MAX_DIMS, (
+            f"halton_nki supports 1 ≤ n_dims ≤ {_HALTON_MAX_DIMS}, got {n_dims}"
+        )
+        assert n_points > 0
+        # All indices must be < 2^22 for exact float32 digit extraction
+        first_idx = max(start_index, 1)  # skip index 0 (all-zero point)
+        last_idx = first_idx + n_points
+        assert last_idx <= _HALTON_MAX_POINTS, (
+            f"halton_nki: index {last_idx} exceeds 2^22 = {_HALTON_MAX_POINTS}. "
+            "Use the CPU path (set_backend('pytorch')) for larger sequences."
+        )
+
+        LANES = _THREEFRY_LANES  # 128
+
+        # Build index tensor starting at first_idx
+        indices = torch.arange(first_idx, first_idx + n_points, dtype=torch.int32)
+
+        # Pad to multiple of LANES
+        n_padded = ((n_points + LANES - 1) // LANES) * LANES
+        idx_col = indices.reshape(-1, 1)
+        if n_padded > n_points:
+            # Pad with harmless indices (reuse last valid index)
+            pad_val = indices[-1].item()
+            pad = torch.full((n_padded - n_points, 1), pad_val, dtype=torch.int32)
+            idx_col = torch.cat([idx_col, pad], dim=0)
+
+        chunks = []
+        for tile_start in range(0, n_padded, LANES):
+            tile = idx_col[tile_start : tile_start + LANES].contiguous()
+
+            if _use_simulator():
+                out_np = nki.simulate(halton_kernel)(tile.numpy())
+                chunks.append(torch.from_numpy(np.asarray(out_np)))
+            else:
+                (tile_xla,), orig = _to_xla(tile)
+                out_tile = halton_kernel(tile_xla).to(orig)
+                chunks.append(out_tile)
+
+        result = torch.cat(chunks, dim=0)[:n_points, :n_dims]
+        return result.float()
