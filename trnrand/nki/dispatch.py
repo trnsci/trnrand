@@ -1370,3 +1370,163 @@ if HAS_NKI:
 
         result = torch.cat(chunks) if len(chunks) > 1 else chunks[0]
         return result.float()[:n_elements]
+
+    def truncated_normal_nki(
+        n_elements,
+        low=-2.0,
+        high=2.0,
+        mean=0.0,
+        std=1.0,
+        seed=0,
+        counter_offset=0,
+    ):
+        """Truncated normal via NKI Box-Muller + host-side rejection.
+
+        Generates standard normal candidates via threefry_normal_nki and
+        accepts those in [low, high] (in standard-normal units). Applies
+        mean/std shift on accepted samples. Retries until n_elements gathered.
+
+        Args:
+            n_elements: Number of samples to return.
+            low: Lower bound in standard-normal units (default -2.0).
+            high: Upper bound in standard-normal units (default +2.0).
+            mean: Output mean (default 0.0).
+            std: Output std (default 1.0).
+            seed: 24-bit Threefry key seed.
+            counter_offset: Starting counter tile offset.
+
+        Returns:
+            Float32 tensor of shape (n_elements,).
+        """
+        LANES = _THREEFRY_LANES
+        result = torch.empty(n_elements, dtype=torch.float32)
+        idx = 0
+        batch_count = counter_offset
+        while idx < n_elements:
+            remaining = n_elements - idx
+            # Oversample by 2.5× — typical acceptance rate for [-2, 2] is ~95%
+            draw = max(LANES, int(remaining * 2.5) + LANES)
+            z = threefry_normal_nki(draw, seed=seed, counter_offset=batch_count)
+            # Advance counter by the number of tiles consumed
+            n_words = (draw + 3) // 4
+            batch_count += (n_words + LANES - 1) // LANES
+            accepted = z[(z >= low) & (z <= high)]
+            take = min(accepted.numel(), remaining)
+            result[idx : idx + take] = accepted[:take]
+            idx += take
+        return (result * std + mean).float()
+
+    def gamma_nki(n_elements, shape, scale=1.0, seed=0, counter_offset=0):
+        """Gamma distribution via Marsaglia-Tsang + NKI Threefry RNG.
+
+        Uses the squeeze-acceptance form:
+            d = shape - 1/3,  c = 1/sqrt(9*d)
+            z ~ N(0,1),  v = (1 + c*z)^3,  u ~ U(0,1)
+            Accept if z > -1/c and log(u) < 0.5*z^2 + d*(1 - v + log(v))
+        For shape < 1 applies the boost identity: multiply by U^(1/shape).
+
+        Args:
+            n_elements: Number of samples to return.
+            shape: Shape parameter k > 0.
+            scale: Scale parameter θ > 0.
+            seed: 24-bit Threefry key seed.
+            counter_offset: Starting counter tile offset.
+
+        Returns:
+            Float32 tensor of shape (n_elements,).
+        """
+        assert shape > 0 and scale > 0
+        LANES = _THREEFRY_LANES
+
+        # Boost identity for shape < 1: sample Gamma(shape+1) then multiply by U^(1/shape)
+        if shape < 1.0:
+            boost_u = threefry_uniform_nki(n_elements, seed=seed, counter_offset=counter_offset)
+            boost = boost_u ** (1.0 / shape)
+            shape_eff = shape + 1.0
+            n_words_boost = (n_elements + 3) // 4
+            counter_offset = counter_offset + (n_words_boost + LANES - 1) // LANES
+            seed_eff = (seed + 1) & 0xFFFFFF
+        else:
+            boost = None
+            shape_eff = shape
+            seed_eff = seed
+
+        d = shape_eff - 1.0 / 3.0
+        c = 1.0 / math.sqrt(9.0 * d)
+        neg_c_inv = -1.0 / c
+
+        result = torch.empty(n_elements, dtype=torch.float32)
+        idx = 0
+        batch_count = counter_offset
+        while idx < n_elements:
+            remaining = n_elements - idx
+            # Oversample by 1.7× — typical acceptance rate ~76% for shape ≥ 1
+            draw = max(LANES, int(remaining * 1.7) + LANES)
+            z = threefry_normal_nki(draw, seed=seed_eff, counter_offset=batch_count)
+            u = threefry_uniform_nki(
+                draw, seed=(seed_eff + 2) & 0xFFFFFF, counter_offset=batch_count
+            )
+            n_words = (draw + 3) // 4
+            batch_count += (n_words + LANES - 1) // LANES
+            v = (1.0 + c * z) ** 3
+            valid = z > neg_c_inv
+            v_safe = torch.where(valid, v, torch.ones_like(v))
+            accept = valid & (u.log() < 0.5 * z * z + d * (1.0 - v + v_safe.log()))
+            draws = (d * v)[accept]
+            take = min(draws.numel(), remaining)
+            result[idx : idx + take] = draws[:take]
+            idx += take
+
+        if boost is not None:
+            result = result * boost
+        return (result * scale).float()
+
+    def chi_squared_nki(n_elements, df, seed=0, counter_offset=0):
+        """Chi-squared distribution: Gamma(df/2, scale=2).
+
+        Args:
+            n_elements: Number of samples.
+            df: Degrees of freedom (> 0).
+            seed: 24-bit Threefry key seed.
+            counter_offset: Starting counter tile offset.
+
+        Returns:
+            Float32 tensor of shape (n_elements,).
+        """
+        assert df > 0
+        return gamma_nki(
+            n_elements,
+            shape=df / 2.0,
+            scale=2.0,
+            seed=seed,
+            counter_offset=counter_offset,
+        )
+
+    def beta_nki(n_elements, alpha, beta_param, seed=0, counter_offset=0):
+        """Beta distribution via gamma-ratio identity.
+
+        X ~ Gamma(alpha), Y ~ Gamma(beta) → X/(X+Y) ~ Beta(alpha, beta).
+        Uses distinct seeds for X and Y streams to ensure independence.
+
+        Args:
+            n_elements: Number of samples.
+            alpha: Shape parameter α > 0.
+            beta_param: Shape parameter β > 0.
+            seed: 24-bit Threefry key seed for the alpha stream.
+            counter_offset: Starting counter tile offset.
+
+        Returns:
+            Float32 tensor of shape (n_elements,) with values in (0, 1).
+        """
+        assert alpha > 0 and beta_param > 0
+        x = gamma_nki(
+            n_elements, shape=alpha, scale=1.0, seed=seed, counter_offset=counter_offset
+        )
+        y = gamma_nki(
+            n_elements,
+            shape=beta_param,
+            scale=1.0,
+            seed=(seed + 4) & 0xFFFFFF,
+            counter_offset=counter_offset,
+        )
+        return (x / (x + y)).float()
