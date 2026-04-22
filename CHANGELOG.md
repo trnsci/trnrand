@@ -7,6 +7,86 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.6.0] - 2026-04-22
+
+### Added
+
+#### Streaming NKI kernels — 32-tile pipeline (#42)
+
+- `threefry_streaming_normal_kernel` / `threefry_streaming_uniform_kernel` —
+  `@nki.jit` kernels using `nl.static_range(_PROGRAM_TILES)` (32 tiles) to
+  pipeline GpSimd Threefry rounds and Vector Engine Box-Muller transcendentals
+  within a single NEFF invocation. This is only possible inside one kernel call;
+  separate XLA graph submissions cannot share SBUF state across the tile loop.
+- `threefry_stream_normal(n, seed, counter_offset)` /
+  `threefry_stream_uniform(n, seed, counter_offset)` — host wrappers.
+  `counter_offset` is passed as a runtime HBM argument so the same NEFF serves
+  every launch; the counter advances `n_launches × _PROGRAM_TILES` per call to
+  guarantee non-overlapping streams.
+- `_PROGRAM_TILES = 32` exported at module level (outside `if HAS_NKI:`) so
+  `program.py` and test files can import it on dev hosts without neuronxcc.
+- `tests/test_nki_streaming.py` — simulator + neuron tests: shape, range,
+  moments, determinism, counter-advance, bit-exactness, hardware throughput.
+
+#### `GeneratorProgram` API (#43)
+
+- `ProgramBuilder` — fluent builder: `.normal(n)`, `.uniform(n)`,
+  `.exponential(n)`, `.build()`. Raises `ValueError` if no steps added.
+- `GeneratorProgram` — pre-compiled streaming NEFF wrapper. `stream_into(buffers)`
+  fills named `torch.Tensor` buffers in-place and advances an internal counter so
+  consecutive calls draw independent, non-overlapping streams.
+  - **NKI path**: calls `threefry_stream_normal` / `threefry_stream_uniform` with
+    `counter_offset=self._counter`; counter masked to 24 bits.
+  - **CPU fallback**: `torch.Generator` seeded with `seed ^ counter`; increments
+    counter by 1 per call. Not bit-exact with the NKI path.
+- `Generator.new_program()` — entry point that creates a `ProgramBuilder` seeded
+  from the generator. Late import keeps `generator.py` free of NKI dependency.
+- `GeneratorProgram` exported from `trnrand.__all__`; `ProgramBuilder` is internal.
+- `__version__` now resolves dynamically via `importlib.metadata` instead of the
+  stale hardcoded `"0.2.0"`.
+- `tests/test_program.py` — 30 CPU tests + 7 `nki_simulator` tests.
+
+#### Zero-allocation in-place variants (#44)
+
+- `normal_into(buf, mean, std, generator)` — fills `buf` in-place with
+  `N(mean, std)` samples. NKI path uses `threefry_stream_normal`; XLA caches the
+  NEFF for same-size buffers automatically — no Python-level cache needed.
+- `uniform_into(buf, low, high, generator)` — fills `buf` with `U(low, high)`.
+- `exponential_into(buf, rate, generator)` — fills `buf` with `Exp(rate)` via
+  inverse-CDF from a uniform stream.
+- All three exported in `trnrand.__all__`; PyTorch fallback calls `buf.normal_()`,
+  `buf.uniform_()`, `buf.exponential_()` directly.
+- 22 new CPU tests added to `tests/test_distributions.py`.
+
+#### Streaming benchmarks (#45)
+
+- `benchmarks/bench_streaming.py` — validates five RFC claims:
+  latency floor (single NKI launch = 16,384 samples), throughput (250-round
+  1M-sample benchmark), NEFF cache-reuse assertion (< 100ms), bit-exactness
+  (program output matches direct kernel dispatch at same seed + counter_offset),
+  engine-overlap timing guard (neuron-only).
+- `scripts/run_benchmarks.sh` updated to include `bench_streaming.py`.
+
+### Architecture notes
+
+**Tensor Engine is intentionally idle** in all RNG kernels. Random number
+generation is not matmul-shaped; Trainium's Tensor Engine is a matrix-multiply
+unit and would add nothing here. GpSimd (Threefry byte arithmetic) + Vector Engine
+(Box-Muller transcendentals) is the correct engine pairing for this workload.
+
+**Stochastic rounding is not used.** SR corrects systematic bias in repeated
+accumulations — the error mode that kills FP32 training. For RNG, the dominant
+error is statistical (1/√N); arithmetic rounding contributes ≪ 1 ULP per sample.
+SR would add hardware cost with no distributional benefit.
+
+### Deferred
+
+- **Poisson NKI kernel** (#15) — Knuth's sequential-product algorithm requires a
+  data-dependent loop termination per sample, which cannot be vectorized across
+  lanes. `torch.poisson` on the host is the only practical path until a
+  Trainium-native rejection sampler becomes feasible. Honest non-fit; not deferred
+  for schedule reasons.
+
 ## [0.5.0] - 2026-04-21
 
 ### Added
