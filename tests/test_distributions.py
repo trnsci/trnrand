@@ -6,6 +6,7 @@ import torch
 
 import trnrand
 from trnrand import Generator
+from trnrand.distributions import exponential_into, normal_into, uniform_into
 
 
 class TestGenerator:
@@ -242,3 +243,138 @@ class TestPoisson:
         a = trnrand.poisson(1000, lam=4.0, generator=g1)
         b = trnrand.poisson(1000, lam=4.0, generator=g2)
         np.testing.assert_allclose(a.numpy(), b.numpy())
+
+
+# ── In-place zero-allocation variants ─────────────────────────────────────────
+
+
+class TestNormalInto:
+    def test_in_place_same_object(self):
+        buf = torch.empty(500)
+        original_data_ptr = buf.data_ptr()
+        normal_into(buf)
+        assert buf.data_ptr() == original_data_ptr, "normal_into should not reallocate"
+
+    def test_shape_preserved(self):
+        buf = torch.empty(3, 4, 5)
+        normal_into(buf)
+        assert buf.shape == (3, 4, 5)
+
+    def test_dtype_float32(self):
+        buf = torch.empty(100)
+        normal_into(buf)
+        assert buf.dtype == torch.float32
+
+    def test_all_finite(self):
+        buf = torch.empty(10_000)
+        normal_into(buf)
+        assert torch.isfinite(buf).all()
+
+    def test_moments(self):
+        buf = torch.empty(200_000)
+        normal_into(buf)
+        assert abs(buf.mean().item()) < 0.01
+        assert abs(buf.std().item() - 1.0) < 0.01
+
+    def test_mean_std_applied(self):
+        buf = torch.empty(100_000)
+        normal_into(buf, mean=5.0, std=2.0)
+        assert abs(buf.mean().item() - 5.0) < 0.05
+        assert abs(buf.std().item() - 2.0) < 0.05
+
+    def test_reproducibility(self):
+        g1 = Generator(seed=42)
+        g2 = Generator(seed=42)
+        b1 = torch.empty(1000)
+        b2 = torch.empty(1000)
+        normal_into(b1, generator=g1)
+        normal_into(b2, generator=g2)
+        assert torch.equal(b1, b2)
+
+    def test_exported_from_trnrand(self):
+        assert hasattr(trnrand, "normal_into")
+        assert trnrand.normal_into is normal_into
+
+
+class TestUniformInto:
+    def test_in_place_same_object(self):
+        buf = torch.empty(500)
+        ptr = buf.data_ptr()
+        uniform_into(buf)
+        assert buf.data_ptr() == ptr
+
+    def test_shape_preserved(self):
+        buf = torch.empty(7, 8)
+        uniform_into(buf)
+        assert buf.shape == (7, 8)
+
+    def test_range_default(self):
+        buf = torch.empty(50_000)
+        uniform_into(buf)
+        assert (buf >= 0.0).all()
+        assert (buf < 1.0).all()
+
+    def test_range_custom(self):
+        buf = torch.empty(50_000)
+        uniform_into(buf, low=2.0, high=5.0)
+        assert (buf >= 2.0).all()
+        assert (buf < 5.0).all()
+
+    def test_reproducibility(self):
+        g1 = Generator(seed=7)
+        g2 = Generator(seed=7)
+        b1 = torch.empty(1000)
+        b2 = torch.empty(1000)
+        uniform_into(b1, generator=g1)
+        uniform_into(b2, generator=g2)
+        assert torch.equal(b1, b2)
+
+    def test_exported_from_trnrand(self):
+        assert hasattr(trnrand, "uniform_into")
+        assert trnrand.uniform_into is uniform_into
+
+
+class TestExponentialInto:
+    def test_in_place_same_object(self):
+        buf = torch.empty(500)
+        ptr = buf.data_ptr()
+        exponential_into(buf)
+        assert buf.data_ptr() == ptr
+
+    def test_shape_preserved(self):
+        buf = torch.empty(5, 10)
+        exponential_into(buf)
+        assert buf.shape == (5, 10)
+
+    def test_all_positive(self):
+        buf = torch.empty(20_000)
+        exponential_into(buf)
+        assert (buf > 0.0).all()
+
+    def test_all_finite(self):
+        buf = torch.empty(20_000)
+        exponential_into(buf)
+        assert torch.isfinite(buf).all()
+
+    def test_mean_rate1(self):
+        buf = torch.empty(200_000)
+        exponential_into(buf, rate=1.0)
+        assert abs(buf.mean().item() - 1.0) < 0.01
+
+    def test_mean_rate2(self):
+        buf = torch.empty(200_000)
+        exponential_into(buf, rate=2.0)
+        assert abs(buf.mean().item() - 0.5) < 0.01
+
+    def test_reproducibility(self):
+        g1 = Generator(seed=3)
+        g2 = Generator(seed=3)
+        b1 = torch.empty(1000)
+        b2 = torch.empty(1000)
+        exponential_into(b1, generator=g1)
+        exponential_into(b2, generator=g2)
+        assert torch.equal(b1, b2)
+
+    def test_exported_from_trnrand(self):
+        assert hasattr(trnrand, "exponential_into")
+        assert trnrand.exponential_into is exponential_into

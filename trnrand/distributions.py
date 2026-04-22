@@ -288,6 +288,101 @@ def poisson(
     return torch.poisson(rates, generator=gen).to(dtype)
 
 
+def normal_into(
+    buf: torch.Tensor,
+    mean: float = 0.0,
+    std: float = 1.0,
+    generator: Generator | None = None,
+) -> None:
+    """Write N(mean, std) samples into pre-allocated buf in-place.
+
+    Zero-allocation variant of `normal`. On the NKI path, uses the streaming
+    Threefry+Box-Muller kernel (16,384 samples per XLA call). The NEFF is
+    cached by the XLA runtime for repeated calls with identical buffer sizes.
+    On PyTorch fallback, calls buf.normal_() directly.
+
+    Args:
+        buf:       Pre-allocated float32 tensor; filled in-place.
+        mean:      Distribution mean (default 0.0).
+        std:       Distribution standard deviation (default 1.0).
+        generator: Optional Generator for reproducible seeding.
+    """
+    if _nki_active():
+        from .nki.dispatch import threefry_stream_normal
+
+        gen = generator or get_default_generator()
+        seed = _nki_seed(gen)
+        raw = threefry_stream_normal(buf.numel(), seed=seed)
+        if mean != 0.0 or std != 1.0:
+            raw = raw * std + mean
+        buf.copy_(raw.reshape(buf.shape))
+        return
+    gen_t = (generator or get_default_generator()).torch_generator
+    buf.normal_(mean, std, generator=gen_t)
+
+
+def uniform_into(
+    buf: torch.Tensor,
+    low: float = 0.0,
+    high: float = 1.0,
+    generator: Generator | None = None,
+) -> None:
+    """Write U(low, high) samples into pre-allocated buf in-place.
+
+    Zero-allocation variant of `uniform`. On the NKI path, uses the streaming
+    Threefry kernel; NEFF is cached by the XLA runtime for same-size buffers.
+    On PyTorch fallback, calls buf.uniform_() directly.
+
+    Args:
+        buf:       Pre-allocated float32 tensor; filled in-place.
+        low:       Lower bound (inclusive, default 0.0).
+        high:      Upper bound (exclusive, default 1.0).
+        generator: Optional Generator for reproducible seeding.
+    """
+    if _nki_active():
+        from .nki.dispatch import threefry_stream_uniform
+
+        gen = generator or get_default_generator()
+        seed = _nki_seed(gen)
+        raw = threefry_stream_uniform(buf.numel(), seed=seed)
+        if low != 0.0 or high != 1.0:
+            raw = raw * (high - low) + low
+        buf.copy_(raw.reshape(buf.shape))
+        return
+    gen_t = (generator or get_default_generator()).torch_generator
+    buf.uniform_(low, high, generator=gen_t)
+
+
+def exponential_into(
+    buf: torch.Tensor,
+    rate: float = 1.0,
+    generator: Generator | None = None,
+) -> None:
+    """Write Exp(rate) samples into pre-allocated buf in-place.
+
+    Zero-allocation variant of `exponential`. On the NKI path, uses the
+    streaming Threefry uniform kernel with inverse-CDF transform; NEFF is
+    cached for same-size buffers. On PyTorch fallback, calls
+    buf.exponential_() directly.
+
+    Args:
+        buf:       Pre-allocated float32 tensor; filled in-place.
+        rate:      Rate parameter λ (default 1.0). Mean = 1/λ.
+        generator: Optional Generator for reproducible seeding.
+    """
+    if _nki_active():
+        from .nki.dispatch import threefry_stream_uniform
+
+        gen = generator or get_default_generator()
+        seed = _nki_seed(gen)
+        u = threefry_stream_uniform(buf.numel(), seed=seed)
+        raw = -torch.log(u) / rate
+        buf.copy_(raw.reshape(buf.shape))
+        return
+    gen_t = (generator or get_default_generator()).torch_generator
+    buf.exponential_(lambd=rate, generator=gen_t)
+
+
 def truncated_normal(
     *size: int,
     mean: float = 0.0,
