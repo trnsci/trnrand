@@ -7,6 +7,109 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.5.0] - 2026-04-21
+
+### Added
+
+#### NKI backend dispatch wiring (#18)
+
+- `set_backend("nki")` now routes `uniform()`, `normal()`, `standard_normal()`,
+  and `exponential()` to the Threefry NKI kernels (`threefry_uniform_nki`,
+  `threefry_normal_nki`) shipped in v0.4.0. Closes
+  [#18](https://github.com/trnsci/trnrand/issues/18).
+- `_nki_active()` helper in both `distributions.py` and `quasi.py`: returns
+  `True` when `get_backend() != "pytorch"` and `HAS_NKI`.
+- `_nki_seed(gen)`: draws one `torch.randint` to advance generator state and
+  produce a 24-bit seed for NKI dispatch — same state-advance guarantee the
+  PyTorch path provides for successive calls.
+- `quasi.py` dispatch stubs for `sobol()` and `halton()`: try-import pattern
+  that falls through to the CPU path when NKI kernels are not yet available.
+- `tests/test_nki_dispatch.py`: CPU-only backend routing tests
+  (`TestBackendRoutingCPU`, 11 tests) and NKI simulator tests
+  (`TestNKIDispatchSimulator`, 9 tests, `@pytest.mark.nki_simulator`).
+
+#### Truncated normal NKI kernel (#17)
+
+- `truncated_normal_nki(n, low, high, mean, std, seed)` — Box-Muller
+  candidates from `threefry_normal_nki` + host-side rejection sampling.
+  2.5× oversample; configurable `[low, high]` bounds (in standard-normal
+  units); `mean`/`std` shift applied to accepted samples. No new NKI code —
+  reuses the Threefry normal kernel established in v0.4.0. Closes
+  [#17](https://github.com/trnsci/trnrand/issues/17).
+- `distributions.truncated_normal()` dispatches to `truncated_normal_nki`
+  when NKI is active.
+
+#### Gamma NKI kernel (#14)
+
+- `gamma_nki(n, shape, scale, seed)` — Marsaglia-Tsang squeeze acceptance
+  in float32. Boost identity (`U^(1/shape)`) for `shape < 1`. 1.7× oversample.
+  All arithmetic in float32 (adequate precision for scientific Monte Carlo).
+  Closes [#14](https://github.com/trnsci/trnrand/issues/14).
+- `distributions.gamma()` dispatches to `gamma_nki` when NKI is active.
+
+#### Chi-squared NKI kernel (#16)
+
+- `chi_squared_nki(n, df, seed)` — thin wrapper: `gamma_nki(shape=df/2, scale=2)`.
+  Closes [#16](https://github.com/trnsci/trnrand/issues/16).
+- `distributions.chi_squared()` dispatches to `chi_squared_nki` when NKI is active.
+
+#### Beta NKI kernel (#13)
+
+- `beta_nki(n, alpha, beta_param, seed)` — gamma-ratio identity
+  `X / (X + Y)` where `X ~ Gamma(alpha)`, `Y ~ Gamma(beta)`. Distinct seeds
+  for the X and Y streams ensure statistical independence. Closes
+  [#13](https://github.com/trnsci/trnrand/issues/13).
+- `distributions.beta()` dispatches to `beta_nki` when NKI is active.
+
+#### Sobol NKI kernel (#11)
+
+- `_init_sobol_directions()` — Joe-Kuo 2010 direction vectors for 10 Sobol
+  dimensions, 24-bit precision. Computed once at module import; embedded as
+  `nl.full` constants at `@nki.jit` trace time. No HBM round-trip for
+  lookup tables.
+- `sobol_gray_code_kernel(@nki.jit)` — GpSimd XOR accumulation over Gray-code
+  bits. For each lane `p` and dimension `d`:
+  `s[p,d] = XOR{ v[d][k]  for k in 0..23  if bit k of gray(i_p) }`.
+  10 dims × 24 bits fully unrolled via `nl.static_range` (~240 ops, all
+  vectorized over 128 lanes). Float conversion via 3-byte decomposition
+  identical to `threefry4x32_kernel`. Output: `(P, 10)` float32 in `[0, 1)`.
+- `sobol_nki(n_points, n_dims, seed, start_index)` — host wrapper. Gray codes
+  computed host-side; 128-lane tiling with padding; additive scrambling
+  (random shift in `[0,1)` per dimension) when `seed != 0`. Closes
+  [#11](https://github.com/trnsci/trnrand/issues/11).
+- `quasi.sobol()` routes to `sobol_nki` when NKI is active.
+
+#### Halton NKI kernel (#12)
+
+- `halton_kernel(@nki.jit)` — iterative float32 radical inverse on the Vector
+  Engine. Per digit: `q = nl.floor(i / p)` (exact for `i < 2²²` — ULP proof
+  in source), `digit = i - p * q`, `result += digit / p^(k+1)`, `i = q`.
+  Outer loop (10 dims) + inner loop (depth) both unrolled via `nl.static_range`.
+  Output: `(P, 10)` float32 in `(0, 1)`.
+- `halton_nki(n_points, n_dims, start_index)` — host wrapper. Skips index 0
+  per Halton convention; 128-lane tiling; asserts index < 2²² = 4,194,304.
+  Primes: (2, 3, 5, 7, 11, 13, 17, 19, 23, 29). Closes
+  [#12](https://github.com/trnsci/trnrand/issues/12).
+- `quasi.halton()` routes to `halton_nki` when NKI is active.
+
+### Architecture notes
+
+All five new distribution/QMC kernels follow the **fixed-batch-with-mask pattern**:
+each kernel generates a fixed tile of candidates; the host wrapper retries until
+enough accepted samples are gathered. This sidesteps NKI's no-dynamic-loop
+constraint without any kernel changes.
+
+The Sobol and Halton kernels demonstrate complementary engine strategies:
+- **Sobol** uses GpSimd exclusively (integer XOR — no multiplies needed)
+- **Halton** uses GpSimd for arithmetic + Vector Engine for `nl.floor` (same
+  engine mix as the Threefry normal kernel)
+
+### Deferred
+
+- **Poisson NKI kernel** (#15) — Knuth's algorithm (sequential product loop)
+  is not vectorizable. Poisson remains CPU-only via `torch.poisson`. Will be
+  revisited if a Trainium-native rejection sampler becomes practical.
+
 ## [0.4.1] - 2026-04-18
 
 ### Fixed
