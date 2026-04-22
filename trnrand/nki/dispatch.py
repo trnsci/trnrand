@@ -309,6 +309,10 @@ THREEFRY_ROUNDS = 20
 # From Table 4, Salmon et al. SC'11 (Skein hash variant used by Random123).
 THREEFRY_ROTATIONS = [(10, 26), (11, 21), (13, 27), (23, 5)]
 
+# Streaming kernel tile count — exported at module level so non-NKI hosts can
+# import it for test parameterisation without requiring neuronxcc.
+_PROGRAM_TILES = 32  # tiles per streaming launch; 32 × 128 × 4 = 16,384 samples/call
+
 
 def threefry4x32_reference(counter: torch.Tensor, key: torch.Tensor) -> torch.Tensor:
     """CPU reference implementation of Threefry4×32-20.
@@ -1873,3 +1877,491 @@ if HAS_NKI:
 
         result = torch.cat(chunks, dim=0)[:n_points, :n_dims]
         return result.float()
+
+    # ── Streaming generator (v0.6.0 Phase 3) ─────────────────────────────────
+    #
+    # NEFF-resident pipeline: GpSimd (Threefry) → Vector (Box-Muller) → Scalar.
+    # All _PROGRAM_TILES tiles execute within ONE kernel invocation, enabling
+    # engine overlap that is impossible across separate XLA graph submissions.
+    #
+    # Steady-state overlap at tile k≥2:
+    #   GpSimd  runs Threefry on tile k
+    #   Vector  runs Box-Muller on tile k-1
+    #   Scalar  handles scale/shift on tile k-2
+    #
+    # 31× reduction in Python→XLA round-trips for 1M samples vs per-tile dispatch:
+    #   v0.5.0: 7813 XLA calls  (1M / (128 × 4) = 1M / 512)
+    #   v0.6.0:  245 XLA calls  (1M / (32 × 128 × 4) = 1M / 16384)
+
+    @nki.jit
+    def threefry_streaming_normal_kernel(c0_ref, start_batch_ref, k0_ref, k1_ref, k2_ref, k3_ref):
+        """Streaming Threefry4×32-20 + Box-Muller: _PROGRAM_TILES tiles in one NEFF.
+
+        Eliminates per-tile XLA dispatch overhead. Each invocation generates
+        _PROGRAM_TILES × _THREEFRY_LANES × 4 = 16,384 standard-normal floats.
+
+        Engine orchestration:
+          GpSimd:  Threefry byte-tile arithmetic (20 rounds per tile)
+          Vector:  Box-Muller log/sqrt/cos/sin transcendentals (per tile, pipelined)
+          Scalar:  scale+shift (identity here — output is N(0,1))
+          Tensor:  intentionally idle — RNG is not matmul-shaped
+
+        Stochastic rounding: NOT used — statistical error 1/√N dominates arithmetic
+          error at all practical Monte Carlo sample counts (Connolly–Higham–Mary,
+          SIAM J. Sci. Comput., 2021). The √n·u improvement over Wilkinson's n·u
+          bound is immeasurable against 1/√N for any n ≥ 1.
+
+        Counter scheme (bit-exact with threefry_normal_nki for same seed/offset):
+          c0 = lane index [0..127]  (static, from c0_ref)
+          c1 = (start_batch + tile_idx) & 0xFFFFFF  (computed per tile)
+          c2 = c3 = 0
+          start_batch = counter_offset + launch × _PROGRAM_TILES
+
+        Inputs:
+          c0_ref:          (P, 1) int32 — lane indices 0..127
+          start_batch_ref: (P, 1) int32 — base batch index for this launch
+          k0_ref..k3_ref:  (P, 1) int32 — Threefry key words
+
+        Output: (P, 4 × _PROGRAM_TILES) = (128, 128) float32 N(0,1) samples.
+        """
+        P = c0_ref.shape[0]
+
+        # Fixed inputs: loaded once, shared across all _PROGRAM_TILES iterations.
+        c0_b = _b_split(c0_ref)
+        k0_b = _b_split(k0_ref)
+        k1_b = _b_split(k1_ref)
+        k2_b = _b_split(k2_ref)
+        k3_b = _b_split(k3_ref)
+        parity_b = _b_from_scalar(P, THREEFRY_SKEIN_KS_PARITY)
+        k4_b = _xor32_b(_xor32_b(_xor32_b(_xor32_b(k0_b, k1_b), k2_b), k3_b), parity_b)
+        ks_b = [k0_b, k1_b, k2_b, k3_b, k4_b]
+
+        # c2=c3=0 (compile-time constants, same for all tiles).
+        c2_b = _b_from_scalar(P, 0)
+        c3_b = _b_from_scalar(P, 0)
+
+        # Runtime start_batch loaded once from HBM; tile_idx offset added per tile.
+        # Passing start_batch as a runtime arg lets the SAME NEFF serve every
+        # stream_into call — the NEFF cache key depends only on shapes/dtypes.
+        start_batch_u = nl.load(start_batch_ref, dtype=nl.uint32)
+
+        # Box-Muller constants — hoisted outside the loop (compile-once into NEFF).
+        inv24 = nl.full((P, 1), 1.0 / 16777216.0, dtype=nl.float32)
+        scale256 = nl.full((P, 1), 256.0, dtype=nl.float32)
+        scale65536 = nl.full((P, 1), 65536.0, dtype=nl.float32)
+        clamp_eps = nl.full((P, 1), 1e-7, dtype=nl.float32)
+        neg_two = nl.full((P, 1), -2.0, dtype=nl.float32)
+        two_pi = nl.full((P, 1), TWO_PI, dtype=nl.float32)
+
+        # Output: wider free dimension avoids large input-tensor slicing.
+        # Shape (P, 4×_PROGRAM_TILES) = (128, 128) fits in a single HBM tile.
+        out = nl.ndarray((P, 4 * _PROGRAM_TILES), dtype=nl.float32, buffer=nl.shared_hbm)
+
+        for tile_idx in nl.static_range(_PROGRAM_TILES):
+            # c1 = (start_batch + tile_idx) & 0xFFFFFF — unique counter per tile.
+            # tile_idx is a compile-time Python int from nl.static_range;
+            # nl.full materializes it as a constant tile for the add.
+            c1_u = nl.bitwise_and(
+                nl.add(
+                    start_batch_u,
+                    nl.full((P, 1), tile_idx, dtype=nl.uint32),
+                    dtype=nl.uint32,
+                ),
+                0xFFFFFF,
+                dtype=nl.uint32,
+            )
+            # Byte-split c1 from an SBUF tile (not a ref — no nl.load).
+            # b3=0 guaranteed: c1_u ≤ 0xFFFFFF (24 bits after masking).
+            c1_b = [
+                nl.bitwise_and(c1_u, 0xFF, dtype=nl.uint32),
+                nl.bitwise_and(nl.right_shift(c1_u, 8, dtype=nl.uint32), 0xFF, dtype=nl.uint32),
+                nl.bitwise_and(nl.right_shift(c1_u, 16, dtype=nl.uint32), 0xFF, dtype=nl.uint32),
+                nl.full((P, 1), 0, dtype=nl.uint32),
+            ]
+
+            # Threefry4×32-20: key injection then 20 rounds.
+            _ki = _key_inject_b([c0_b, c1_b, c2_b, c3_b], ks_b, 0)
+            x0_b = _ki[0]
+            x1_b = _ki[1]
+            x2_b = _ki[2]
+            x3_b = _ki[3]
+
+            for round_num in nl.static_range(THREEFRY_ROUNDS):
+                pair_idx = round_num % 4
+                if round_num % 2 == 0:
+                    q0, r0 = _THREEFRY_ROT_QR[pair_idx * 2 + 0]
+                    q1, r1 = _THREEFRY_ROT_QR[pair_idx * 2 + 1]
+                    x0_b, x1_b = _mix_b(x0_b, x1_b, q0, r0)
+                    x2_b, x3_b = _mix_b(x2_b, x3_b, q1, r1)
+                else:
+                    q0, r0 = _THREEFRY_ROT_QR[pair_idx * 2 + 0]
+                    q1, r1 = _THREEFRY_ROT_QR[pair_idx * 2 + 1]
+                    x0_b, x3_b = _mix_b(x0_b, x3_b, q0, r0)
+                    x2_b, x1_b = _mix_b(x2_b, x1_b, q1, r1)
+                if (round_num + 1) % 4 == 0:
+                    _ki = _key_inject_b([x0_b, x1_b, x2_b, x3_b], ks_b, (round_num + 1) // 4)
+                    x0_b = _ki[0]
+                    x1_b = _ki[1]
+                    x2_b = _ki[2]
+                    x3_b = _ki[3]
+
+            # Convert to 4 uniform floats (SBUF-resident, no HBM write yet).
+            # Inlined x4 words — NKI compiler rejects list comprehensions inside @nki.jit.
+            b = x0_b
+            u0 = nl.maximum(
+                nl.multiply(
+                    nl.add(
+                        nl.add(
+                            nl.copy(b[0], dtype=nl.float32),
+                            nl.multiply(
+                                nl.copy(b[1], dtype=nl.float32), scale256, dtype=nl.float32
+                            ),
+                            dtype=nl.float32,
+                        ),
+                        nl.multiply(nl.copy(b[2], dtype=nl.float32), scale65536, dtype=nl.float32),
+                        dtype=nl.float32,
+                    ),
+                    inv24,
+                    dtype=nl.float32,
+                ),
+                clamp_eps,
+            )
+            b = x1_b
+            u1 = nl.maximum(
+                nl.multiply(
+                    nl.add(
+                        nl.add(
+                            nl.copy(b[0], dtype=nl.float32),
+                            nl.multiply(
+                                nl.copy(b[1], dtype=nl.float32), scale256, dtype=nl.float32
+                            ),
+                            dtype=nl.float32,
+                        ),
+                        nl.multiply(nl.copy(b[2], dtype=nl.float32), scale65536, dtype=nl.float32),
+                        dtype=nl.float32,
+                    ),
+                    inv24,
+                    dtype=nl.float32,
+                ),
+                clamp_eps,
+            )
+            b = x2_b
+            u2 = nl.maximum(
+                nl.multiply(
+                    nl.add(
+                        nl.add(
+                            nl.copy(b[0], dtype=nl.float32),
+                            nl.multiply(
+                                nl.copy(b[1], dtype=nl.float32), scale256, dtype=nl.float32
+                            ),
+                            dtype=nl.float32,
+                        ),
+                        nl.multiply(nl.copy(b[2], dtype=nl.float32), scale65536, dtype=nl.float32),
+                        dtype=nl.float32,
+                    ),
+                    inv24,
+                    dtype=nl.float32,
+                ),
+                clamp_eps,
+            )
+            b = x3_b
+            u3 = nl.maximum(
+                nl.multiply(
+                    nl.add(
+                        nl.add(
+                            nl.copy(b[0], dtype=nl.float32),
+                            nl.multiply(
+                                nl.copy(b[1], dtype=nl.float32), scale256, dtype=nl.float32
+                            ),
+                            dtype=nl.float32,
+                        ),
+                        nl.multiply(nl.copy(b[2], dtype=nl.float32), scale65536, dtype=nl.float32),
+                        dtype=nl.float32,
+                    ),
+                    inv24,
+                    dtype=nl.float32,
+                ),
+                clamp_eps,
+            )
+
+            # Box-Muller pairs: (u0,u1) → (z0,z1), (u2,u3) → (z2,z3).
+            bm_r0 = nl.sqrt(nl.multiply(nl.log(u0), neg_two))
+            bm_theta0 = nl.multiply(u1, two_pi)
+            z0 = nl.multiply(bm_r0, nl.cos(bm_theta0))
+            z1 = nl.multiply(bm_r0, nl.sin(bm_theta0))
+            bm_r1 = nl.sqrt(nl.multiply(nl.log(u2), neg_two))
+            bm_theta1 = nl.multiply(u3, two_pi)
+            z2 = nl.multiply(bm_r1, nl.cos(bm_theta1))
+            z3 = nl.multiply(bm_r1, nl.sin(bm_theta1))
+
+            col = tile_idx * 4
+            out[:, col : col + 1] = z0
+            out[:, col + 1 : col + 2] = z1
+            out[:, col + 2 : col + 3] = z2
+            out[:, col + 3 : col + 4] = z3
+
+        return out
+
+    @nki.jit
+    def threefry_streaming_uniform_kernel(c0_ref, start_batch_ref, k0_ref, k1_ref, k2_ref, k3_ref):
+        """Streaming Threefry4×32-20: _PROGRAM_TILES tiles → float32 uniforms in [0,1).
+
+        Same counter/key scheme and NEFF-caching strategy as
+        threefry_streaming_normal_kernel but emits raw uniform samples instead of
+        applying Box-Muller. Use when downstream needs U(0,1) values (importance-
+        sampling weights, quantile transforms, Bernoulli draws, etc.).
+
+        Engine orchestration:
+          GpSimd:  Threefry byte-tile arithmetic
+          Vector:  uniform float assembly (multiply/add)
+          Tensor:  intentionally idle
+        Stochastic rounding: NOT used (same rationale as streaming normal kernel).
+
+        Output: (P, 4 × _PROGRAM_TILES) = (128, 128) float32 values in [0, 1).
+        """
+        P = c0_ref.shape[0]
+
+        c0_b = _b_split(c0_ref)
+        k0_b = _b_split(k0_ref)
+        k1_b = _b_split(k1_ref)
+        k2_b = _b_split(k2_ref)
+        k3_b = _b_split(k3_ref)
+        parity_b = _b_from_scalar(P, THREEFRY_SKEIN_KS_PARITY)
+        k4_b = _xor32_b(_xor32_b(_xor32_b(_xor32_b(k0_b, k1_b), k2_b), k3_b), parity_b)
+        ks_b = [k0_b, k1_b, k2_b, k3_b, k4_b]
+
+        c2_b = _b_from_scalar(P, 0)
+        c3_b = _b_from_scalar(P, 0)
+
+        start_batch_u = nl.load(start_batch_ref, dtype=nl.uint32)
+
+        inv24 = nl.full((P, 1), 1.0 / 16777216.0, dtype=nl.float32)
+        scale256 = nl.full((P, 1), 256.0, dtype=nl.float32)
+        scale65536 = nl.full((P, 1), 65536.0, dtype=nl.float32)
+
+        out = nl.ndarray((P, 4 * _PROGRAM_TILES), dtype=nl.float32, buffer=nl.shared_hbm)
+
+        for tile_idx in nl.static_range(_PROGRAM_TILES):
+            c1_u = nl.bitwise_and(
+                nl.add(
+                    start_batch_u,
+                    nl.full((P, 1), tile_idx, dtype=nl.uint32),
+                    dtype=nl.uint32,
+                ),
+                0xFFFFFF,
+                dtype=nl.uint32,
+            )
+            c1_b = [
+                nl.bitwise_and(c1_u, 0xFF, dtype=nl.uint32),
+                nl.bitwise_and(nl.right_shift(c1_u, 8, dtype=nl.uint32), 0xFF, dtype=nl.uint32),
+                nl.bitwise_and(nl.right_shift(c1_u, 16, dtype=nl.uint32), 0xFF, dtype=nl.uint32),
+                nl.full((P, 1), 0, dtype=nl.uint32),
+            ]
+
+            _ki = _key_inject_b([c0_b, c1_b, c2_b, c3_b], ks_b, 0)
+            x0_b = _ki[0]
+            x1_b = _ki[1]
+            x2_b = _ki[2]
+            x3_b = _ki[3]
+
+            for round_num in nl.static_range(THREEFRY_ROUNDS):
+                pair_idx = round_num % 4
+                if round_num % 2 == 0:
+                    q0, r0 = _THREEFRY_ROT_QR[pair_idx * 2 + 0]
+                    q1, r1 = _THREEFRY_ROT_QR[pair_idx * 2 + 1]
+                    x0_b, x1_b = _mix_b(x0_b, x1_b, q0, r0)
+                    x2_b, x3_b = _mix_b(x2_b, x3_b, q1, r1)
+                else:
+                    q0, r0 = _THREEFRY_ROT_QR[pair_idx * 2 + 0]
+                    q1, r1 = _THREEFRY_ROT_QR[pair_idx * 2 + 1]
+                    x0_b, x3_b = _mix_b(x0_b, x3_b, q0, r0)
+                    x2_b, x1_b = _mix_b(x2_b, x1_b, q1, r1)
+                if (round_num + 1) % 4 == 0:
+                    _ki = _key_inject_b([x0_b, x1_b, x2_b, x3_b], ks_b, (round_num + 1) // 4)
+                    x0_b = _ki[0]
+                    x1_b = _ki[1]
+                    x2_b = _ki[2]
+                    x3_b = _ki[3]
+
+            # Uniform float assembly — inlined x4 words, direct to output slice.
+            col = tile_idx * 4
+            b = x0_b
+            out[:, col : col + 1] = nl.multiply(
+                nl.add(
+                    nl.add(
+                        nl.copy(b[0], dtype=nl.float32),
+                        nl.multiply(nl.copy(b[1], dtype=nl.float32), scale256, dtype=nl.float32),
+                        dtype=nl.float32,
+                    ),
+                    nl.multiply(nl.copy(b[2], dtype=nl.float32), scale65536, dtype=nl.float32),
+                    dtype=nl.float32,
+                ),
+                inv24,
+                dtype=nl.float32,
+            )
+            b = x1_b
+            out[:, col + 1 : col + 2] = nl.multiply(
+                nl.add(
+                    nl.add(
+                        nl.copy(b[0], dtype=nl.float32),
+                        nl.multiply(nl.copy(b[1], dtype=nl.float32), scale256, dtype=nl.float32),
+                        dtype=nl.float32,
+                    ),
+                    nl.multiply(nl.copy(b[2], dtype=nl.float32), scale65536, dtype=nl.float32),
+                    dtype=nl.float32,
+                ),
+                inv24,
+                dtype=nl.float32,
+            )
+            b = x2_b
+            out[:, col + 2 : col + 3] = nl.multiply(
+                nl.add(
+                    nl.add(
+                        nl.copy(b[0], dtype=nl.float32),
+                        nl.multiply(nl.copy(b[1], dtype=nl.float32), scale256, dtype=nl.float32),
+                        dtype=nl.float32,
+                    ),
+                    nl.multiply(nl.copy(b[2], dtype=nl.float32), scale65536, dtype=nl.float32),
+                    dtype=nl.float32,
+                ),
+                inv24,
+                dtype=nl.float32,
+            )
+            b = x3_b
+            out[:, col + 3 : col + 4] = nl.multiply(
+                nl.add(
+                    nl.add(
+                        nl.copy(b[0], dtype=nl.float32),
+                        nl.multiply(nl.copy(b[1], dtype=nl.float32), scale256, dtype=nl.float32),
+                        dtype=nl.float32,
+                    ),
+                    nl.multiply(nl.copy(b[2], dtype=nl.float32), scale65536, dtype=nl.float32),
+                    dtype=nl.float32,
+                ),
+                inv24,
+                dtype=nl.float32,
+            )
+
+        return out
+
+    def threefry_stream_normal(
+        n_elements: int,
+        seed: int = 0,
+        counter_offset: int = 0,
+    ) -> torch.Tensor:
+        """Host wrapper: streaming Threefry4×32-20 + Box-Muller → N(0,1) floats.
+
+        Each call reuses the fixed-size NEFF compiled for `threefry_streaming_normal_kernel`,
+        running _PROGRAM_TILES Threefry tiles in one XLA invocation — 16,384 samples per
+        XLA call vs 512 per call in threefry_normal_nki. For 1M samples: 245 XLA calls vs
+        7813 in the per-tile wrapper (~31× reduction in launch overhead).
+
+        Counter-offset compatibility: outputs are bit-exact with threefry_normal_nki when
+        both use the same seed and counter_offset. Launch L tile T uses
+        c1 = (counter_offset + L*_PROGRAM_TILES + T) & 0xFFFFFF, matching the per-tile
+        wrapper's c1 = (batch + counter_offset) & 0xFFFFFF at batch = L*_PROGRAM_TILES + T.
+        """
+        LANES = _THREEFRY_LANES
+        NORMALS_PER_LAUNCH = _PROGRAM_TILES * LANES * 4  # 32 × 128 × 4 = 16,384
+
+        n_launches = (n_elements + NORMALS_PER_LAUNCH - 1) // NORMALS_PER_LAUNCH
+
+        k0_val = seed & 0xFFFFFF
+        k1_val = (seed >> 24) & 0xFFFFFF
+
+        c0_np = np.arange(LANES, dtype=np.int32).reshape(-1, 1)
+        k0_np = np.full((LANES, 1), k0_val, dtype=np.int32)
+        k1_np = np.full((LANES, 1), k1_val, dtype=np.int32)
+        k2_np = np.zeros((LANES, 1), dtype=np.int32)
+        k3_np = np.zeros((LANES, 1), dtype=np.int32)
+
+        chunks = []
+        for launch in range(n_launches):
+            start_batch = (counter_offset + launch * _PROGRAM_TILES) & 0xFFFFFF
+            start_batch_np = np.full((LANES, 1), start_batch, dtype=np.int32)
+
+            if _use_simulator():
+                out_np = nki.simulate(threefry_streaming_normal_kernel)(
+                    c0_np, start_batch_np, k0_np, k1_np, k2_np, k3_np
+                )
+                out_tile = torch.from_numpy(np.asarray(out_np).reshape(-1))
+            else:
+
+                def _t(arr):
+                    return torch.from_numpy(arr)
+
+                (c0t, sb_t, k0t, k1t, k2t, k3t), orig = _to_xla(
+                    _t(c0_np),
+                    _t(start_batch_np),
+                    _t(k0_np),
+                    _t(k1_np),
+                    _t(k2_np),
+                    _t(k3_np),
+                )
+                out_tile = (
+                    threefry_streaming_normal_kernel(c0t, sb_t, k0t, k1t, k2t, k3t)
+                    .reshape(-1)
+                    .to(orig)
+                )
+            chunks.append(out_tile)
+
+        result = torch.cat(chunks) if len(chunks) > 1 else chunks[0]
+        return result.float()[:n_elements]
+
+    def threefry_stream_uniform(
+        n_elements: int,
+        seed: int = 0,
+        counter_offset: int = 0,
+    ) -> torch.Tensor:
+        """Host wrapper: streaming Threefry4×32-20 → float32 uniforms in [0, 1).
+
+        Same launch/counter scheme as threefry_stream_normal; 16,384 uniforms per
+        XLA call, ~31× fewer round-trips than the per-tile threefry_uniform_nki
+        for large n.
+        """
+        LANES = _THREEFRY_LANES
+        UNIFORMS_PER_LAUNCH = _PROGRAM_TILES * LANES * 4  # 32 × 128 × 4 = 16,384
+
+        n_launches = (n_elements + UNIFORMS_PER_LAUNCH - 1) // UNIFORMS_PER_LAUNCH
+
+        k0_val = seed & 0xFFFFFF
+        k1_val = (seed >> 24) & 0xFFFFFF
+
+        c0_np = np.arange(LANES, dtype=np.int32).reshape(-1, 1)
+        k0_np = np.full((LANES, 1), k0_val, dtype=np.int32)
+        k1_np = np.full((LANES, 1), k1_val, dtype=np.int32)
+        k2_np = np.zeros((LANES, 1), dtype=np.int32)
+        k3_np = np.zeros((LANES, 1), dtype=np.int32)
+
+        chunks = []
+        for launch in range(n_launches):
+            start_batch = (counter_offset + launch * _PROGRAM_TILES) & 0xFFFFFF
+            start_batch_np = np.full((LANES, 1), start_batch, dtype=np.int32)
+
+            if _use_simulator():
+                out_np = nki.simulate(threefry_streaming_uniform_kernel)(
+                    c0_np, start_batch_np, k0_np, k1_np, k2_np, k3_np
+                )
+                out_tile = torch.from_numpy(np.asarray(out_np).reshape(-1))
+            else:
+
+                def _t(arr):
+                    return torch.from_numpy(arr)
+
+                (c0t, sb_t, k0t, k1t, k2t, k3t), orig = _to_xla(
+                    _t(c0_np),
+                    _t(start_batch_np),
+                    _t(k0_np),
+                    _t(k1_np),
+                    _t(k2_np),
+                    _t(k3_np),
+                )
+                out_tile = (
+                    threefry_streaming_uniform_kernel(c0t, sb_t, k0t, k1t, k2t, k3t)
+                    .reshape(-1)
+                    .to(orig)
+                )
+            chunks.append(out_tile)
+
+        result = torch.cat(chunks) if len(chunks) > 1 else chunks[0]
+        return result.float()[:n_elements]
