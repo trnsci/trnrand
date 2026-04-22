@@ -22,14 +22,17 @@ from .distributions import (
     beta,
     chi_squared,
     exponential,
+    exponential_into,
     gamma,
     normal,
+    normal_into,
     poisson,
     randint,
     randperm,
     standard_normal,
     truncated_normal,
     uniform,
+    uniform_into,
 )
 from .generator import Generator, get_default_generator, manual_seed
 
@@ -60,6 +63,10 @@ __all__ = [
     "chi_squared",
     "beta",
     "poisson",
+    # Zero-allocation in-place variants
+    "normal_into",
+    "uniform_into",
+    "exponential_into",
     # Quasi-random
     "sobol",
     "halton",
