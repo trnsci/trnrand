@@ -13,7 +13,12 @@ tiles, and used by both PyTorch and JAX as their default engine.
 
 from __future__ import annotations
 
+from typing import TYPE_CHECKING
+
 import torch
+
+if TYPE_CHECKING:
+    from .nki.program import ProgramBuilder
 
 
 class Generator:
@@ -53,6 +58,32 @@ class Generator:
     def torch_generator(self) -> torch.Generator:
         """Access underlying torch.Generator for use with torch ops."""
         return self._torch_gen
+
+    def new_program(self) -> ProgramBuilder:
+        """Return a ProgramBuilder seeded from this generator.
+
+        Builds a pre-compiled streaming NEFF program via a fluent API::
+
+            prog = (
+                gen.new_program()
+                .normal(1_000_000, out="z")
+                .uniform(500_000, out="u")
+                .build()
+            )
+            z = torch.empty(1_000_000)
+            u = torch.empty(500_000)
+            prog.stream_into({"z": z, "u": u})
+
+        On NKI, the first `stream_into` compiles the NEFF; subsequent calls
+        with identical buffer shapes reuse the cached kernel. On CPU (no
+        neuronxcc), falls back to torch.Generator-based generation.
+
+        Returns:
+            ProgramBuilder seeded with this generator's current seed.
+        """
+        from .nki.program import ProgramBuilder
+
+        return ProgramBuilder(generator=self)
 
 
 # Module-level default generator

@@ -7,7 +7,13 @@ sequences for quasi-Monte Carlo integration.
 Part of the trnsci scientific computing suite.
 """
 
-__version__ = "0.2.0"
+from importlib.metadata import PackageNotFoundError
+from importlib.metadata import version as _pkg_version
+
+try:
+    __version__ = _pkg_version("trnrand")
+except PackageNotFoundError:
+    __version__ = "unknown"
 
 # Generator
 # Distributions
@@ -29,6 +35,9 @@ from .generator import Generator, get_default_generator, manual_seed
 
 # Backend control
 from .nki import HAS_NKI, get_backend, set_backend
+
+# Streaming generator program
+from .nki.program import GeneratorProgram
 
 # Quasi-random sequences
 from .quasi import halton, latin_hypercube, sobol
@@ -55,6 +64,8 @@ __all__ = [
     "sobol",
     "halton",
     "latin_hypercube",
+    # Streaming program API
+    "GeneratorProgram",
     # Backend
     "HAS_NKI",
     "set_backend",
