@@ -81,7 +81,7 @@ BENCH_SCRIPT="source /opt/aws_neuronx_venv_pytorch_2_9/bin/activate && \
   git fetch --all && \
   git checkout $SHA && \
   pip install -e '.[dev]' --quiet && \
-  pytest benchmarks/bench_rand.py --benchmark-only --benchmark-json=$REMOTE_JSON --tb=short 2>&1 | tail -120 && \
+  pytest benchmarks/bench_rand.py benchmarks/bench_streaming.py --benchmark-only --benchmark-json=$REMOTE_JSON --tb=short 2>&1 | tail -120 && \
   echo BENCH_OK"
 
 CMD_ID=$(aws ssm send-command \
