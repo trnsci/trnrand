@@ -59,7 +59,8 @@ def uniform(
         gen = generator or get_default_generator()
         seed = _nki_seed(gen)
         n = math.prod(size)
-        out = threefry_uniform_nki(n, seed=seed)
+        out = threefry_uniform_nki(n, seed=seed, counter_offset=gen._chip_counter_offset(n))
+        gen._advance_by_elements(n)
         return (out * (high - low) + low).to(dtype).reshape(size)
     gen = (generator or get_default_generator()).torch_generator
     return torch.empty(*size, dtype=dtype).uniform_(low, high, generator=gen)
@@ -79,7 +80,8 @@ def normal(
         gen = generator or get_default_generator()
         seed = _nki_seed(gen)
         n = math.prod(size)
-        out = threefry_normal_nki(n, seed=seed)
+        out = threefry_normal_nki(n, seed=seed, counter_offset=gen._chip_counter_offset(n))
+        gen._advance_by_elements(n)
         return (out * std + mean).to(dtype).reshape(size)
     gen = (generator or get_default_generator()).torch_generator
     return torch.empty(*size, dtype=dtype).normal_(mean, std, generator=gen)
@@ -111,7 +113,8 @@ def exponential(
         gen = generator or get_default_generator()
         seed = _nki_seed(gen)
         n = math.prod(size)
-        u = threefry_uniform_nki(n, seed=seed)
+        u = threefry_uniform_nki(n, seed=seed, counter_offset=gen._chip_counter_offset(n))
+        gen._advance_by_elements(n)
         u = torch.clamp(u, min=1e-10)
         return (-torch.log(u) / rate).to(dtype).reshape(size)
     gen = (generator or get_default_generator()).torch_generator
@@ -308,11 +311,16 @@ def normal_into(
         generator: Optional Generator for reproducible seeding.
     """
     if _nki_active():
-        from .nki.dispatch import threefry_stream_normal
+        from .nki.dispatch import _PROGRAM_TILES, threefry_stream_normal
 
         gen = generator or get_default_generator()
         seed = _nki_seed(gen)
-        raw = threefry_stream_normal(buf.numel(), seed=seed)
+        n = buf.numel()
+        n_launches = math.ceil(n / (_PROGRAM_TILES * 128 * 4))
+        streaming_batches = n_launches * _PROGRAM_TILES
+        counter_offset = gen._partition_rank * streaming_batches + gen._counter
+        raw = threefry_stream_normal(n, seed=seed, counter_offset=counter_offset)
+        gen._counter += streaming_batches
         if mean != 0.0 or std != 1.0:
             raw = raw * std + mean
         buf.copy_(raw.reshape(buf.shape))
@@ -340,11 +348,16 @@ def uniform_into(
         generator: Optional Generator for reproducible seeding.
     """
     if _nki_active():
-        from .nki.dispatch import threefry_stream_uniform
+        from .nki.dispatch import _PROGRAM_TILES, threefry_stream_uniform
 
         gen = generator or get_default_generator()
         seed = _nki_seed(gen)
-        raw = threefry_stream_uniform(buf.numel(), seed=seed)
+        n = buf.numel()
+        n_launches = math.ceil(n / (_PROGRAM_TILES * 128 * 4))
+        streaming_batches = n_launches * _PROGRAM_TILES
+        counter_offset = gen._partition_rank * streaming_batches + gen._counter
+        raw = threefry_stream_uniform(n, seed=seed, counter_offset=counter_offset)
+        gen._counter += streaming_batches
         if low != 0.0 or high != 1.0:
             raw = raw * (high - low) + low
         buf.copy_(raw.reshape(buf.shape))
@@ -371,11 +384,16 @@ def exponential_into(
         generator: Optional Generator for reproducible seeding.
     """
     if _nki_active():
-        from .nki.dispatch import threefry_stream_uniform
+        from .nki.dispatch import _PROGRAM_TILES, threefry_stream_uniform
 
         gen = generator or get_default_generator()
         seed = _nki_seed(gen)
-        u = threefry_stream_uniform(buf.numel(), seed=seed)
+        n = buf.numel()
+        n_launches = math.ceil(n / (_PROGRAM_TILES * 128 * 4))
+        streaming_batches = n_launches * _PROGRAM_TILES
+        counter_offset = gen._partition_rank * streaming_batches + gen._counter
+        u = threefry_stream_uniform(n, seed=seed, counter_offset=counter_offset)
+        gen._counter += streaming_batches
         raw = -torch.log(u) / rate
         buf.copy_(raw.reshape(buf.shape))
         return

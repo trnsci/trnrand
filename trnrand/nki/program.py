@@ -63,8 +63,14 @@ class ProgramBuilder:
         self._steps: list[tuple] = []
         if generator is not None:
             self._seed = generator.seed if generator.seed is not None else 0
+            self._partition_rank = getattr(generator, "_partition_rank", 0)
+            self._partition_size = getattr(generator, "_partition_size", 1)
+            self._counter_start = getattr(generator, "_counter", 0)
         else:
             self._seed = int(seed)
+            self._partition_rank = 0
+            self._partition_size = 1
+            self._counter_start = 0
 
     def normal(self, n: int, mean: float = 0.0, std: float = 1.0, out: str = "z") -> ProgramBuilder:
         """Queue n N(mean, std) samples into buffer `out`."""
@@ -98,7 +104,13 @@ class ProgramBuilder:
                 "ProgramBuilder has no distribution steps. "
                 "Call .normal(), .uniform(), or .exponential() before .build()."
             )
-        return GeneratorProgram(steps=list(self._steps), seed=self._seed)
+        return GeneratorProgram(
+            steps=list(self._steps),
+            seed=self._seed,
+            partition_rank=self._partition_rank,
+            partition_size=self._partition_size,
+            counter_start=self._counter_start,
+        )
 
 
 class GeneratorProgram:
@@ -124,12 +136,21 @@ class GeneratorProgram:
         path; shape, dtype, and distribution properties are preserved.
     """
 
-    def __init__(self, steps: list[tuple], seed: int = 0):
+    def __init__(
+        self,
+        steps: list[tuple],
+        seed: int = 0,
+        partition_rank: int = 0,
+        partition_size: int = 1,
+        counter_start: int = 0,
+    ):
         self._steps = steps
         self._seed = int(seed)
-        # Counter tracks next available batch index in the Threefry stream.
+        self._partition_rank = partition_rank
+        self._partition_size = partition_size
+        # Counter starts at the generator's snapshot position (0 for single-chip).
         # Advances by n_launches * _PROGRAM_TILES after each distribution step.
-        self._counter: int = 0
+        self._counter: int = counter_start
 
     def stream_into(self, buffers: dict[str, torch.Tensor]) -> None:
         """Fill each named buffer in-place with samples from this program.
@@ -154,10 +175,14 @@ class GeneratorProgram:
             buf = buffers[out_name]
             n_actual = buf.numel()
 
+            n_launches = math.ceil(n_actual / _NORMALS_PER_LAUNCH)
+            streaming_batches = n_launches * _PROGRAM_TILES
+            # Chip r of P uses [r×step_batches, (r+1)×step_batches) relative to
+            # self._counter, so its counter_offset is shifted by partition_rank.
+            counter_offset = self._counter + self._partition_rank * streaming_batches
+
             if dist == "normal":
-                raw = threefry_stream_normal(
-                    n_actual, seed=self._seed, counter_offset=self._counter
-                )
+                raw = threefry_stream_normal(n_actual, seed=self._seed, counter_offset=counter_offset)
                 mean = kwargs["mean"]
                 std = kwargs["std"]
                 if std != 1.0 or mean != 0.0:
@@ -165,9 +190,7 @@ class GeneratorProgram:
                 buf.copy_(raw.reshape(buf.shape))
 
             elif dist == "uniform":
-                raw = threefry_stream_uniform(
-                    n_actual, seed=self._seed, counter_offset=self._counter
-                )
+                raw = threefry_stream_uniform(n_actual, seed=self._seed, counter_offset=counter_offset)
                 low = kwargs["low"]
                 high = kwargs["high"]
                 if low != 0.0 or high != 1.0:
@@ -176,15 +199,13 @@ class GeneratorProgram:
 
             elif dist == "exponential":
                 # Inverse CDF: if U ~ Uniform(0,1) then -log(U)/rate ~ Exp(rate).
-                raw = threefry_stream_uniform(
-                    n_actual, seed=self._seed, counter_offset=self._counter
-                )
+                raw = threefry_stream_uniform(n_actual, seed=self._seed, counter_offset=counter_offset)
                 raw = -torch.log(raw) / kwargs["rate"]
                 buf.copy_(raw.reshape(buf.shape))
 
-            # Advance counter past the range consumed by this step.
-            n_launches = math.ceil(n_actual / _NORMALS_PER_LAUNCH)
-            self._counter = (self._counter + n_launches * _PROGRAM_TILES) & 0xFFFFFF
+            # Advance counter by the total range allocated for this step
+            # (all P chips together span partition_size × streaming_batches).
+            self._counter = (self._counter + streaming_batches) & 0xFFFFFF
 
     def _stream_into_pytorch(self, buffers: dict[str, torch.Tensor]) -> None:
         """CPU fallback — uses torch.Generator; not bit-exact with NKI path."""
