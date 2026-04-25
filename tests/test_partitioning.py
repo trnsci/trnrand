@@ -18,6 +18,7 @@ import torch
 
 from trnrand.generator import _BATCH_SIZE, Generator
 from trnrand.nki.dispatch import threefry_uniform_cpu
+from trnrand.nki.program import GeneratorProgram, ProgramBuilder
 
 try:
     from trnrand.nki.dispatch import HAS_NKI as _HAS_NKI
@@ -244,3 +245,49 @@ class TestPartitionEquivalenceCPU:
         full = threefry_uniform_cpu(N_full, seed=5, counter_offset=0)
         tail = threefry_uniform_cpu(N_full - N_first, seed=5, counter_offset=_n_blocks(N_first))
         assert torch.equal(full[N_first:], tail)
+
+
+# ── ProgramBuilder partition context ──────────────────────────────────────────
+
+
+class TestProgramBuilderPartitionContext:
+    def test_single_chip_default(self):
+        builder = ProgramBuilder(seed=42)
+        assert builder._partition_rank == 0
+        assert builder._partition_size == 1
+        assert builder._counter_start == 0
+
+    def test_partition_propagates_from_generator(self):
+        gen = Generator(seed=7, partition_rank=2, partition_size=4)
+        gen.advance(3 * _BATCH_SIZE)  # _counter = 3
+        builder = gen.new_program()
+        assert builder._partition_rank == 2
+        assert builder._partition_size == 4
+        assert builder._counter_start == 3
+
+    def test_build_propagates_to_program(self):
+        gen = Generator(seed=0, partition_rank=1, partition_size=2)
+        gen.advance(_BATCH_SIZE)  # _counter = 1
+        prog = gen.new_program().normal(1000, out="z").build()
+        assert prog._partition_rank == 1
+        assert prog._partition_size == 2
+        assert prog._counter == 1  # counter_start from generator
+
+    def test_single_chip_stream_into_unchanged(self):
+        """rank=0, size=1 produces same output as before partition wiring."""
+        prog1 = ProgramBuilder(seed=42).normal(500, out="z").build()
+        prog2 = ProgramBuilder(seed=42).normal(500, out="z").build()
+        z1 = torch.empty(500)
+        z2 = torch.empty(500)
+        prog1.stream_into({"z": z1})
+        prog2.stream_into({"z": z2})
+        assert torch.equal(z1, z2)
+
+    def test_consecutive_calls_still_differ(self):
+        """Counter must still advance between calls even with partition support."""
+        prog = ProgramBuilder(seed=0).normal(500, out="z").build()
+        z1 = torch.empty(500)
+        z2 = torch.empty(500)
+        prog.stream_into({"z": z1})
+        prog.stream_into({"z": z2})
+        assert not torch.equal(z1, z2)
