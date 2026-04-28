@@ -7,6 +7,100 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.7.0] - 2026-04-27
+
+### Added
+
+#### Counter-partitioned multi-chip RNG — bit-exact reproducibility across chip counts (#47 #48 #49)
+
+The central claim: a 1-chip run and a P-chip run with the same seed produce the
+same combined sample stream — byte-for-byte — with zero cross-chip coordination.
+Concatenating P-chip draws in rank order exactly reproduces the single-chip output.
+GPU libraries cannot offer this without user-side key-threading (JAX split) or
+manual offset management (cuRAND). On Trainium, it falls out of the Threefry
+counter structure for free.
+
+**`Generator` partition API (#47)**
+
+- `Generator(seed, partition_rank=r, partition_size=P)` — declares this generator
+  as chip `r` of `P`. Defaults `rank=0, size=1` so all existing single-chip code
+  is unchanged.
+- `partition_rank` / `partition_size` validation at construction time: `size ≥ 1`,
+  `0 ≤ rank < size`.
+- `generator.position() → int` — logical sample count consumed (rounded up to the
+  nearest 512-sample Threefry batch). Authoritative for checkpoint / resume.
+- `generator.advance(n_samples)` — skip `n_samples` forward without generating
+  them. Increments internal counter by `ceil(n / 512)` batches. Cheap — no RNG
+  work performed.
+- `generator.advance_to(position)` — jump to an absolute sample position for
+  checkpoint / resume. Rounded down to the nearest batch boundary.
+- `generator._chip_counter_offset(n)` — counter offset for chip `r` of `P`
+  dispatching `n` elements: `partition_rank × ceil(n / 512) + _counter`.
+- `generator._advance_by_elements(n)` — advance internal counter by batches
+  consumed by `n` samples. Called by NKI dispatch after each kernel launch.
+- `manual_seed()` resets `_counter` to 0 — reseeding starts a fresh stream.
+- `_BATCH_SIZE = 512` exported at module level (`generator.py`) for use in tests
+  and dispatch without NKI dependency.
+
+**Dispatch wiring (#48)**
+
+- `uniform()`, `normal()`, `exponential()` (per-tile NKI path): pass
+  `counter_offset = gen._chip_counter_offset(n)` to the NKI kernel, then call
+  `gen._advance_by_elements(n)`. Single-chip behaviour is unchanged
+  (`rank=0` → offset = `_counter`, same as before).
+- `normal_into()`, `uniform_into()`, `exponential_into()` (streaming path):
+  `counter_offset = partition_rank × streaming_batches + gen._counter`;
+  `gen._counter += streaming_batches` after dispatch.
+- `ProgramBuilder` captures `partition_rank`, `partition_size`, and `_counter`
+  from the `Generator` at `.new_program()` time.
+- `GeneratorProgram._stream_into_nki` applies per-step partition offset:
+  `counter_offset = self._counter + partition_rank × streaming_batches`.
+  Counter advances by `streaming_batches` per step (not `partition_size ×
+  streaming_batches`), so consecutive single-chip calls remain independent.
+
+**Simulator and hardware tests (#49)**
+
+- `tests/test_partitioning.py` — 43 CPU tests (no NKI required):
+  `TestGeneratorPartitionAPI` (30 tests), `TestPartitionEquivalenceCPU` using
+  `threefry_uniform_cpu` with 4-sample block units (8 tests),
+  `TestProgramBuilderPartitionContext` (5 tests).
+- `tests/test_nki_partitioning.py` — gated tests (skip automatically on dev hosts):
+  - `nki_simulator` marker: per-tile equivalence (uniform/normal/exponential, P=2,4),
+    streaming equivalence (stream_normal/stream_uniform, P=2,4), GeneratorProgram
+    equivalence including multi-distribution programs, advance/resume equivalence.
+  - `neuron` marker (trn1.32xlarge, manual): zero cross-chip coordination smoke test
+    (profiler confirms no collective ops), near-linear strong scaling benchmark (≥87%
+    efficiency / ≥28× 1-chip target), P=32 chip-0 slice structural check, NEFF cache
+    reuse with partition args (<100ms second launch).
+
+### Architecture notes
+
+**Counter unit distinction**: `threefry_uniform_cpu` uses 4-sample Threefry output
+blocks as its `counter_offset` unit; the NKI kernel aggregates 128 lanes into
+512-sample batches. `Generator._counter` and `_BATCH_SIZE = 512` track NKI batch
+units. CPU-reference tests use `ceil(n / 4)` block units directly.
+
+**NEFF is not partition-aware at compile time.** Partition rank and counter offset
+live in HBM arguments passed at runtime. The same compiled NEFF serves all chips in
+a partition — no per-rank recompilation.
+
+**Partition equivalence boundary**: N must be a multiple of `512 × P` (per-tile)
+or `16,384 × P` (streaming) for exact batch alignment. Partial-batch tails
+produce correct but non-partitionable outputs — documented and tested.
+
+### Deferred
+
+- **Partition wiring for `gamma`, `beta`, `chi_squared`, `truncated_normal`** —
+  rejection-loop batch counts are data-dependent and cannot be tracked at the
+  `Generator` level without significant complexity. These distributions remain
+  single-chip on the NKI path. Partition support will be added once a fixed-batch
+  rejection kernel is available.
+
+- **Hardware validation** — zero cross-chip coordination profiler trace and
+  near-linear strong scaling numbers (trn1.32xlarge, 32 chips) are pending a
+  manual hardware run. The `neuron`-marked tests in `test_nki_partitioning.py`
+  capture the assertions; results will be documented in a follow-up release note.
+
 ## [0.6.0] - 2026-04-22
 
 ### Added
