@@ -284,8 +284,21 @@ def poisson(
 
     PMF: P(k) = λ^k exp(-λ) / k!
     Mean: λ; Variance: λ
+
+    NKI path (lam ≥ 20): normal approximation round(N(λ, √λ)) clamped to ≥ 0.
+    CPU path (lam < 20 or NKI inactive): torch.poisson (exact, Knuth algorithm).
     """
     assert lam >= 0, "poisson requires lam >= 0"
+    if _nki_active():
+        from .nki.dispatch import _POISSON_NORMAL_THRESHOLD, poisson_nki
+
+        if lam >= _POISSON_NORMAL_THRESHOLD:
+            gen = generator or get_default_generator()
+            seed = _nki_seed(gen)
+            n = math.prod(size)
+            out = poisson_nki(n, lam=lam, seed=seed, counter_offset=gen._chip_counter_offset(n))
+            gen._advance_by_elements(n)
+            return out.to(dtype).reshape(size)
     gen = (generator or get_default_generator()).torch_generator
     rates = torch.full(size, float(lam), dtype=torch.float32)
     return torch.poisson(rates, generator=gen).to(dtype)
