@@ -293,6 +293,11 @@ class TestSimulatorStreamInto:
 
     def test_neff_cache_reuse_timing(self):
         """Second stream_into with same shapes should be faster than first."""
+        if os.environ.get("TRNRAND_USE_SIMULATOR", "").lower() in ("1", "true", "yes"):
+            pytest.skip(
+                "NEFF cache timing is not meaningful under the NKI simulator "
+                "(simulator compiles fresh every call; no NEFF cache)"
+            )
         prog = ProgramBuilder(seed=0).normal(16_384, out="z").build()
         z = torch.empty(16_384)
 

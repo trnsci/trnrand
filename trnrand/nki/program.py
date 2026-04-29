@@ -182,7 +182,9 @@ class GeneratorProgram:
             counter_offset = self._counter + self._partition_rank * streaming_batches
 
             if dist == "normal":
-                raw = threefry_stream_normal(n_actual, seed=self._seed, counter_offset=counter_offset)
+                raw = threefry_stream_normal(
+                    n_actual, seed=self._seed, counter_offset=counter_offset
+                )
                 mean = kwargs["mean"]
                 std = kwargs["std"]
                 if std != 1.0 or mean != 0.0:
@@ -190,7 +192,9 @@ class GeneratorProgram:
                 buf.copy_(raw.reshape(buf.shape))
 
             elif dist == "uniform":
-                raw = threefry_stream_uniform(n_actual, seed=self._seed, counter_offset=counter_offset)
+                raw = threefry_stream_uniform(
+                    n_actual, seed=self._seed, counter_offset=counter_offset
+                )
                 low = kwargs["low"]
                 high = kwargs["high"]
                 if low != 0.0 or high != 1.0:
@@ -199,13 +203,19 @@ class GeneratorProgram:
 
             elif dist == "exponential":
                 # Inverse CDF: if U ~ Uniform(0,1) then -log(U)/rate ~ Exp(rate).
-                raw = threefry_stream_uniform(n_actual, seed=self._seed, counter_offset=counter_offset)
+                raw = threefry_stream_uniform(
+                    n_actual, seed=self._seed, counter_offset=counter_offset
+                )
                 raw = -torch.log(raw) / kwargs["rate"]
                 buf.copy_(raw.reshape(buf.shape))
 
-            # Advance counter by the total range allocated for this step
-            # (all P chips together span partition_size × streaming_batches).
-            self._counter = (self._counter + streaming_batches) & 0xFFFFFF
+            # Advance counter by the FULL single-chip step size so that the
+            # next step's base is aligned with what a 1-chip reference program
+            # would have consumed.  For P chips each processing n/P samples:
+            #   streaming_batches     = batches this chip consumed
+            #   streaming_batches * P = batches a 1-chip run would consume
+            # For P=1 this is a no-op (× 1).
+            self._counter = (self._counter + streaming_batches * self._partition_size) & 0xFFFFFF
 
     def _stream_into_pytorch(self, buffers: dict[str, torch.Tensor]) -> None:
         """CPU fallback — uses torch.Generator; not bit-exact with NKI path."""
