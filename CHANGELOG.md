@@ -7,6 +7,40 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.7.1] - 2026-04-29
+
+### Fixed
+
+#### Multi-step `GeneratorProgram` partition counter bug (#52)
+
+`GeneratorProgram._stream_into_nki` advanced `_counter` by the per-chip
+`streaming_batches` after each distribution step. In a multi-step partitioned
+program (`ProgramBuilder.normal(…).uniform(…).build()`) this caused the base
+counter for step 2 onward to be misaligned: chip r's step 2 started at the
+per-chip offset instead of the correct full-step offset. Concretely, the
+uniform step in a 2-distribution P=2 program drew from the wrong region of
+the Threefry stream, breaking partition equivalence.
+
+Fix: advance `_counter` by `streaming_batches × partition_size` (the full
+single-chip step width) rather than `streaming_batches` alone. For
+`partition_size=1` this is a no-op; all single-step programs and single-chip
+programs are unaffected.
+
+Detected by `test_multi_distribution_program_equivalence_P2` in the NKI
+simulator CI job introduced in #49.
+
+#### Simulator CI test fixes (#52)
+
+- `test_neff_cache_reuse_timing` — skip when `TRNRAND_USE_SIMULATOR=1`. The
+  NKI simulator compiles every kernel invocation fresh (~10s each); asserting
+  <500ms is meaningless without actual NEFF caching.
+- `TestSimulatorBitExact` renamed `TestHardwareBitExact`, moved from
+  `nki_simulator` to `neuron` marker. The simulator's `nl.static_range` tile
+  execution order differs from sequential per-tile invocations, producing
+  completely different output sequences (max diff 5.58 for normal). On
+  hardware, NEFF compilation guarantees consistent deterministic output.
+- `ruff format` — reformatted `program.py` to resolve CI lint failure.
+
 ## [0.7.0] - 2026-04-27
 
 ### Added
