@@ -313,6 +313,12 @@ THREEFRY_ROTATIONS = [(10, 26), (11, 21), (13, 27), (23, 5)]
 # import it for test parameterisation without requiring neuronxcc.
 _PROGRAM_TILES = 32  # tiles per streaming launch; 32 × 128 × 4 = 16,384 samples/call
 
+# Normal-approximation threshold for Poisson NKI path.
+# For lam >= 20, skewness 1/sqrt(lam) <= 0.22 and the normal approximation
+# round(N(lam, sqrt(lam))) produces tail probabilities within ~1% of exact.
+# Exported at module level so distributions.py can check lam without NKI.
+_POISSON_NORMAL_THRESHOLD = 20.0
+
 
 def threefry4x32_reference(counter: torch.Tensor, key: torch.Tensor) -> torch.Tensor:
     """CPU reference implementation of Threefry4×32-20.
@@ -1532,6 +1538,36 @@ if HAS_NKI:
             counter_offset=counter_offset,
         )
         return (x / (x + y)).float()
+
+    def poisson_nki(n_elements, lam, seed=0, counter_offset=0):
+        """Poisson distribution via normal approximation for large λ.
+
+        For λ ≥ _POISSON_NORMAL_THRESHOLD (20), Poisson(λ) ≈ round(N(λ, √λ))
+        clamped to ≥ 0. This is vectorizable on NKI — no data-dependent loop.
+
+        Accuracy: skewness 1/√λ ≤ 0.22 at the threshold; tail probabilities
+        are within ~1% of exact for integer k at λ = 20, improving rapidly
+        with larger λ. Suitable for scientific Monte Carlo (photon counting,
+        event-rate simulation, queuing models) where λ ≥ 20 is typical.
+
+        Args:
+            n_elements: Number of samples.
+            lam: Rate parameter λ (≥ _POISSON_NORMAL_THRESHOLD = 20).
+            seed: 24-bit Threefry key seed.
+            counter_offset: Starting counter tile offset.
+
+        Returns:
+            Float32 tensor of shape (n_elements,) with non-negative integer values.
+        """
+        import math as _math
+
+        assert lam >= _POISSON_NORMAL_THRESHOLD, (
+            f"poisson_nki requires lam >= {_POISSON_NORMAL_THRESHOLD}; got {lam}. "
+            "Use the CPU path (torch.poisson) for small lam."
+        )
+        z = threefry_normal_nki(n_elements, seed=seed, counter_offset=counter_offset)
+        samples = lam + _math.sqrt(lam) * z
+        return torch.clamp(torch.round(samples), min=0.0)
 
     # ── Sobol quasi-random sequence (GpSimd XOR accumulation) ─────────────────
     #

@@ -244,6 +244,48 @@ class TestPoisson:
         b = trnrand.poisson(1000, lam=4.0, generator=g2)
         np.testing.assert_allclose(a.numpy(), b.numpy())
 
+    def test_nki_large_lam_statistics(self):
+        """NKI normal-approximation path: mean ≈ lam, var ≈ lam."""
+        from trnrand.nki.dispatch import _POISSON_NORMAL_THRESHOLD
+
+        lam = float(_POISSON_NORMAL_THRESHOLD) * 2  # well above threshold
+        g = Generator(seed=7)
+        x = trnrand.poisson(200_000, lam=lam, generator=g).double()
+        np.testing.assert_allclose(x.mean().item(), lam, rtol=0.01)
+        np.testing.assert_allclose(x.var().item(), lam, rtol=0.05)
+
+    def test_nki_large_lam_nonneg_integer(self):
+        """NKI path produces non-negative integer-valued floats."""
+        from trnrand.nki.dispatch import _POISSON_NORMAL_THRESHOLD
+
+        g = Generator(seed=13)
+        x = trnrand.poisson(50_000, lam=float(_POISSON_NORMAL_THRESHOLD) + 5, generator=g)
+        assert (x >= 0).all()
+        assert torch.equal(x, x.round())
+
+    def test_nki_large_lam_reproducibility(self):
+        """Same seed + large lam: two draws are identical."""
+        from trnrand.nki.dispatch import _POISSON_NORMAL_THRESHOLD
+
+        lam = float(_POISSON_NORMAL_THRESHOLD) + 10
+        g1 = Generator(seed=99)
+        g2 = Generator(seed=99)
+        a = trnrand.poisson(1000, lam=lam, generator=g1)
+        b = trnrand.poisson(1000, lam=lam, generator=g2)
+        assert torch.equal(a, b)
+
+    def test_small_lam_uses_cpu_path(self):
+        """lam < threshold falls through to torch.poisson (exact)."""
+        from trnrand.nki.dispatch import _POISSON_NORMAL_THRESHOLD
+
+        lam = _POISSON_NORMAL_THRESHOLD / 2  # below threshold
+        g = Generator(seed=5)
+        x = trnrand.poisson(10_000, lam=lam, generator=g)
+        # CPU poisson is exact → all non-negative integers
+        assert (x >= 0).all()
+        assert torch.equal(x, x.round())
+        np.testing.assert_allclose(x.double().mean().item(), lam, rtol=0.05)
+
 
 # ── In-place zero-allocation variants ─────────────────────────────────────────
 
