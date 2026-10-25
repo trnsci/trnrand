@@ -30,6 +30,12 @@ neuron = [
     # canonical namespace. Previous releases exposed `neuronxcc.nki.*` which
     # is now deprecated. Ships with the Deep Learning AMI Neuron or via
     # https://pip.repos.neuron.amazonaws.com.
+    #
+    # torch-neuronx has two lineages and both satisfy this pin; install the
+    # one that matches the instance (pip markers can't tell them apart):
+    #   TorchNeuron / native: torch-neuronx 2.14.*, torch 2.14, Python >= 3.12,
+    #                         Neuron SDK 2.33+, Trn2/Trn3.
+    #   PyTorch/XLA:          torch-neuronx 2.9 lineage + torch-xla, Trn1.
     "nki>=0.3.0",
     "torch-neuronx>=2.9",
 ]

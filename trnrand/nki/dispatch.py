@@ -16,6 +16,7 @@ of random tensors, which can be significant for large Monte Carlo runs.
 
 from __future__ import annotations
 
+import importlib.util
 import math
 import os
 import warnings
@@ -79,6 +80,79 @@ def _to_xla(*tensors):
     device = torch_xla.device()
     orig = tensors[0].device
     return [t.to(device) for t in tensors], orig
+
+
+# ── Device dispatch path: native TorchNeuron vs XLA ──────────────────────────
+#
+# Two Neuron PyTorch lineages coexist:
+#   native  torch-neuronx 2.14+ (TorchNeuron, Trn2/Trn3): Trainium is a
+#           PyTorch `neuron` device; kernels are custom ops registered via
+#           `torch_neuronx.nki_op` (see `_native.py`).
+#   xla     torch-neuronx 2.9 lineage (PyTorch/XLA; Trn1 and Inf2 stay
+#           here): kernels dispatch on the torch_xla device via `_to_xla()`.
+# Anything else is "cpu": no device path, so a kernel launch outside the
+# simulator raises (from `_to_xla`) exactly as it did before the native
+# path existed. Detection runs on the first launch, not at import, and the
+# native probe never imports torch_xla.
+
+_NEURON_DEVICE = "neuron"
+_dispatch_path: str | None = None
+_native_ops: dict | None = None
+
+
+def _native_available() -> bool:
+    try:
+        import torch_neuronx
+    except Exception:
+        return False
+    # The XLA-lineage torch_neuronx has no `nki_op`.
+    if not hasattr(torch_neuronx, "nki_op"):
+        return False
+    try:
+        torch.device(_NEURON_DEVICE)  # torch_neuronx renames PrivateUse1 to "neuron"
+        return torch_neuronx.device_count() > 0
+    except Exception:
+        return False
+
+
+def _detect_dispatch_path() -> str:
+    if _native_available():
+        return "native"
+    if importlib.util.find_spec("torch_xla") is not None:
+        return "xla"
+    return "cpu"
+
+
+def _get_dispatch_path() -> str:
+    """Return "native", "xla", or "cpu" (cached after the first call)."""
+    global _dispatch_path
+    if _dispatch_path is None:
+        _dispatch_path = _detect_dispatch_path()
+    return _dispatch_path
+
+
+def _get_native_ops() -> dict:
+    """Import `_native` (registering the trnrand:: custom ops) on first use."""
+    global _native_ops
+    if _native_ops is None:
+        from . import _native
+
+        _native_ops = _native.OPS
+    return _native_ops
+
+
+def _launch(kernel, op_name: str, *tensors: torch.Tensor) -> torch.Tensor:
+    """Run one kernel launch on the Neuron device and return the host result.
+
+    `op_name` is the `trnrand::<op_name>` custom op used on the native path;
+    the XLA path calls `kernel` directly on torch_xla tensors.
+    """
+    if _get_dispatch_path() == "native":
+        orig = tensors[0].device
+        op = _get_native_ops()[op_name]
+        return op(*(t.to(_NEURON_DEVICE) for t in tensors)).to(orig)
+    xs, orig = _to_xla(*tensors)
+    return kernel(*xs).to(orig)
 
 
 # NKI partition axis is limited to 128 lanes on trn1/trn2. The host wrapper
@@ -690,8 +764,9 @@ if HAS_NKI:
         output layout per chunk is `[c0, c1, c2, c3]` interleaved per
         lane (4 uint32 words → 4 * lanes int32 values per chunk).
 
-        Importing `torch_xla` inside `_to_xla` also populates
+        On the XLA path, importing `torch_xla` inside `_to_xla` also populates
         `sys.modules['torch_neuronx']` before the first kernel invocation.
+        On the native path the launch goes through `trnrand::philox4x32`.
 
         Args:
             counter_lo: int32 per-lane counter increment, shape `(lanes,)`.
@@ -722,10 +797,11 @@ if HAS_NKI:
                 )
                 out_tile = torch.from_numpy(np.asarray(out_np)).reshape(-1)
             else:
-                (cl, kl, kh), orig = _to_xla(cl_tile, kl_tile, kh_tile)
                 # Kernel returns (tile_len, 4); flatten to interleaved
                 # [c0_0, c1_0, c2_0, c3_0, c0_1, c1_1, ...].
-                out_tile = philox4x32_kernel(cl, kl, kh).reshape(-1).to(orig)
+                out_tile = _launch(
+                    philox4x32_kernel, "philox4x32", cl_tile, kl_tile, kh_tile
+                ).reshape(-1)
             chunks.append(out_tile)
         return torch.cat(chunks) if len(chunks) > 1 else chunks[0]
 
@@ -752,9 +828,8 @@ if HAS_NKI:
                 out_np = nki.simulate(box_muller_kernel)(tile_slice.cpu().numpy())
                 out_tile = torch.from_numpy(np.asarray(out_np)).reshape(-1)
             else:
-                (u,), orig = _to_xla(tile_slice)
                 # Kernel returns (tile_len, 2); flatten to interleaved [z1, z2, z1, z2, ...].
-                out_tile = box_muller_kernel(u).reshape(-1).to(orig)
+                out_tile = _launch(box_muller_kernel, "box_muller", tile_slice).reshape(-1)
             chunks.append(out_tile)
         return torch.cat(chunks) if len(chunks) > 1 else chunks[0]
 
@@ -1292,23 +1367,14 @@ if HAS_NKI:
                 )
                 out_tile = torch.from_numpy(np.asarray(out_np).reshape(-1))
             else:
-
-                def _t(arr):
-                    return torch.from_numpy(arr)
-
-                (c0t, c1t, c2t, c3t, k0t, k1t, k2t, k3t), orig = _to_xla(
-                    _t(c0_np),
-                    _t(c1_np),
-                    _t(c2_np),
-                    _t(c3_np),
-                    _t(k0_np),
-                    _t(k1_np),
-                    _t(k2_np),
-                    _t(k3_np),
-                )
-                out_tile = (
-                    threefry4x32_kernel(c0t, c1t, c2t, c3t, k0t, k1t, k2t, k3t).reshape(-1).to(orig)
-                )
+                out_tile = _launch(
+                    threefry4x32_kernel,
+                    "threefry4x32",
+                    *(
+                        torch.from_numpy(a)
+                        for a in (c0_np, c1_np, c2_np, c3_np, k0_np, k1_np, k2_np, k3_np)
+                    ),
+                ).reshape(-1)
             chunks.append(out_tile)
 
         result = torch.cat(chunks) if len(chunks) > 1 else chunks[0]
@@ -1357,25 +1423,14 @@ if HAS_NKI:
                 )
                 out_tile = torch.from_numpy(np.asarray(out_np).reshape(-1))
             else:
-
-                def _t(arr):
-                    return torch.from_numpy(arr)
-
-                (c0t, c1t, c2t, c3t, k0t, k1t, k2t, k3t), orig = _to_xla(
-                    _t(c0_np),
-                    _t(c1_np),
-                    _t(c2_np),
-                    _t(c3_np),
-                    _t(k0_np),
-                    _t(k1_np),
-                    _t(k2_np),
-                    _t(k3_np),
-                )
-                out_tile = (
-                    threefry_normal_kernel(c0t, c1t, c2t, c3t, k0t, k1t, k2t, k3t)
-                    .reshape(-1)
-                    .to(orig)
-                )
+                out_tile = _launch(
+                    threefry_normal_kernel,
+                    "threefry_normal",
+                    *(
+                        torch.from_numpy(a)
+                        for a in (c0_np, c1_np, c2_np, c3_np, k0_np, k1_np, k2_np, k3_np)
+                    ),
+                ).reshape(-1)
             chunks.append(out_tile)
 
         result = torch.cat(chunks) if len(chunks) > 1 else chunks[0]
@@ -1742,8 +1797,7 @@ if HAS_NKI:
                 out_np = nki.simulate(sobol_gray_code_kernel)(gray_tile.numpy())
                 chunks.append(torch.from_numpy(np.asarray(out_np)))
             else:
-                (gray_xla,), orig = _to_xla(gray_tile)
-                out_tile = sobol_gray_code_kernel(gray_xla).to(orig)
+                out_tile = _launch(sobol_gray_code_kernel, "sobol_gray_code", gray_tile)
                 chunks.append(out_tile)
 
         # (n_padded, _SOBOL_MAX_DIMS) → (n_points, n_dims) float32
@@ -1907,8 +1961,7 @@ if HAS_NKI:
                 out_np = nki.simulate(halton_kernel)(tile.numpy())
                 chunks.append(torch.from_numpy(np.asarray(out_np)))
             else:
-                (tile_xla,), orig = _to_xla(tile)
-                out_tile = halton_kernel(tile_xla).to(orig)
+                out_tile = _launch(halton_kernel, "halton", tile)
                 chunks.append(out_tile)
 
         result = torch.cat(chunks, dim=0)[:n_points, :n_dims]
@@ -2322,23 +2375,14 @@ if HAS_NKI:
                 )
                 out_tile = torch.from_numpy(np.asarray(out_np).reshape(-1))
             else:
-
-                def _t(arr):
-                    return torch.from_numpy(arr)
-
-                (c0t, sb_t, k0t, k1t, k2t, k3t), orig = _to_xla(
-                    _t(c0_np),
-                    _t(start_batch_np),
-                    _t(k0_np),
-                    _t(k1_np),
-                    _t(k2_np),
-                    _t(k3_np),
-                )
-                out_tile = (
-                    threefry_streaming_normal_kernel(c0t, sb_t, k0t, k1t, k2t, k3t)
-                    .reshape(-1)
-                    .to(orig)
-                )
+                out_tile = _launch(
+                    threefry_streaming_normal_kernel,
+                    "threefry_streaming_normal",
+                    *(
+                        torch.from_numpy(a)
+                        for a in (c0_np, start_batch_np, k0_np, k1_np, k2_np, k3_np)
+                    ),
+                ).reshape(-1)
             chunks.append(out_tile)
 
         result = torch.cat(chunks) if len(chunks) > 1 else chunks[0]
@@ -2380,23 +2424,14 @@ if HAS_NKI:
                 )
                 out_tile = torch.from_numpy(np.asarray(out_np).reshape(-1))
             else:
-
-                def _t(arr):
-                    return torch.from_numpy(arr)
-
-                (c0t, sb_t, k0t, k1t, k2t, k3t), orig = _to_xla(
-                    _t(c0_np),
-                    _t(start_batch_np),
-                    _t(k0_np),
-                    _t(k1_np),
-                    _t(k2_np),
-                    _t(k3_np),
-                )
-                out_tile = (
-                    threefry_streaming_uniform_kernel(c0t, sb_t, k0t, k1t, k2t, k3t)
-                    .reshape(-1)
-                    .to(orig)
-                )
+                out_tile = _launch(
+                    threefry_streaming_uniform_kernel,
+                    "threefry_streaming_uniform",
+                    *(
+                        torch.from_numpy(a)
+                        for a in (c0_np, start_batch_np, k0_np, k1_np, k2_np, k3_np)
+                    ),
+                ).reshape(-1)
             chunks.append(out_tile)
 
         result = torch.cat(chunks) if len(chunks) > 1 else chunks[0]

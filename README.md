@@ -36,6 +36,21 @@ pip install trnrand
 pip install trnrand[neuron]
 ```
 
+Kernels dispatch on whichever Neuron PyTorch lineage is installed:
+
+- **TorchNeuron (native)** — Trn2/Trn3, Neuron SDK 2.33+, Python ≥ 3.12,
+  `torch` 2.14, `torch-neuronx` 2.14.*. Each kernel is a PyTorch custom op
+  (`torch.ops.trnrand.*`) on the `neuron` device; no `torch_xla`.
+- **PyTorch/XLA** — Trn1 (and any host on the `torch-neuronx` 2.9 lineage).
+  Kernels dispatch through `torch_xla`, unchanged.
+
+trnrand picks the native path when the native `torch_neuronx` and a `neuron`
+device are present, and the XLA path when `torch_xla` is installed; without
+`nki` it uses `torch.Generator`. With an editable install
+(`pip install -e`), set `NKI_ENABLE_TRACE_CACHE=0`: the NKI kernel cache only
+versions installed wheels and can serve stale kernels. See
+[installation](docs/installation.md).
+
 ## Usage
 
 ```python

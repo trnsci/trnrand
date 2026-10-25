@@ -23,7 +23,9 @@ trnrand/
 │   ├── quasi.py             # sobol, halton, latin_hypercube
 │   └── nki/
 │       ├── __init__.py
-│       └── dispatch.py      # Philox kernel stub for on-device RNG
+│       ├── dispatch.py      # NKI kernels, host wrappers, dispatch-path selection
+│       ├── _native.py       # TorchNeuron custom ops (nki_op), loaded lazily
+│       └── program.py       # GeneratorProgram streaming builder
 ├── tests/
 │   ├── conftest.py
 │   ├── test_distributions.py  # Reproducibility, statistics, bounds

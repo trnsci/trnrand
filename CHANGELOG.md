@@ -7,6 +7,34 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+#### Native PyTorch dispatch on TorchNeuron (#54)
+
+On TorchNeuron (Neuron SDK 2.33+, `torch-neuronx` 2.14, PyTorch 2.14,
+Trn2/Trn3), every NKI kernel is now registered as a PyTorch custom op with
+`torch_neuronx.nki_op` and dispatched on `device="neuron"`, with no
+`torch_xla` import. Ops: `trnrand::philox4x32`, `box_muller`,
+`threefry4x32`, `threefry_normal`, `sobol_gray_code`, `halton`,
+`threefry_streaming_normal`, `threefry_streaming_uniform`. Kernel bodies
+are unchanged.
+
+- The dispatch path is detected on the first kernel launch: native when
+  `torch_neuronx` exports `nki_op` and a `neuron` device is available, XLA
+  when `torch_xla` is installed, otherwise none. The XLA path (Trn1) is
+  unchanged, as are the `torch.Generator` fallback and the
+  `TRNRAND_USE_SIMULATOR` path.
+- Custom ops are registered lazily (`trnrand/nki/_native.py` is imported
+  only when the native path is selected), so CPU-only installs and the XLA
+  lineage see no import-time side effects.
+- All host wrappers, `GeneratorProgram.stream_into`, and the partitioned
+  multi-chip paths share one launch helper, so they follow the same path.
+- Docs: the `[neuron]` install notes describe both lineages and recommend
+  `NKI_ENABLE_TRACE_CACHE=0` for editable installs.
+- Tests: CPU-runnable backend-selection and lazy-registration tests;
+  `@pytest.mark.neuron` native-path tests for Trn2 (not yet run on
+  hardware).
+
 ## [0.7.1] - 2026-04-29
 
 ### Fixed
