@@ -9,10 +9,16 @@ pip install trnrand
 ## With Neuron hardware support
 
 ```bash
-pip install trnrand[neuron]
+# Trn2/Trn3 with TorchNeuron (native PyTorch, Neuron SDK 2.33+)
+pip install "trnrand[torchneuron]" --extra-index-url https://pip.repos.neuron.amazonaws.com
+
+# Trn1 / PyTorch-XLA lineage
+pip install "trnrand[neuron]" --extra-index-url https://pip.repos.neuron.amazonaws.com
 ```
 
-This pulls in `nki` and `torch-neuronx`, which are only needed on
+`[torchneuron]` pins `torch>=2.14`, `torch-neuronx>=2.14`, and `nki>=0.6`
+(torch-neuronx 2.14 requires Python ≥ 3.12). `[neuron]` is the XLA lineage
+(`torch-neuronx>=2.9`, `nki>=0.3.0`). These are only needed on
 Trainium/Inferentia instances. On CPU or GPU, trnrand falls back to
 `torch.Generator` automatically.
 
@@ -43,9 +49,18 @@ Selection is automatic, on the first kernel launch:
 
 The `trnrand::` custom ops are registered only when the native path is
 selected, so importing trnrand on CPU or on the XLA lineage has no
-TorchNeuron side effects. `pip install trnrand[neuron]` does not choose a
-lineage for you: install the `torch-neuronx` that matches the instance, or
-use the matching Deep Learning AMI Neuron.
+TorchNeuron side effects. Both lineages publish a package named
+`torch-neuronx`, so pick the extra (or Deep Learning AMI Neuron) that
+matches the instance.
+
+To force a path, set `TRNSCI_NKI_DISPATCH` before the first launch. The
+variable is shared by every trnsci library:
+
+| Value | Effect |
+|---|---|
+| `auto` (default) | The order above. |
+| `native` | Use TorchNeuron; raise `RuntimeError` if no `neuron` device is available. |
+| `xla` | Use torch_xla even if TorchNeuron is present; raise `RuntimeError` if torch_xla is missing. |
 
 ### Editable installs and the NKI kernel cache
 

@@ -116,6 +116,22 @@ def _native_available() -> bool:
 
 
 def _detect_dispatch_path() -> str:
+    # TRNSCI_NKI_DISPATCH=auto|native|xla is shared by every trnsci library, so
+    # one variable pins the whole suite on hosts that have both lineages.
+    forced = os.environ.get("TRNSCI_NKI_DISPATCH", "auto").strip().lower()
+    if forced == "native":
+        if not _native_available():
+            raise RuntimeError(
+                "TRNSCI_NKI_DISPATCH=native, but no TorchNeuron backend with a "
+                "'neuron' device is available"
+            )
+        return "native"
+    if forced == "xla":
+        if importlib.util.find_spec("torch_xla") is None:
+            raise RuntimeError("TRNSCI_NKI_DISPATCH=xla, but torch_xla is not installed")
+        return "xla"
+    if forced != "auto":
+        raise ValueError(f"TRNSCI_NKI_DISPATCH must be auto, native, or xla; got {forced!r}")
     if _native_available():
         return "native"
     if importlib.util.find_spec("torch_xla") is not None:

@@ -26,6 +26,7 @@ what's trnrand-specific.
 |---|---|
 | `TRNRAND_USE_SIMULATOR=1` | Dispatch bypasses `torch_xla` and runs kernels through `nki.simulate(kernel)(numpy_args)` on CPU. |
 | `TRNRAND_REQUIRE_NKI=1` | Kernel-path failures re-raise instead of silently falling back to the PyTorch reference. Used by the validation suite to catch silent kernel breakage during iteration. |
+| `TRNSCI_NKI_DISPATCH=auto\|native\|xla` | Suite-wide. Forces the native or XLA dispatch path; `auto` (default) detects. Forcing an unavailable path raises. |
 | `NKI_ENABLE_TRACE_CACHE=0` | TorchNeuron (not trnrand) setting. Turns off the cross-process NKI kernel cache, which cannot version editable installs and may serve a stale kernel after a source edit. |
 
 Each host-side wrapper hands its tiles to `_launch(kernel, op_name, *tiles)`

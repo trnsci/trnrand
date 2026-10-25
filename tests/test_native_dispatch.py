@@ -37,6 +37,7 @@ def reset_dispatch_state(monkeypatch):
     """Each test sees an undetected path and an unregistered op table."""
     monkeypatch.setattr(dispatch, "_dispatch_path", None)
     monkeypatch.setattr(dispatch, "_native_ops", None)
+    monkeypatch.delenv("TRNSCI_NKI_DISPATCH", raising=False)
     # Drop any `_native` left by an earlier test so registration re-runs.
     monkeypatch.delitem(sys.modules, "trnrand.nki._native", raising=False)
     monkeypatch.delattr(trnrand.nki, "_native", raising=False)
@@ -157,6 +158,45 @@ class TestDispatchPathSelection:
         assert dispatch._get_dispatch_path() == "xla"
         assert dispatch._get_dispatch_path() == "xla"
         assert len(calls) == 1
+
+
+class TestDispatchOverride:
+    """TRNSCI_NKI_DISPATCH=auto|native|xla (suite-wide) pins the path."""
+
+    def _both_lineages(self, monkeypatch):
+        monkeypatch.setitem(sys.modules, "torch_neuronx", _fake_native_torch_neuronx())
+        _accept_neuron_device(monkeypatch)
+        _set_torch_xla_present(monkeypatch, True)
+
+    def test_auto_prefers_native(self, monkeypatch):
+        self._both_lineages(monkeypatch)
+        monkeypatch.setenv("TRNSCI_NKI_DISPATCH", "auto")
+        assert dispatch._get_dispatch_path() == "native"
+
+    def test_force_xla_when_both_available(self, monkeypatch):
+        self._both_lineages(monkeypatch)
+        monkeypatch.setenv("TRNSCI_NKI_DISPATCH", "XLA")
+        assert dispatch._get_dispatch_path() == "xla"
+
+    def test_force_native_without_backend_raises(self, monkeypatch):
+        monkeypatch.setitem(sys.modules, "torch_neuronx", _fake_xla_torch_neuronx())
+        _set_torch_xla_present(monkeypatch, True)
+        monkeypatch.setenv("TRNSCI_NKI_DISPATCH", "native")
+        with pytest.raises(RuntimeError, match="TRNSCI_NKI_DISPATCH=native"):
+            dispatch._get_dispatch_path()
+
+    def test_force_xla_without_torch_xla_raises(self, monkeypatch):
+        monkeypatch.setitem(sys.modules, "torch_neuronx", _fake_native_torch_neuronx())
+        _accept_neuron_device(monkeypatch)
+        _set_torch_xla_present(monkeypatch, False)
+        monkeypatch.setenv("TRNSCI_NKI_DISPATCH", "xla")
+        with pytest.raises(RuntimeError, match="TRNSCI_NKI_DISPATCH=xla"):
+            dispatch._get_dispatch_path()
+
+    def test_unknown_value_raises(self, monkeypatch):
+        monkeypatch.setenv("TRNSCI_NKI_DISPATCH", "cuda")
+        with pytest.raises(ValueError, match="auto, native, or xla"):
+            dispatch._get_dispatch_path()
 
 
 class TestLaunchRouting:
