@@ -65,6 +65,12 @@ outputs are unchanged.
   frontend check for every kernel on trn1 and trn2, so the simulator CI job
   now catches MLIR verification failures that `nki.simulate` misses. It
   does not run the backend compiler.
+- Full CPU compile to NEFF (frontend, then `neuronx-cc`, no device): all 8
+  kernels compile for trn1 and trn2 with `neuronx-cc` 2.28 / NKI 0.7.0. With
+  `neuronx-cc` 2.26 / NKI 0.5.0, 6 of 8 compile. The two streaming kernels
+  then fail with an unrelated SBUF out-of-memory error in NKI 0.5.0's pass
+  pipeline: 32 unrolled tiles leave too many allocations live at once
+  (2 tiles fit). That failure is not fixed here.
 - Not yet re-run on hardware.
 
 ## [0.7.1] - 2026-04-29
