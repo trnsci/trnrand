@@ -43,6 +43,30 @@ are unchanged.
   `@pytest.mark.neuron` native-path tests for Trn2 (not yet run on
   hardware).
 
+### Fixed
+
+#### NKI kernels fail to compile on neuronxcc 2.26 / NKI 0.5+ (#56)
+
+Hardware compilation failed with `'nisa.tensor_scalar_arith' op 'operand0'
+must be float32, got 'ui32'` for the Philox, Threefry, Sobol and streaming
+kernels. `nl.add` / `nl.multiply` lower any `(P, 1)` operand (a Python
+scalar or a `(P, 1)` tile, which is every tile in these kernels) to
+`nisa.tensor_scalar`, whose arithmetic form now requires a float32
+operand. Integer adds and multiplies now call `nisa.tensor_tensor`
+directly. Bitwise ops and shifts lower to `tensor_scalar_bitvec`, which
+accepts integer operands, so they are unchanged. The arithmetic and
+outputs are unchanged.
+
+- Every kernel now generates MLIR that passes verification on CPU
+  (`nki.compiler.frontend.source_to_mlir`, trn1 and trn2 targets, NKI
+  0.5.0 / 0.6.0 / 0.7.0). Before the fix, 6 of 8 kernels failed
+  verification there with the same error as on hardware.
+- Tests: `tests/test_nki_compile.py` (`nki_simulator` marker) runs that
+  frontend check for every kernel on trn1 and trn2, so the simulator CI job
+  now catches MLIR verification failures that `nki.simulate` misses. It
+  does not run the backend compiler.
+- Not yet re-run on hardware.
+
 ## [0.7.1] - 2026-04-29
 
 ### Fixed

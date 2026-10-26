@@ -26,6 +26,7 @@ import torch
 
 try:
     import nki
+    import nki.isa as nisa
     import nki.language as nl
 
     HAS_NKI = True
@@ -584,17 +585,32 @@ if HAS_NKI:
     # NKI rejects inner function definitions inside functions called from
     # @nki.jit kernels, so all helpers must live at module scope.
 
+    # Integer add/multiply go through `nisa.tensor_tensor` directly, not
+    # `nl.add` / `nl.multiply`. `nl`'s binary ops lower any (P, 1) operand —
+    # a Python scalar *or* a (P, 1) tile, which is every tile in these
+    # kernels — to `nisa.tensor_scalar`, and arithmetic `tensor_scalar`
+    # (`tensor_scalar_arith`) requires a float32 operand. Newer compilers
+    # (neuronxcc 2.26, NKI 0.5+) reject a uint32 operand outright:
+    # "'nisa.tensor_scalar_arith' op 'operand0' must be float32, got 'ui32'"
+    # (#56). `tensor_tensor` accepts integer operands. Bitwise ops and
+    # shifts lower to `tensor_scalar_bitvec`, which takes integer operands,
+    # so they keep their scalar operands.
+
     def _nki_mul_u32(x, y):
-        return nl.multiply(x, y, dtype=nl.uint32)
+        out = nl.ndarray(x.shape, dtype=nl.uint32, buffer=nl.sbuf)
+        nisa.tensor_tensor(out, x, y, op=nl.multiply)
+        return out
 
     def _nki_add_u32(x, y):
-        return nl.add(x, y, dtype=nl.uint32)
+        out = nl.ndarray(x.shape, dtype=nl.uint32, buffer=nl.sbuf)
+        nisa.tensor_tensor(out, x, y, op=nl.add)
+        return out
 
     def _nki_carry_step(acc, col):
         """Extract low byte and carry, add carry to next column."""
         byte = nl.bitwise_and(acc, 0xFF, dtype=nl.uint32)
         carry = nl.right_shift(acc, 8, dtype=nl.uint32)
-        return byte, nl.add(carry, col, dtype=nl.uint32)
+        return byte, _nki_add_u32(carry, col)
 
     def _nki_pack4_u32(b0, b1, b2, b3):
         """Pack 4 byte tiles into a single uint32 tile."""
@@ -720,8 +736,8 @@ if HAS_NKI:
             c0, c1, c2, c3 = new_c0, new_c1, new_c2, new_c3
 
             # Key bump: (k + W) mod 2^32 via the vector-immediate W.
-            k0_u = nl.add(nl.copy(k0, dtype=nl.uint32), w0_vec, dtype=nl.uint32)
-            k1_u = nl.add(nl.copy(k1, dtype=nl.uint32), w1_vec, dtype=nl.uint32)
+            k0_u = _nki_add_u32(nl.copy(k0, dtype=nl.uint32), w0_vec)
+            k1_u = _nki_add_u32(nl.copy(k1, dtype=nl.uint32), w1_vec)
             k0 = nl.copy(k0_u, dtype=nl.int32)
             k1 = nl.copy(k1_u, dtype=nl.int32)
 
@@ -898,16 +914,16 @@ if HAS_NKI:
         Each byte tile is in [0, 255]; sums ≤ 511 < 2^10 (exact in float32).
         Returns 4 byte tiles representing (a + b) mod 2^32.
         """
-        s0 = nl.add(a_b[0], b_b[0], dtype=nl.uint32)  # ≤ 510
+        s0 = _nki_add_u32(a_b[0], b_b[0])  # ≤ 510
         c0 = nl.right_shift(s0, 8, dtype=nl.uint32)
         r0 = nl.bitwise_and(s0, 0xFF, dtype=nl.uint32)
-        s1 = nl.add(nl.add(a_b[1], b_b[1], dtype=nl.uint32), c0, dtype=nl.uint32)
+        s1 = _nki_add_u32(_nki_add_u32(a_b[1], b_b[1]), c0)
         c1 = nl.right_shift(s1, 8, dtype=nl.uint32)
         r1 = nl.bitwise_and(s1, 0xFF, dtype=nl.uint32)
-        s2 = nl.add(nl.add(a_b[2], b_b[2], dtype=nl.uint32), c1, dtype=nl.uint32)
+        s2 = _nki_add_u32(_nki_add_u32(a_b[2], b_b[2]), c1)
         c2 = nl.right_shift(s2, 8, dtype=nl.uint32)
         r2 = nl.bitwise_and(s2, 0xFF, dtype=nl.uint32)
-        s3 = nl.add(nl.add(a_b[3], b_b[3], dtype=nl.uint32), c2, dtype=nl.uint32)
+        s3 = _nki_add_u32(_nki_add_u32(a_b[3], b_b[3]), c2)
         r3 = nl.bitwise_and(s3, 0xFF, dtype=nl.uint32)  # carry out discarded
         return [r0, r1, r2, r3]
 
@@ -1744,7 +1760,7 @@ if HAS_NKI:
                     # bit_k ∈ {0,1} and v_dk < 2^24 → product < 2^24 (float32-exact)
                     s = nl.bitwise_xor(
                         s,
-                        nl.multiply(bit_k, nl.full((P, 1), v_dk, dtype=nl.uint32), dtype=nl.uint32),
+                        _nki_mul_u32(bit_k, nl.full((P, 1), v_dk, dtype=nl.uint32)),
                         dtype=nl.uint32,
                     )
             # Convert s (uint32 in [0, 2^24)) to float32 in [0, 1) via
@@ -2067,11 +2083,7 @@ if HAS_NKI:
             # tile_idx is a compile-time Python int from nl.static_range;
             # nl.full materializes it as a constant tile for the add.
             c1_u = nl.bitwise_and(
-                nl.add(
-                    start_batch_u,
-                    nl.full((P, 1), tile_idx, dtype=nl.uint32),
-                    dtype=nl.uint32,
-                ),
+                _nki_add_u32(start_batch_u, nl.full((P, 1), tile_idx, dtype=nl.uint32)),
                 0xFFFFFF,
                 dtype=nl.uint32,
             )
@@ -2248,11 +2260,7 @@ if HAS_NKI:
 
         for tile_idx in nl.static_range(_PROGRAM_TILES):
             c1_u = nl.bitwise_and(
-                nl.add(
-                    start_batch_u,
-                    nl.full((P, 1), tile_idx, dtype=nl.uint32),
-                    dtype=nl.uint32,
-                ),
+                _nki_add_u32(start_batch_u, nl.full((P, 1), tile_idx, dtype=nl.uint32)),
                 0xFFFFFF,
                 dtype=nl.uint32,
             )
