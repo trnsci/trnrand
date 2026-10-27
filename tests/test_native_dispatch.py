@@ -29,6 +29,8 @@ EXPECTED_OPS = {
     "halton",
     "threefry_streaming_normal",
     "threefry_streaming_uniform",
+    "threefry_bulk_normal",
+    "threefry_bulk_uniform",
 }
 
 
@@ -321,3 +323,8 @@ class TestLazyRegistration:
         streaming = (128, 4 * dispatch._PROGRAM_TILES)
         assert fake("threefry_streaming_normal")(*[i32] * 6).shape == streaming
         assert fake("threefry_streaming_uniform")(*[i32] * 6).shape == streaming
+        lanes = torch.zeros(128, 512, dtype=torch.int32, device="meta")
+        starts = torch.zeros(128, 16, dtype=torch.int32, device="meta")
+        for name in ("threefry_bulk_normal", "threefry_bulk_uniform"):
+            out = fake(name)(lanes, starts, *[i32] * 4)
+            assert out.shape == (128, 16 * 4 * 512) and out.dtype == torch.float32

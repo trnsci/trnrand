@@ -74,6 +74,41 @@ simulator bit-identity against the per-tile path.
   `trnrand/nki/dispatch.py`, outside `if HAS_NKI:`, so they import and can
   be tested on hosts without NKI.
 
+#### Bulk `uniform`/`normal` run as one wide-tile kernel launch (#60)
+
+The streaming kernels held every byte of every Threefry word as a `(128, 1)`
+tile, so each NKI instruction did 128 elements of work and a 16,384-value
+launch was about 55k instructions. On Trn2 that made `normal()` linear at
+about 0.23 ms per 1k values (934 ms for 4M) no matter how launches were
+grouped. On the native path and the simulator, `threefry_stream_*` (and so
+`trnrand.uniform`, `normal` and the distributions built on them) now use
+new bulk kernels, `threefry_bulk_normal_kernel` and
+`threefry_bulk_uniform_kernel` (ops `trnrand::threefry_bulk_normal` and
+`trnrand::threefry_bulk_uniform`). They run the same byte-tile arithmetic on
+`(128, F)` tiles, with F up to 512 Threefry batches per chunk and up to 16
+unrolled chunks per launch. One launch covers up to 4,194,304 values.
+
+- Counters are built in SBUF: the column index comes from `nisa.iota` and is
+  added byte-wise to each chunk's start batch. Key words are added as float32
+  `(128, 1)` `tensor_scalar` operands (byte plus byte is at most 510, exact),
+  so the key schedule is never broadcast to `(128, F)`. Box-Muller runs in
+  the same kernel, and each chunk's four output words leave in one DMA.
+- Values and order are bit-identical to the streaming and per-tile kernels
+  for every seed, `counter_offset` and size. The counter for each element is
+  unchanged, including the 24-bit batch wrap. F and C are rounded up to
+  powers of two (F from 32 to 512, C from 1 to 16), so at most 9 NEFF shapes
+  are compiled.
+- `TRNRAND_BULK_COLS` lowers the column cap if a compiler reports SBUF
+  pressure. `TRNRAND_BULK_KERNEL=0` goes back to the 16,384-value streaming
+  kernels. The XLA path (Trn1) still uses the streaming kernels.
+- Tests: `tests/test_bulk_kernel.py` checks the wrapper against an
+  independent numpy Threefry4x32-20 plus Box-Muller reference on CPU for
+  sizes that are and aren't multiples of the tile, for multi-chunk and
+  multi-launch plans, and for partitioned generators. On the simulator it
+  checks the real kernels against the streaming kernels. Both bulk kernels
+  are added to the MLIR verifier check for trn1 and trn2
+  (`tests/test_nki_compile.py`).
+
 #### Streaming output is in per-tile order (#58)
 
 **Reproducibility break.** For a given seed and counter, the streaming
