@@ -9,7 +9,6 @@ to it — custom-op registration, no torch_xla, torch.compile, and the
 streaming program path.
 """
 
-import subprocess
 import sys
 
 import pytest
@@ -55,13 +54,14 @@ def _threefry_inputs(seed: int) -> list[torch.Tensor]:
 
 class TestNativeDispatch:
     def test_native_path_never_imports_torch_xla(self):
-        code = (
-            "import sys; from trnrand.nki.dispatch import threefry_uniform_nki, "
-            "_get_dispatch_path; threefry_uniform_nki(512, seed=1); "
-            "assert _get_dispatch_path() == 'native'; "
-            "assert 'torch_xla' not in sys.modules"
-        )
-        subprocess.run([sys.executable, "-c", code], check=True)
+        # In-process: a subprocess can't acquire NeuronCores while this pytest
+        # process holds them. Lazy registration itself is covered on CPU in
+        # tests/test_native_dispatch.py.
+        from trnrand.nki.dispatch import _get_dispatch_path, threefry_uniform_nki
+
+        threefry_uniform_nki(512, seed=1)
+        assert _get_dispatch_path() == "native"
+        assert "torch_xla" not in sys.modules
 
     def test_ops_registered_in_torch_ops(self):
         from trnrand.nki.dispatch import _get_native_ops
