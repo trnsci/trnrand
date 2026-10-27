@@ -73,6 +73,41 @@ outputs are unchanged.
   (2 tiles fit). That failure is not fixed here.
 - Not yet re-run on hardware.
 
+#### Philox output corrupted by saturating int32/uint32 casts (#56)
+
+On Trn2 hardware (Neuron SDK 2.33, NKI 0.7.0, `neuronx-cc` 2.28) every
+`philox4x32_kernel` output word was wrong: many were exactly `0x7FFFFFFF`
+and the uniform mean was about 0.33. The kernels crossed between int32 (the
+kernel input/output dtype) and uint32 (the arithmetic dtype) with
+`nl.copy(x, dtype=...)`, which is a value conversion, not a bit
+reinterpretation: uint32 values >= 2^31 saturate to `0x7FFFFFFF` and
+negative int32 values to 0. Every crossing now uses `tile.view(dtype)`, a
+bit reinterpretation with no data copied. The arithmetic is unchanged.
+
+- Philox: inputs are reinterpreted as uint32 after `nl.load`, the state and
+  key bump stay uint32 through all 10 rounds (`_mul32_hi_lo` now returns
+  uint32), and the outputs are reinterpreted as int32 at the store. This
+  removes 6 casts per round.
+- Threefry, Threefry-normal and both streaming kernels: the int32 -> uint32
+  cast in `_b_split` (counter and key words) is now a reinterpretation, so
+  words >= 2^31 are no longer read as 0. The host wrappers keep these words
+  below 2^24, so existing outputs are unchanged.
+- Streaming kernels: `nl.load(start_batch_ref, dtype=nl.uint32)` is now a
+  plain load followed by `.view(nl.uint32)`.
+- Sobol: the Gray-code load is reinterpreted rather than converted. Gray
+  codes are below 2^24, so outputs are unchanged.
+- The simulator (`nki.simulate`, NKI 0.7.0) saturated the same way, so the
+  Philox simulator tests that were xfailed as aws-neuron-sdk#1308 were in
+  fact failing on this bug. They now pass and are no longer xfailed. New
+  tests feed full-range counters and keys (top bit set) to Philox and
+  Threefry and require bit-exact output, with about half the Philox words
+  >= 2^31. They fail on the previous kernels.
+- Checked with `neuronx-cc` 2.28's BIR simulator (no device), trn2 target:
+  the previous Philox kernel matches 0 of 512 words against
+  `philox4x32_reference`, with 153 words equal to `0x7FFFFFFF` (the
+  hardware symptom), and the fixed kernel matches 512 of 512.
+- Not yet re-run on hardware.
+
 ## [0.7.1] - 2026-04-29
 
 ### Fixed

@@ -76,8 +76,16 @@ provisions. Instance auto-stops on exit.
 - **`nl.multiply` output dtype promotion.** Products that can exceed
   `INT32_MAX` (e.g., `0xFFFF * 0xD251 = 0xD2503DAF`) need explicit
   `dtype=nl.uint32` on the multiply to avoid sign extension.
-- **`nl.copy(x, dtype=...)` is the cast primitive.** NKI 0.3.0's `nl.*`
-  has neither `cast` nor `static_cast`.
+- **`nl.copy(x, dtype=...)` converts values; `.view(dtype)` reinterprets
+  bits.** `nl.copy` (and a load or store into a different dtype) is a value
+  conversion. Between `int32` and `uint32` it saturates, both on Trn2
+  hardware and in `nki.simulate`: uint32 values >= 2^31 become `0x7FFFFFFF`
+  and negative int32 values become 0. To carry a uint32 bit pattern in an
+  int32 tensor, use `tile.view(nl.uint32)` / `tile.view(nl.int32)` (NKI
+  0.7; no data is copied, like `numpy.ndarray.view`). trnrand kernels take
+  and return int32 tensors and reinterpret once at each boundary (#56).
+- **Integer `nisa.tensor_tensor` needs matching dtypes.** All operands and
+  the output must share one integer dtype (NCC_EBIR028 on hardware).
 - **trn1-specific**: `InstActivation` bias cannot be a scalar immediate
   for `Ln` — must be a vector-immediate `(P, 1)` tensor. Affects
   Box-Muller's `nl.log + scalar` fusion on trn1. trn2+ unaffected.

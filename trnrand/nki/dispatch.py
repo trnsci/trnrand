@@ -376,7 +376,7 @@ def _mul32_hi_lo_numpy(a, b_l: int, b_h: int):
         ),
     )
 
-    # Same bit pattern reinterpreted as int32 (matches NKI's nl.copy cast).
+    # Same bit pattern reinterpreted as int32 (matches the kernel's .view(nl.int32)).
     return hi32_u.astype(np.int32), lo32_u.astype(np.int32)
 
 
@@ -606,6 +606,24 @@ if HAS_NKI:
         nisa.tensor_tensor(out, x, y, op=nl.add)
         return out
 
+    # int32 <-> uint32 crossings use `.view(dtype)`, a bit reinterpretation
+    # (no data copied, like `numpy.ndarray.view`), never `nl.copy(x, dtype=...)`.
+    # `nl.copy` and dtype-converting loads/stores are VALUE conversions: on
+    # Trn2 hardware and in `nki.simulate` they saturate (uint32 >= 2^31 ->
+    # int32 0x7FFFFFFF, negative int32 -> uint32 0), which corrupted Philox,
+    # Threefry keys >= 2^31 and the streaming kernels. Kernel inputs and
+    # outputs stay int32 (torch has no general uint32 device path); the
+    # arithmetic is all uint32, so the bits are reinterpreted once at each
+    # boundary.
+
+    def _as_u32(t):
+        """Reinterpret an int32 tile's bits as uint32 (no value conversion)."""
+        return t.view(nl.uint32)
+
+    def _as_i32(t):
+        """Reinterpret a uint32 tile's bits as int32 (no value conversion)."""
+        return t.view(nl.int32)
+
     def _nki_carry_step(acc, col):
         """Extract low byte and carry, add carry to next column."""
         byte = nl.bitwise_and(acc, 0xFF, dtype=nl.uint32)
@@ -623,7 +641,7 @@ if HAS_NKI:
         )
 
     def _mul32_hi_lo(a, b_l, b_h):
-        """32×32→64 multiply returning (hi32, lo32) int32 tensors.
+        """32×32→64 multiply returning (hi32, lo32) uint32 tiles.
 
         8-bit byte decomposition:
 
@@ -638,14 +656,13 @@ if HAS_NKI:
         intermediate stays well below 2^24, avoiding the float32
         precision loss on the activation-engine multiply path.
 
-        `a` is a uint32-valued int32 tile of shape (P, 1). `b_l`, `b_h`
-        are Python-int constants (low/high 16 bits of the full 32-bit
-        multiplier).
+        `a` is a uint32 tile of shape (P, 1). `b_l`, `b_h` are Python-int
+        constants (low/high 16 bits of the full 32-bit multiplier).
         """
-        # Cast `a` to uint32 up front so the dst/src dtype match in
-        # MLIR tensor_scalar_bitvec ops. Hardware verifier rejects
+        # `a` is uint32 so the dst/src dtypes match in the MLIR
+        # tensor_scalar_bitvec ops; the hardware verifier rejects
         # src=i32/dst=ui32 mismatches.
-        a_u = nl.copy(a, dtype=nl.uint32)
+        a_u = a
         a0 = nl.bitwise_and(a_u, 0xFF, dtype=nl.uint32)
         a1 = nl.bitwise_and(nl.right_shift(a_u, 8, dtype=nl.uint32), 0xFF, dtype=nl.uint32)
         a2 = nl.bitwise_and(nl.right_shift(a_u, 16, dtype=nl.uint32), 0xFF, dtype=nl.uint32)
@@ -694,8 +711,9 @@ if HAS_NKI:
         lo32_u = _nki_pack4_u32(byte0, byte1, byte2, byte3)
         hi32_u = _nki_pack4_u32(byte4, byte5, byte6, byte7)
 
-        # Return int32 for downstream XOR — same bit pattern.
-        return nl.copy(hi32_u, dtype=nl.int32), nl.copy(lo32_u, dtype=nl.int32)
+        # Stay uint32: the Philox state is uint32 end to end and is only
+        # reinterpreted as int32 at the output store.
+        return hi32_u, lo32_u
 
     @nki.jit
     def philox4x32_kernel(counter_lo_ref, key_lo_ref, key_hi_ref):
@@ -707,12 +725,14 @@ if HAS_NKI:
         lane. The wrapper flattens to `(P*4,)` interleaved.
         """
         P = counter_lo_ref.shape[0]
-        c0 = nl.load(counter_lo_ref)
+        # Inputs are int32 bit patterns of uint32 words: reinterpret, don't
+        # convert (a value conversion saturates words >= 2^31).
+        c0 = _as_u32(nl.load(counter_lo_ref))
         c1 = nl.zeros_like(c0)
         c2 = nl.zeros_like(c0)
         c3 = nl.zeros_like(c0)
-        k0 = nl.load(key_lo_ref)
-        k1 = nl.load(key_hi_ref)
+        k0 = _as_u32(nl.load(key_lo_ref))
+        k1 = _as_u32(nl.load(key_hi_ref))
 
         # Materialize the key-bump constants as uint32 vector-immediates
         # up front. PHILOX_W0 = 0x9E3779B9 and PHILOX_W1 = 0xBB67AE85
@@ -736,16 +756,16 @@ if HAS_NKI:
             c0, c1, c2, c3 = new_c0, new_c1, new_c2, new_c3
 
             # Key bump: (k + W) mod 2^32 via the vector-immediate W.
-            k0_u = _nki_add_u32(nl.copy(k0, dtype=nl.uint32), w0_vec)
-            k1_u = _nki_add_u32(nl.copy(k1, dtype=nl.uint32), w1_vec)
-            k0 = nl.copy(k0_u, dtype=nl.int32)
-            k1 = nl.copy(k1_u, dtype=nl.int32)
+            k0 = _nki_add_u32(k0, w0_vec)
+            k1 = _nki_add_u32(k1, w1_vec)
 
-        out = nl.ndarray((P, 4), dtype=counter_lo_ref.dtype, buffer=nl.shared_hbm)
-        out[:, 0:1] = c0
-        out[:, 1:2] = c1
-        out[:, 2:3] = c2
-        out[:, 3:4] = c3
+        # int32 output holding the uint32 bit patterns (reinterpret, not
+        # a saturating uint32 -> int32 value conversion).
+        out = nl.ndarray((P, 4), dtype=nl.int32, buffer=nl.shared_hbm)
+        out[:, 0:1] = _as_i32(c0)
+        out[:, 1:2] = _as_i32(c1)
+        out[:, 2:3] = _as_i32(c2)
+        out[:, 3:4] = _as_i32(c3)
         return out
 
     @nki.jit
@@ -891,8 +911,7 @@ if HAS_NKI:
         Returns [b0, b1, b2, b3] where b0 is the least-significant byte.
         All returned tiles are uint32-typed with values ≤ 255.
         """
-        v = nl.load(v_ref)
-        v_u = nl.copy(v, dtype=nl.uint32)
+        v_u = _as_u32(nl.load(v_ref))
         b0 = nl.bitwise_and(v_u, 0xFF, dtype=nl.uint32)
         b1 = nl.bitwise_and(nl.right_shift(v_u, 8, dtype=nl.uint32), 0xFF, dtype=nl.uint32)
         b2 = nl.bitwise_and(nl.right_shift(v_u, 16, dtype=nl.uint32), 0xFF, dtype=nl.uint32)
@@ -1734,8 +1753,7 @@ if HAS_NKI:
             (P, _SOBOL_MAX_DIMS) float32 tile — Sobol coordinates in [0, 1).
         """
         P = gray_ref.shape[0]
-        g = nl.load(gray_ref)
-        g = nl.copy(g, dtype=nl.uint32)
+        g = _as_u32(nl.load(gray_ref))
 
         out = nl.ndarray((P, _SOBOL_MAX_DIMS), dtype=nl.float32, buffer=nl.shared_hbm)
 
@@ -2064,7 +2082,7 @@ if HAS_NKI:
         # Runtime start_batch loaded once from HBM; tile_idx offset added per tile.
         # Passing start_batch as a runtime arg lets the SAME NEFF serve every
         # stream_into call — the NEFF cache key depends only on shapes/dtypes.
-        start_batch_u = nl.load(start_batch_ref, dtype=nl.uint32)
+        start_batch_u = _as_u32(nl.load(start_batch_ref))
 
         # Box-Muller constants — hoisted outside the loop (compile-once into NEFF).
         inv24 = nl.full((P, 1), 1.0 / 16777216.0, dtype=nl.float32)
@@ -2250,7 +2268,7 @@ if HAS_NKI:
         c2_b = _b_from_scalar(P, 0)
         c3_b = _b_from_scalar(P, 0)
 
-        start_batch_u = nl.load(start_batch_ref, dtype=nl.uint32)
+        start_batch_u = _as_u32(nl.load(start_batch_ref))
 
         inv24 = nl.full((P, 1), 1.0 / 16777216.0, dtype=nl.float32)
         scale256 = nl.full((P, 1), 256.0, dtype=nl.float32)
