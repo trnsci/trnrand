@@ -135,6 +135,74 @@ class TestLaunchCount:
         assert torch.equal(new, old)
 
 
+class _FakeNative:
+    """Stand-in for the native path: `trnrand::` ops plus counted host↔device copies."""
+
+    def __init__(self):
+        self.launcher = _FakeLauncher()
+        self.h2d = 0
+        self.d2h = 0
+
+    def ops(self):
+        def make(name):
+            return lambda *t: self.launcher(None, name, *t)
+
+        return {n: make(n) for n in ("threefry_streaming_normal", "threefry_streaming_uniform")}
+
+    def to_device(self, t):
+        self.h2d += 1
+        return t.clone()
+
+    def to_host(self, t):
+        self.d2h += 1
+        return t.clone()
+
+
+@pytest.fixture
+def fake_native(monkeypatch):
+    nat = _FakeNative()
+    monkeypatch.setattr(dispatch, "_use_simulator", lambda: False)
+    monkeypatch.setattr(dispatch, "_get_dispatch_path", lambda: "native")
+    monkeypatch.setattr(dispatch, "_get_native_ops", nat.ops)
+    monkeypatch.setattr(dispatch, "_h2d", nat.to_device)
+    monkeypatch.setattr(dispatch, "_d2h", nat.to_host)
+    monkeypatch.setattr(dispatch, "_launch", _unexpected_launch)
+    monkeypatch.delenv("TRNRAND_BULK_STREAMING", raising=False)
+    return nat
+
+
+def _unexpected_launch(*a, **k):
+    raise AssertionError("native streaming must not go through per-launch _launch")
+
+
+class TestNativeDeviceResident:
+    """Native path: inputs copied once, outputs copied back once (#60 follow-up)."""
+
+    @pytest.mark.parametrize("n", [1, 16_384, 16_385, 100_000, 1_048_576])
+    @pytest.mark.parametrize("fn", ["normal", "uniform"])
+    def test_copy_and_launch_counts(self, fake_native, n, fn):
+        getattr(dispatch, f"threefry_{fn}_nki")(n, seed=4, counter_offset=3)
+        assert fake_native.launcher.calls == Counter(
+            {f"threefry_streaming_{fn}": _ceil(n, PER_STREAM)}
+        )
+        # c0 + 4 key words + one (launches, P, 1) start_batch tensor; one copy back.
+        assert fake_native.h2d == 6
+        assert fake_native.d2h == 1
+
+    @pytest.mark.parametrize("n", [1, 513, 16_385, 50_000, 100_000])
+    @pytest.mark.parametrize("seed,offset", [(0, 0), (12345, 7), (999, 2**24 - 5)])
+    def test_bit_identical_to_per_tile(self, fake_native, monkeypatch, n, seed, offset):
+        new_z = dispatch.threefry_normal_nki(n, seed=seed, counter_offset=offset)
+        new_u = dispatch.threefry_uniform_nki(n, seed=seed, counter_offset=offset)
+        # Per-tile reference through the XLA-style `_launch` stand-in.
+        monkeypatch.setattr(dispatch, "_launch", _FakeLauncher())
+        monkeypatch.setattr(dispatch, "_get_dispatch_path", lambda: "xla")
+        old_z = dispatch._threefry_normal_per_tile(n, seed=seed, counter_offset=offset)
+        old_u = dispatch._threefry_uniform_per_tile(n, seed=seed, counter_offset=offset)
+        assert torch.equal(new_z, old_z)
+        assert torch.equal(new_u, old_u)
+
+
 class TestBulkStreamingGate:
     @pytest.fixture(autouse=True)
     def _clean(self, monkeypatch):

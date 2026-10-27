@@ -119,6 +119,24 @@ class TestNativeDispatch:
         # wrapper for the same seed/offset (#58).
         torch.testing.assert_close(z, _threefry_normal_per_tile(n, seed=5), rtol=0, atol=0)
 
+    @pytest.mark.parametrize("n,seed,offset", [(16_385, 3, 0), (3 * 16_384 + 100, 21, 7)])
+    def test_bulk_multi_launch_matches_per_tile(self, n, seed, offset):
+        # Bulk wrappers stream with device-resident inputs indexed per launch and
+        # one stacked copy back (#60); values/order must equal the per-tile path.
+        from trnrand.nki.dispatch import (
+            _threefry_normal_per_tile,
+            _threefry_uniform_per_tile,
+            threefry_normal_nki,
+            threefry_uniform_nki,
+        )
+
+        z = threefry_normal_nki(n, seed=seed, counter_offset=offset)
+        torch.testing.assert_close(
+            z, _threefry_normal_per_tile(n, seed=seed, counter_offset=offset), rtol=0, atol=0
+        )
+        u = threefry_uniform_nki(n, seed=seed, counter_offset=offset)
+        assert torch.equal(u, _threefry_uniform_per_tile(n, seed=seed, counter_offset=offset))
+
     def test_partitioned_program_concatenates_to_single_chip(self):
         import trnrand
 

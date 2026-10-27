@@ -58,6 +58,14 @@ seed and `counter_offset` (#58). Tests: CPU launch-count and bit-identity
 tests with a stand-in launcher (`tests/test_launch_granularity.py`), and
 simulator bit-identity against the per-tile path.
 
+- On the native path the streaming launches keep their inputs and outputs
+  on the device. The lane-index and key inputs are copied to the device
+  once per call, the start-batch inputs for all launches are copied once as
+  one `(launches, 128, 1)` tensor, and the per-launch outputs are stacked on
+  the device and copied back in one transfer: 6 host-to-device copies and 1
+  device-to-host copy per call instead of 6 and 1 per launch. Measured on
+  Trn2 before this step: `normal(4M)` went from 9.2 s to 1.6 s with
+  multi-tile launches alone.
 - The per-tile wrappers are kept as `_threefry_uniform_per_tile` /
   `_threefry_normal_per_tile`. They are still used on the XLA path when
   `neuronx-cc` is older than 2.28, where the streaming kernels hit SBUF OOM
