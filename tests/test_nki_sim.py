@@ -52,6 +52,7 @@ from trnrand.nki.dispatch import (  # noqa: E402
     box_muller_cpu,
     philox4x32_reference,
     philox_uniform_cpu,
+    sobol_reference,
     threefry4x32_reference,
     threefry_uniform_cpu,
 )
@@ -70,6 +71,12 @@ try:
 except ImportError:
     threefry4x32_kernel = None
     threefry_normal_kernel = None
+
+try:
+    from trnrand.nki.dispatch import sobol_gray_code_kernel, sobol_nki  # noqa: E402
+except ImportError:
+    sobol_gray_code_kernel = None
+    sobol_nki = None
 
 _PHILOX_LANES_PER_TILE = 128
 _THREEFRY_LANES = 128
@@ -437,3 +444,28 @@ def test_threefry_normal_kernel_distribution():
     z = out_np.reshape(-1)
     assert abs(float(z.mean())) < 0.2
     assert abs(float(z.std()) - 1.0) < 0.2
+
+
+# ── Sobol conformance via nki.simulate (#59) ───────────────────────────────
+
+
+def test_sobol_kernel_matches_reference():
+    """Full 128-lane tile, all 10 dims: simulator must bit-match the CPU reference."""
+    import nki
+
+    idx = np.arange(128, dtype=np.int32)
+    gray = (idx ^ (idx >> 1)).reshape(-1, 1)
+    out = np.asarray(nki.simulate(sobol_gray_code_kernel)(gray))
+    np.testing.assert_array_equal(out, sobol_reference(128, 10).numpy())
+
+
+@pytest.mark.parametrize("start_index", [0, 256])
+def test_sobol_nki_matches_sobol_engine(start_index):
+    """sobol_nki (unscrambled) equals SobolEngine's top 24 bits in every dim."""
+    n = 256
+    engine = torch.quasirandom.SobolEngine(10, scramble=False)
+    engine.fast_forward(start_index)
+    expected = (engine.draw(n, dtype=torch.float64) * 2.0**30).round().long() >> 6
+    got = sobol_nki(n, 10, seed=0, start_index=start_index)
+    got_int = (got.double() * 2.0**24).round().long()
+    assert torch.equal(got_int, expected)

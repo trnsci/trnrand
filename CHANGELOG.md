@@ -131,6 +131,32 @@ bit reinterpretation with no data copied. The arithmetic is unchanged.
   hardware symptom), and the fixed kernel matches 512 of 512.
 - Not yet re-run on hardware.
 
+#### NKI Sobol differs from SobolEngine in dimensions 2-5 (#59)
+
+The unscrambled NKI Sobol output (`sobol_nki`, `sobol()` with the NKI
+backend) did not match `torch.quasirandom.SobolEngine` in dimension
+indices 2-5 (Joe-Kuo dimensions 3-6). The initial direction numbers
+`m_init` for those four rows of the table in `_init_sobol_directions` were
+wrong (for example `[1, 1]` instead of `[1, 3]` for index 2). The primitive
+polynomials and the Gray-code recurrence were correct. The rows now match
+Joe-Kuo `new-joe-kuo-6.21201`, the table SobolEngine uses, and all 10
+dimensions equal the top 24 bits of SobolEngine's output. Dimensions 0, 1
+and 6-9 are unchanged.
+
+- The CPU `sobol()` path was not affected: it calls SobolEngine.
+- The direction-vector table and a new CPU reference, `sobol_reference`,
+  are now at module level in `trnrand/nki/dispatch.py`, so CPU-only
+  installs can check them. `tests/test_quasi.py` compares the table with
+  `SobolEngine.sobolstate` and `sobol_reference` with SobolEngine (after
+  `fast_forward`) for every dimension. Both tests fail on the old table.
+- Simulator tests (`tests/test_nki_sim.py`) check the kernel against
+  `sobol_reference` and `sobol_nki` against SobolEngine for all 10
+  dimensions, including a nonzero `start_index`.
+- `TestSobolNKI.test_start_index_advances_sequence` called the public
+  `sobol()` with `start_index`, which `sobol()` has never accepted. It now
+  calls `sobol_nki`, which has the parameter. `test_conformance_vs_cpu` now
+  checks all 10 dimensions instead of 3.
+
 ## [0.7.1] - 2026-04-29
 
 ### Fixed

@@ -100,18 +100,23 @@ class TestSobolNKI:
         assert not torch.equal(a, b)
 
     def test_start_index_advances_sequence(self):
-        """start_index shifts the Sobol sequence forward."""
-        set_backend("nki")
-        full = sobol(512, 2, seed=0)
-        tail = sobol(256, 2, seed=0, start_index=256)
-        assert torch.allclose(full[256:], tail, atol=1e-6)
+        """start_index shifts the Sobol sequence forward.
+
+        start_index is a parameter of the NKI wrapper ``sobol_nki``; the
+        public ``sobol()`` does not take it (#59).
+        """
+        from trnrand.nki.dispatch import sobol_nki
+
+        full = sobol_nki(512, 2, seed=0)
+        tail = sobol_nki(256, 2, seed=0, start_index=256)
+        assert torch.equal(full[256:], tail)
 
     def test_conformance_vs_cpu(self):
-        """NKI output matches CPU Sobol output (without scrambling)."""
+        """NKI output matches CPU Sobol output (without scrambling), all dims."""
         set_backend("nki")
-        nki_out = sobol(256, 3, seed=0)
+        nki_out = sobol(256, 10, seed=0)
         set_backend("pytorch")
-        cpu_out = sobol(256, 3, seed=0, scramble=False)
+        cpu_out = sobol(256, 10, seed=0, scramble=False)
         # NKI uses Van der Corput / Joe-Kuo; CPU uses PyTorch SobolEngine.
         # Without scrambling, both should produce identical sequences.
         assert torch.allclose(nki_out, cpu_out, atol=1e-5)

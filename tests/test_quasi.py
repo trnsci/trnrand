@@ -74,3 +74,37 @@ class TestLatinHypercube:
         for d in range(2):
             bins = (x[:, d] * n).long()
             assert len(torch.unique(bins)) == n
+
+
+class TestSobolNKITables:
+    """CPU checks of the NKI Sobol direction vectors against SobolEngine (#59).
+
+    The NKI kernel uses 24-bit direction vectors; SobolEngine uses 30-bit ones
+    (``sobolstate``). The 24-bit vectors must equal the top 24 bits of
+    SobolEngine's for every supported dimension, so the unscrambled sequences
+    agree bit-for-bit in those 24 bits.
+    """
+
+    def test_direction_vectors_match_sobol_engine(self):
+        from trnrand.nki.dispatch import _SOBOL_BITS, _SOBOL_DIR_VECS, _SOBOL_MAX_DIMS
+
+        engine = torch.quasirandom.SobolEngine(_SOBOL_MAX_DIMS, scramble=False)
+        state = engine.sobolstate  # (dims, 30) int64
+        shift = state.shape[1] - _SOBOL_BITS
+        for d in range(_SOBOL_MAX_DIMS):
+            expected = [int(v) >> shift for v in state[d, :_SOBOL_BITS]]
+            assert list(_SOBOL_DIR_VECS[d]) == expected, f"dimension {d} differs"
+
+    @pytest.mark.parametrize("start_index", [0, 1, 256, 1000])
+    def test_reference_matches_sobol_engine(self, start_index):
+        from trnrand.nki.dispatch import _SOBOL_BITS, _SOBOL_MAX_DIMS, sobol_reference
+
+        n = 512
+        engine = torch.quasirandom.SobolEngine(_SOBOL_MAX_DIMS, scramble=False)
+        engine.fast_forward(start_index)
+        # float64 draw is exact: 30-bit integers scaled by 2^-30.
+        exact = engine.draw(n, dtype=torch.float64)
+        expected = (exact * 2.0**30).round().long() >> (30 - _SOBOL_BITS)
+        got = sobol_reference(n, _SOBOL_MAX_DIMS, start_index=start_index)
+        got_int = (got.double() * 2.0**_SOBOL_BITS).round().long()
+        assert torch.equal(got_int, expected)
