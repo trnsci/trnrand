@@ -155,19 +155,25 @@ class TestNeffCacheReuse:
     """
 
     @nki_only
-    def test_second_call_under_100ms(self):
-        """Second stream_into must be < 100ms (NEFF cache hit)."""
+    def test_second_call_hits_neff_cache(self):
+        """Second stream_into must not recompile (NEFF cache hit).
+
+        Relative to the cold call: a warm 1M-normal stream is ~60 native launches
+        of real work, so the old absolute 100 ms bound only held on the XLA path.
+        """
         prog = ProgramBuilder(seed=0).normal(1_000_000, out="z").build()
         z = torch.empty(1_000_000)
 
+        t0 = time.perf_counter()
         prog.stream_into({"z": z})  # may trigger compilation
+        cold_ms = (time.perf_counter() - t0) * 1_000
 
         t0 = time.perf_counter()
         prog.stream_into({"z": z})
-        elapsed_ms = (time.perf_counter() - t0) * 1_000
+        warm_ms = (time.perf_counter() - t0) * 1_000
 
-        assert elapsed_ms < 100, (
-            f"Second stream_into took {elapsed_ms:.1f}ms — expected NEFF cache hit (< 100ms)"
+        assert warm_ms < 0.25 * cold_ms, (
+            f"Second stream_into took {warm_ms:.1f}ms vs cold {cold_ms:.1f}ms — NEFF cache miss?"
         )
 
     @nki_only
