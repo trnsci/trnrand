@@ -43,6 +43,29 @@ are unchanged.
   `@pytest.mark.neuron` native-path tests for Trn2 (not yet run on
   hardware).
 
+### Changed
+
+#### Streaming output is in per-tile order (#58)
+
+**Reproducibility break.** For a given seed and counter, the streaming
+generators (`threefry_stream_normal`, `threefry_stream_uniform`, and
+everything built on them: `GeneratorProgram.stream_into`, the in-place
+`*_into` distributions on the NKI path, and the partitioned multi-chip
+paths) now return values in a different order than before. The values
+drawn are unchanged; only their order changes.
+
+- Streams now match the per-tile path (`threefry_normal_nki`,
+  `threefry_uniform_nki`) element for element for the same seed and
+  counter offset: all 128 lanes of counter batch 0, then batch 1, and so
+  on. Before, each 16,384-element launch was flattened lane-major
+  (`(P, tiles, 4)`) instead of tile-major (`(tiles, P, 4)`).
+- The fix is a host-side permute after each launch
+  (`_stream_tile_order` in `trnrand/nki/dispatch.py`). The kernels are
+  unchanged.
+- Partitioned streams still concatenate to the single-chip result.
+- Checked on the NKI simulator. The Trn2 run of
+  `TestHardwareBitExact` and the native-path program test is pending.
+
 ### Fixed
 
 #### NKI kernels fail to compile on neuronxcc 2.26 / NKI 0.5+ (#56)

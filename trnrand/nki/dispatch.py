@@ -404,6 +404,21 @@ THREEFRY_ROTATIONS = [(10, 26), (11, 21), (13, 27), (23, 5)]
 # import it for test parameterisation without requiring neuronxcc.
 _PROGRAM_TILES = 32  # tiles per streaming launch; 32 × 128 × 4 = 16,384 samples/call
 
+
+def _stream_tile_order(out: torch.Tensor) -> torch.Tensor:
+    """Flatten one streaming launch's (P, 4 × _PROGRAM_TILES) output in per-tile order.
+
+    The streaming kernels write tile T's four words for lane p to
+    out[p, 4T : 4T + 4], so a row-major flatten yields (P, tiles, 4) order. The
+    per-tile wrappers (threefry_normal_nki / threefry_uniform_nki) emit
+    (tiles, P, 4): all lanes of batch 0, then batch 1, and so on. Permuting on the
+    host makes a stream element-for-element identical to the per-tile path for the
+    same seed and counter_offset (#58). Module-level so it is testable without NKI.
+    """
+    lanes = out.shape[0]
+    return out.reshape(lanes, _PROGRAM_TILES, 4).permute(1, 0, 2).contiguous().reshape(-1)
+
+
 # Normal-approximation threshold for Poisson NKI path.
 # For lam >= 20, skewness 1/sqrt(lam) <= 0.22 and the normal approximation
 # round(N(lam, sqrt(lam))) produces tail probabilities within ~1% of exact.
@@ -2391,6 +2406,9 @@ if HAS_NKI:
         both use the same seed and counter_offset. Launch L tile T uses
         c1 = (counter_offset + L*_PROGRAM_TILES + T) & 0xFFFFFF, matching the per-tile
         wrapper's c1 = (batch + counter_offset) & 0xFFFFFF at batch = L*_PROGRAM_TILES + T.
+        Each launch's output is flattened in per-tile (tiles, P, 4) order by
+        _stream_tile_order, so the stream equals the per-tile output element-for-element
+        (#58).
         """
         LANES = _THREEFRY_LANES
         NORMALS_PER_LAUNCH = _PROGRAM_TILES * LANES * 4  # 32 × 128 × 4 = 16,384
@@ -2415,7 +2433,7 @@ if HAS_NKI:
                 out_np = nki.simulate(threefry_streaming_normal_kernel)(
                     c0_np, start_batch_np, k0_np, k1_np, k2_np, k3_np
                 )
-                out_tile = torch.from_numpy(np.asarray(out_np).reshape(-1))
+                out_tile = torch.from_numpy(np.asarray(out_np))
             else:
                 out_tile = _launch(
                     threefry_streaming_normal_kernel,
@@ -2424,8 +2442,8 @@ if HAS_NKI:
                         torch.from_numpy(a)
                         for a in (c0_np, start_batch_np, k0_np, k1_np, k2_np, k3_np)
                     ),
-                ).reshape(-1)
-            chunks.append(out_tile)
+                )
+            chunks.append(_stream_tile_order(out_tile))
 
         result = torch.cat(chunks) if len(chunks) > 1 else chunks[0]
         return result.float()[:n_elements]
@@ -2440,6 +2458,8 @@ if HAS_NKI:
         Same launch/counter scheme as threefry_stream_normal; 16,384 uniforms per
         XLA call, ~31× fewer round-trips than the per-tile threefry_uniform_nki
         for large n.
+        Output is in per-tile order, element-for-element equal to
+        threefry_uniform_nki for the same seed and counter_offset (#58).
         """
         LANES = _THREEFRY_LANES
         UNIFORMS_PER_LAUNCH = _PROGRAM_TILES * LANES * 4  # 32 × 128 × 4 = 16,384
@@ -2464,7 +2484,7 @@ if HAS_NKI:
                 out_np = nki.simulate(threefry_streaming_uniform_kernel)(
                     c0_np, start_batch_np, k0_np, k1_np, k2_np, k3_np
                 )
-                out_tile = torch.from_numpy(np.asarray(out_np).reshape(-1))
+                out_tile = torch.from_numpy(np.asarray(out_np))
             else:
                 out_tile = _launch(
                     threefry_streaming_uniform_kernel,
@@ -2473,8 +2493,8 @@ if HAS_NKI:
                         torch.from_numpy(a)
                         for a in (c0_np, start_batch_np, k0_np, k1_np, k2_np, k3_np)
                     ),
-                ).reshape(-1)
-            chunks.append(out_tile)
+                )
+            chunks.append(_stream_tile_order(out_tile))
 
         result = torch.cat(chunks) if len(chunks) > 1 else chunks[0]
         return result.float()[:n_elements]
