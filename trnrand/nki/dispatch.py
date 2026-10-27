@@ -2600,41 +2600,65 @@ def _stream_result(outs, n_elements):
     return result.float()[:n_elements]
 
 
-def _stream_inputs_from_state(state: torch.Tensor, n_launches: int):
-    """Streaming-kernel inputs built with torch ops from a (seed, counter_offset) tensor.
+def _stream_inputs(key_words: torch.Tensor, offset: torch.Tensor, n_launches: int):
+    """Streaming-kernel inputs built with torch ops from tensor key and counter.
 
     Tensor-valued twin of the numpy setup in `_stream_launches`, value for value:
-    c0 = lane index, k0 = seed & 0xFFFFFF, k1 = (seed >> 24) & 0xFFFFFF,
-    k2 = k3 = 0, start_batch[L] = (counter_offset + L × _PROGRAM_TILES) & 0xFFFFFF.
-    Keeping the seed and offset in a tensor means torch.compile neither bakes
-    them into the graph as constants nor recompiles per call (#61).
+    c0 = lane index, (k0, k1) = `key_words` (int32, each < 2^24), k2 = k3 = 0,
+    start_batch[L] = (offset + L × _PROGRAM_TILES) & 0xFFFFFF. `offset` is a 0-d
+    integer tensor. Only plain aten ops, so the neuron backend can lower them,
+    and the key and offset stay graph inputs rather than baked-in constants (#61).
+    Arithmetic after the first mask is int32 (values < 2^25).
     """
     LANES = _THREEFRY_LANES
-    state = state.to(torch.int64)
-    seed, offset = state[0], state[1]
     c0 = torch.arange(LANES, dtype=torch.int32).reshape(-1, 1)
-
-    def word(v):
-        return v.to(torch.int32).reshape(1, 1).expand(LANES, 1).contiguous()
-
+    kw = key_words.to(torch.int32).reshape(1, 2).expand(LANES, 2)
     zero = torch.zeros(LANES, 1, dtype=torch.int32)
-    k = [word(seed & 0xFFFFFF), word((seed >> 24) & 0xFFFFFF), zero, zero.clone()]
-    starts = (offset + torch.arange(n_launches, dtype=torch.int64) * _PROGRAM_TILES) & 0xFFFFFF
-    sb = starts.to(torch.int32).reshape(-1, 1, 1).expand(n_launches, LANES, 1).contiguous()
+    k = [kw[:, 0:1].contiguous(), kw[:, 1:2].contiguous(), zero, zero.clone()]
+    base = (offset & 0xFFFFFF).to(torch.int32)
+    starts = (base + torch.arange(n_launches, dtype=torch.int32) * _PROGRAM_TILES) & 0xFFFFFF
+    sb = starts.reshape(-1, 1, 1).expand(n_launches, LANES, 1).contiguous()
     return c0, sb, k
 
 
-def threefry_stream_from_state(kind: str, n_elements: int, state: torch.Tensor) -> torch.Tensor:
-    """torch.compile-traceable native streaming draw (#61).
+def _stream_inputs_from_state(state: torch.Tensor, n_launches: int):
+    """`_stream_inputs` from an int64 (seed, counter_offset) tensor (key_mode="draw")."""
+    state = state.to(torch.int64)
+    seed = state[0]
+    key_words = torch.stack([seed & 0xFFFFFF, (seed >> 24) & 0xFFFFFF])
+    return _stream_inputs(key_words, state[1], n_launches)
 
-    `state` is the int64 tensor (seed, counter_offset) produced by the
-    `trnrand::gen_nki_state` op. Same launches and values as
-    `threefry_stream_{kind}(n_elements, seed, counter_offset)` on the native path;
-    the host setup is torch ops instead of numpy so Dynamo keeps it in the graph.
-    """
+
+def _n_stream_launches(n_elements: int) -> int:
     per_launch = _PROGRAM_TILES * _THREEFRY_LANES * 4
-    n_launches = max(1, (n_elements + per_launch - 1) // per_launch)
+    return max(1, (n_elements + per_launch - 1) // per_launch)
+
+
+def threefry_stream_from_state(kind: str, n_elements: int, state: torch.Tensor) -> torch.Tensor:
+    """torch.compile-traceable native streaming draw from a (seed, offset) tensor (#61).
+
+    `state` is the int64 tensor produced by the `trnrand::gen_nki_state` op
+    (key_mode="draw"; CPU compile backends only, see `trnrand/_compile.py`).
+    Same launches and values as `threefry_stream_{kind}(n_elements, seed,
+    counter_offset)` on the native path.
+    """
+    n_launches = _n_stream_launches(n_elements)
     c0, sb, k = _stream_inputs_from_state(state, n_launches)
+    outs = _native_stream(f"threefry_streaming_{kind}", n_launches, c0, sb, k)
+    return _stream_result(outs, n_elements)
+
+
+def threefry_stream_from_key(
+    kind: str, n_elements: int, key_words: torch.Tensor, offset: torch.Tensor
+) -> torch.Tensor:
+    """Native streaming draw from tensor key words and counter offset (#61).
+
+    Pure aten ops plus the `trnrand::threefry_streaming_*` nki_op launches, so it
+    lowers on `torch.compile(backend="neuron")`. Same values as
+    `threefry_stream_{kind}(n_elements, seed=k0 | k1 << 24, counter_offset=offset)`.
+    """
+    n_launches = _n_stream_launches(n_elements)
+    c0, sb, k = _stream_inputs(key_words, offset, n_launches)
     outs = _native_stream(f"threefry_streaming_{kind}", n_launches, c0, sb, k)
     return _stream_result(outs, n_elements)
 

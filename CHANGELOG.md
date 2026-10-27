@@ -121,13 +121,32 @@ Generator. `torch.compiler.disable` is not a fix under `fullgraph=True`.
   shares the launch/copy code with the eager wrapper.
 - Eager calls are unchanged. Compiled output is bit-identical to eager for
   every seed, and the generator ends in the same state.
-- `Generator` gains a private `_handle` (registry lookup) and
-  `_compile_token`. Needs PyTorch 2.4+ (`torch.library.custom_op`); older
+- `backend="neuron"` lowers the whole graph to StableHLO and rejects any
+  custom op that is not an `nki_op` kernel, so the `gen_*` ops only serve the
+  CPU compile backends (eager / aot_eager / inductor). The default per-call
+  NKI key is a `torch.randint` on the Generator's Mersenne Twister, which has
+  no in-graph aten equivalent, so it cannot lower without changing the stream.
+  New opt-in `Generator(key_mode="counter")` (or `TRNRAND_KEY_MODE=counter`):
+  the Threefry key is fixed by the seed (64-bit seed folded to 48 bits,
+  k0/k1) and only the counter advances between calls. The counter is now a
+  0-d tensor on the Generator (`_counter` stays as the int view), so on the
+  native path the compiled draw is plain aten ops plus the `nki_op` launches
+  (`dispatch.threefry_stream_from_key`), advancing the counter with an
+  in-place `add_`. **`key_mode="counter"` gives a different stream from the
+  default `"draw"`** (same seed, different values) and does not consume the
+  host `torch.Generator`; the default is unchanged. It applies to
+  `uniform` / `normal` / `standard_normal`; other distributions still draw
+  their key. The PyTorch-backend path (`set_backend("pytorch")`) remains
+  non-lowerable on `neuron`.
+- `Generator` gains a public `key_mode` and private `_handle` (registry
+  lookup), `_compile_token`, `_ctr` and `_key_words`. Needs PyTorch 2.4+ (`torch.library.custom_op`); older
   PyTorch keeps the previous behaviour.
 - Tests: `tests/test_torch_compile.py` (CPU: `backend="eager"`, zero graph
   breaks via `torch._dynamo.explain`, compiled == eager for fixed seeds on the
-  PyTorch, native-NKI (CPU stand-in kernels) and per-tile NKI paths; plus a
-  `neuron`-marked `backend="neuron"` check).
+  PyTorch, native-NKI (CPU stand-in kernels) and per-tile NKI paths, in both
+  key modes; the AOT ATen graph in counter mode contains only aten ops and
+  the kernel ops; plus a `neuron`-marked `backend="neuron"` check using
+  `key_mode="counter"`).
 
 #### NKI kernels fail to compile on neuronxcc 2.26 / NKI 0.5+ (#56)
 

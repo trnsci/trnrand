@@ -24,6 +24,21 @@ output is unused (which would skip a state advance) nor reorder or CSE draws.
 - ``trnrand::gen_nki_draw``   NKI path where the launches are not traceable
   (XLA lineage, simulator, per-tile kernels): the whole eager draw, opaque.
 
+Lowering limits. ``backend="neuron"`` lowers the whole FX graph to StableHLO;
+only aten ops and ``torch_neuronx.nki_op`` kernels survive, so the ``gen_*``
+ops above fail there ("failed to legalize operation 'torch.operator'"). They
+serve the CPU compile backends (eager / aot_eager / inductor). For
+``backend="neuron"``, use a ``Generator(key_mode="counter")`` (or
+``TRNRAND_KEY_MODE=counter``): the Threefry key is fixed by the seed and only
+the counter advances, held as tensors on the Generator (``_key_words``,
+``_ctr``), so the native draw is plain aten ops plus the nki_op launches, with
+the counter advanced by an in-place ``add_`` (functionalized as an input
+mutation). The default ``key_mode="draw"`` derives each call's key from a
+``torch.randint`` on the Generator's Mersenne Twister, which has no aten-op
+equivalent in a graph, so it cannot lower on neuron without changing the
+stream. The PyTorch-backend path (``set_backend("pytorch")``) is likewise not
+lowerable on neuron.
+
 ``torch.library.custom_op`` needs PyTorch 2.4+; on older PyTorch ``AVAILABLE`` is
 False and callers keep the eager code (which graph-breaks as before).
 """
@@ -32,7 +47,7 @@ from __future__ import annotations
 
 import torch
 
-from .generator import _lookup
+from .generator import _BATCH_SIZE, _lookup
 
 AVAILABLE = hasattr(torch.library, "custom_op")
 
@@ -105,6 +120,14 @@ def nki_draw(gen, kind: str, n_elements: int) -> torch.Tensor:
         and not dispatch._use_simulator()
         and dispatch._bulk_streaming()
     )
+    if native and gen._key_mode == "counter":
+        # Lowerable on backend="neuron": plain aten ops on the generator's tensor
+        # counter and key words, plus the nki_op launches. No trnrand custom op.
+        n_batches = -(-n_elements // _BATCH_SIZE)
+        offset = gen._ctr + gen._partition_rank * n_batches
+        out = dispatch.threefry_stream_from_key(kind, n_elements, gen._key_words, offset)
+        gen._ctr.add_(n_batches)
+        return out
     if native:
         state = torch.ops.trnrand.gen_nki_state(gen._compile_token, gen._handle, n_elements)
         return dispatch.threefry_stream_from_state(kind, n_elements, state)

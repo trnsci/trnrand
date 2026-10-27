@@ -18,6 +18,8 @@ test at the bottom.
 
 from __future__ import annotations
 
+import operator
+
 import numpy as np
 import pytest
 import torch
@@ -181,9 +183,11 @@ _FAKE_OPS = {
 }
 
 
-def _partitioned(seed, rank=0, size=1, advance=0):
+def _partitioned(seed, rank=0, size=1, advance=0, key_mode="draw"):
     def make():
-        g = trnrand.Generator(seed=seed, partition_rank=rank, partition_size=size)
+        g = trnrand.Generator(
+            seed=seed, partition_rank=rank, partition_size=size, key_mode=key_mode
+        )
         g.advance(advance)
         return g
 
@@ -195,6 +199,12 @@ GENS = [
     _partitioned(42),
     _partitioned(12345, rank=2, size=4),
     _partitioned(7, advance=(2**24 - 3) * 512),  # start_batch wraps at 2^24
+]
+COUNTER_GENS = [
+    _partitioned(0, key_mode="counter"),
+    _partitioned(42, key_mode="counter"),
+    _partitioned(2**40 + 12345, rank=2, size=4, key_mode="counter"),  # k1 != 0
+    _partitioned(7, advance=(2**24 - 3) * 512, key_mode="counter"),
 ]
 
 
@@ -293,17 +303,104 @@ class TestNonNativeNkiPath:
         assert (graphs, breaks) == (1, 0), reasons
 
 
+class TestCounterKeyMode:
+    """key_mode="counter": the draw lowerable on backend="neuron" (#61 round 2)."""
+
+    def test_default_is_draw(self, monkeypatch):
+        monkeypatch.delenv("TRNRAND_KEY_MODE", raising=False)
+        assert trnrand.Generator(seed=1).key_mode == "draw"
+        monkeypatch.setenv("TRNRAND_KEY_MODE", "counter")
+        assert trnrand.Generator(seed=1).key_mode == "counter"
+        with pytest.raises(ValueError):
+            trnrand.Generator(seed=1, key_mode="bogus")
+
+    @pytest.mark.parametrize("seed", [0, 7, 2**24 + 5, 2**40 + 12345, 2**63 + 9])
+    def test_key_words(self, seed):
+        g = trnrand.Generator(seed=seed, key_mode="counter")
+        k = (seed & (2**48 - 1)) ^ (seed >> 48)
+        assert g._key48 == k
+        assert g._key_words.tolist() == [k & 0xFFFFFF, (k >> 24) & 0xFFFFFF]
+        g.manual_seed(3)
+        assert g._key_words.tolist() == [3, 0]
+
+    def test_eager_stream(self, nki_native):
+        g = trnrand.Generator(seed=2**30 + 99, key_mode="counter")
+        torch_state = g.get_state().clone()
+        a, b = trnrand.normal(1000, generator=g), trnrand.normal(1000, generator=g)
+        # Fixed key, counter advances by ceil(1000 / 512) = 2 batches per call.
+        assert torch.equal(a, dispatch.threefry_stream_normal(1000, g._key48, 0))
+        assert torch.equal(b, dispatch.threefry_stream_normal(1000, g._key48, 2))
+        assert torch.equal(g.get_state(), torch_state)  # host RNG untouched
+        assert g.position() == 4 * 512
+
+    @pytest.mark.parametrize("name", list(FNS))
+    @pytest.mark.parametrize("make_gen", COUNTER_GENS)
+    @pytest.mark.parametrize("n", [1, 513, 16_385, 50_000])
+    def test_matches_eager(self, nki_native, name, make_gen, n):
+        _assert_compiles_like_eager(make_gen, lambda g: FNS[name](g, n))
+
+    @pytest.mark.parametrize("name", ["normal", "uniform"])
+    def test_zero_graph_breaks(self, nki_native, name):
+        g = trnrand.Generator(seed=0, key_mode="counter")
+        graphs, breaks, reasons = _breaks(lambda: FNS[name](g, 20_000))
+        assert (graphs, breaks) == (1, 0), reasons
+
+    def test_aten_graph_has_only_aten_and_kernel_ops(self, nki_native):
+        """What backend="neuron" lowers: no trnrand custom op except the nki_op kernels."""
+        from torch._dynamo.backends.common import aot_autograd
+
+        targets = []
+
+        def fw(gm, example_inputs):
+            targets.extend(n.target for n in gm.graph.nodes if n.op == "call_function")
+            return gm
+
+        g = trnrand.Generator(seed=5, key_mode="counter")
+
+        def fn():
+            return trnrand.normal(40_000, generator=g) + trnrand.uniform(40_000, generator=g)
+
+        ref_g = trnrand.Generator(seed=5, key_mode="counter")
+        ref = trnrand.normal(40_000, generator=ref_g) + trnrand.uniform(40_000, generator=ref_g)
+        got = torch.compile(fn, backend=aot_autograd(fw_compiler=fw), fullgraph=True)()
+        assert torch.equal(got, ref) and g.position() == ref_g.position()
+
+        kernels = {"stream_normal", "stream_uniform"}
+        bad = []
+        for t in targets:
+            ns = getattr(t, "namespace", None)
+            if t is operator.getitem or ns == "aten":
+                continue
+            if ns == "trnrand_test" and t._opname in kernels:
+                continue
+            bad.append(str(t))
+        assert not bad, bad
+        assert sum(getattr(t, "namespace", None) == "trnrand_test" for t in targets) == 6
+
+    @pytest.mark.parametrize("be", ["aot_eager", "inductor"])
+    def test_unused_draw_still_advances(self, nki_native, be):
+        g_e = trnrand.Generator(seed=5, key_mode="counter")
+        g_c = trnrand.Generator(seed=5, key_mode="counter")
+        cf = torch.compile(lambda: _unused_draw(g_c), backend=be, fullgraph=True)
+        for _ in range(2):
+            assert torch.equal(cf(), _unused_draw(g_e))
+        assert g_c.position() == g_e.position()
+
+
 @pytest.mark.neuron
 @pytest.mark.parametrize("name", ["normal", "uniform"])
 def test_neuron_backend_fullgraph(name):
-    """Trn2: torch.compile(backend="neuron", fullgraph=True) matches eager (#61)."""
+    """Trn2: torch.compile(backend="neuron", fullgraph=True) on the native NKI path.
+
+    Needs key_mode="counter": the default "draw" mode's per-call key comes from
+    the host Mersenne Twister and cannot lower to StableHLO (#61).
+    """
     pytest.importorskip("torch_neuronx")
+    assert dispatch._get_dispatch_path() == "native"
     n = 512 * 512
-    trnrand.manual_seed(0)
-    ref = FNS[name](None, n)
-    torch._dynamo.reset()
-    trnrand.manual_seed(0)
-    got = torch.compile(
-        lambda: FNS[name](None, n), backend="neuron", fullgraph=True, dynamic=False
-    )()
-    assert torch.equal(got.cpu(), ref.cpu())
+    g_e = trnrand.Generator(seed=0, key_mode="counter")
+    g_c = trnrand.Generator(seed=0, key_mode="counter")
+    cf = torch.compile(lambda: FNS[name](g_c, n), backend="neuron", fullgraph=True, dynamic=False)
+    for _ in range(2):  # second call: counter advanced in-graph, no recompile
+        assert torch.equal(cf().cpu(), FNS[name](g_e, n).cpu())
+    assert g_c.position() == g_e.position()

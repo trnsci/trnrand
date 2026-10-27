@@ -59,7 +59,8 @@ def _nki_draw_eager(kind: str, gen: Generator, n: int) -> torch.Tensor:
     from .nki.dispatch import threefry_normal_nki, threefry_uniform_nki
 
     fn = threefry_uniform_nki if kind == "uniform" else threefry_normal_nki
-    seed = _nki_seed(gen)
+    # key_mode="counter": fixed key from the seed, only the counter moves (#61).
+    seed = gen._key48 if gen._key_mode == "counter" else _nki_seed(gen)
     out = fn(n, seed=seed, counter_offset=gen._chip_counter_offset(n))
     gen._advance_by_elements(n)
     return out

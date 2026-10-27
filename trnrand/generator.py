@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import itertools
 import math
+import os
 import weakref
 from typing import TYPE_CHECKING
 
@@ -32,6 +33,16 @@ _BATCH_SIZE: int = 128 * 4
 # torch.Generator argument (Dynamo cannot proxy either, #61); it takes the
 # handle and looks the generator up here at run time.
 _HANDLES = itertools.count()
+
+_KEY_MODES = ("draw", "counter")
+
+
+def _key48(seed: int) -> int:
+    """Fold a 64-bit seed to the 48 key bits the Threefry kernels take (k0, k1 < 2^24)."""
+    seed &= 0xFFFFFFFFFFFFFFFF
+    return (seed & 0xFFFFFFFFFFFF) ^ (seed >> 48)
+
+
 _REGISTRY: weakref.WeakValueDictionary[int, Generator] = weakref.WeakValueDictionary()
 
 
@@ -73,7 +84,12 @@ class Generator:
         device: str = "cpu",
         partition_rank: int = 0,
         partition_size: int = 1,
+        key_mode: str | None = None,
     ):
+        if key_mode is None:
+            key_mode = os.environ.get("TRNRAND_KEY_MODE", "draw").strip().lower()
+        if key_mode not in _KEY_MODES:
+            raise ValueError(f"key_mode must be one of {_KEY_MODES}; got {key_mode!r}")
         if partition_size < 1:
             raise ValueError(f"partition_size must be >= 1; got {partition_size}")
         if not (0 <= partition_rank < partition_size):
@@ -83,12 +99,19 @@ class Generator:
             )
         self._partition_rank = partition_rank
         self._partition_size = partition_size
-        self._counter: int = 0  # current position in Threefry batch units
+        self._key_mode = key_mode
+        # Current position in Threefry batch units. A 0-d tensor, so a compiled
+        # graph can advance it with a plain aten add_ (#61); `_counter` is the
+        # int view eager code uses.
+        self._ctr = torch.zeros((), dtype=torch.int64)
         self._device = device
         self._torch_gen = torch.Generator(device=device)
         if seed is not None:
             self._torch_gen.manual_seed(seed)
         self._seed = seed
+        # key_mode="counter": Threefry key words (k0, k1), int32, fixed per seed.
+        self._key_words = torch.zeros(2, dtype=torch.int32)
+        self._set_key()
         self._handle: int = next(_HANDLES)
         _REGISTRY[self._handle] = self
         # Bumped by the torch.compile state-step ops, which declare it mutated so
@@ -100,6 +123,32 @@ class Generator:
         return self._seed
 
     @property
+    def key_mode(self) -> str:
+        """How NKI draws pick their Threefry key.
+
+        ``"draw"`` (default): each call draws a fresh 24-bit key from the
+        underlying ``torch.Generator``. ``"counter"``: the key is fixed by the
+        seed and only the counter advances between calls, so no host RNG state
+        is touched and the draw is traceable by ``torch.compile`` on the
+        ``neuron`` backend (#61). The two modes give different streams.
+        Default from ``TRNRAND_KEY_MODE``.
+        """
+        return self._key_mode
+
+    @property
+    def _counter(self) -> int:
+        return int(self._ctr)
+
+    @_counter.setter
+    def _counter(self, value: int) -> None:
+        self._ctr.fill_(int(value))
+
+    def _set_key(self) -> None:
+        k = _key48(self._torch_gen.initial_seed())
+        self._key48 = k
+        self._key_words.copy_(torch.tensor([k & 0xFFFFFF, (k >> 24) & 0xFFFFFF], dtype=torch.int32))
+
+    @property
     def device(self) -> str:
         return self._device
 
@@ -107,6 +156,7 @@ class Generator:
         """Reseed the generator. Resets the counter — starts a fresh logical stream."""
         self._seed = seed
         self._torch_gen.manual_seed(seed)
+        self._set_key()
         self._counter = 0  # reseeding restarts the stream; partition context is structural
         return self
 
