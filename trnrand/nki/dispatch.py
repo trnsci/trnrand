@@ -2555,13 +2555,13 @@ def _stream_launches(kernel_name: str, op_name: str, n_elements, seed, counter_o
             torch.from_numpy(np.asarray(sim(c0_np, sb_np[i], *k_np))) for i in range(n_launches)
         ]
     elif _get_dispatch_path() == "native":
-        op = _get_native_ops()[op_name]
-        c0_d = _h2d(torch.from_numpy(c0_np))
-        k_d = [_h2d(torch.from_numpy(a)) for a in k_np]
-        sb_d = _h2d(torch.from_numpy(sb_np))
-        outs_d = [op(c0_d, sb_d[i], *k_d) for i in range(n_launches)]
-        stacked = outs_d[0].unsqueeze(0) if n_launches == 1 else torch.stack(outs_d)
-        outs = list(_d2h(stacked).unbind(0))
+        outs = _native_stream(
+            op_name,
+            n_launches,
+            torch.from_numpy(c0_np),
+            torch.from_numpy(sb_np),
+            [torch.from_numpy(a) for a in k_np],
+        )
     else:
         kernel = _kernel(kernel_name)
         outs = [
@@ -2575,9 +2575,68 @@ def _stream_launches(kernel_name: str, op_name: str, n_elements, seed, counter_o
             for i in range(n_launches)
         ]
 
+    return _stream_result(outs, n_elements)
+
+
+def _native_stream(op_name, n_launches, c0, sb, k):
+    """Native path: copy the inputs to the device once, launch, copy back once (#60).
+
+    `c0` and the four `k` words are (P, 1) int32; `sb` is (n_launches, P, 1) int32.
+    Returns the per-launch (P, 4 × tiles) host outputs. Shared by the eager
+    wrapper and the torch.compile path (#61), so both launch identically.
+    """
+    op = _get_native_ops()[op_name]
+    c0_d = _h2d(c0)
+    k_d = [_h2d(t) for t in k]
+    sb_d = _h2d(sb)
+    outs_d = [op(c0_d, sb_d[i], *k_d) for i in range(n_launches)]
+    stacked = outs_d[0].unsqueeze(0) if n_launches == 1 else torch.stack(outs_d)
+    return list(_d2h(stacked).unbind(0))
+
+
+def _stream_result(outs, n_elements):
     chunks = [_stream_tile_order(o) for o in outs]
     result = torch.cat(chunks) if len(chunks) > 1 else chunks[0]
     return result.float()[:n_elements]
+
+
+def _stream_inputs_from_state(state: torch.Tensor, n_launches: int):
+    """Streaming-kernel inputs built with torch ops from a (seed, counter_offset) tensor.
+
+    Tensor-valued twin of the numpy setup in `_stream_launches`, value for value:
+    c0 = lane index, k0 = seed & 0xFFFFFF, k1 = (seed >> 24) & 0xFFFFFF,
+    k2 = k3 = 0, start_batch[L] = (counter_offset + L × _PROGRAM_TILES) & 0xFFFFFF.
+    Keeping the seed and offset in a tensor means torch.compile neither bakes
+    them into the graph as constants nor recompiles per call (#61).
+    """
+    LANES = _THREEFRY_LANES
+    state = state.to(torch.int64)
+    seed, offset = state[0], state[1]
+    c0 = torch.arange(LANES, dtype=torch.int32).reshape(-1, 1)
+
+    def word(v):
+        return v.to(torch.int32).reshape(1, 1).expand(LANES, 1).contiguous()
+
+    zero = torch.zeros(LANES, 1, dtype=torch.int32)
+    k = [word(seed & 0xFFFFFF), word((seed >> 24) & 0xFFFFFF), zero, zero.clone()]
+    starts = (offset + torch.arange(n_launches, dtype=torch.int64) * _PROGRAM_TILES) & 0xFFFFFF
+    sb = starts.to(torch.int32).reshape(-1, 1, 1).expand(n_launches, LANES, 1).contiguous()
+    return c0, sb, k
+
+
+def threefry_stream_from_state(kind: str, n_elements: int, state: torch.Tensor) -> torch.Tensor:
+    """torch.compile-traceable native streaming draw (#61).
+
+    `state` is the int64 tensor (seed, counter_offset) produced by the
+    `trnrand::gen_nki_state` op. Same launches and values as
+    `threefry_stream_{kind}(n_elements, seed, counter_offset)` on the native path;
+    the host setup is torch ops instead of numpy so Dynamo keeps it in the graph.
+    """
+    per_launch = _PROGRAM_TILES * _THREEFRY_LANES * 4
+    n_launches = max(1, (n_elements + per_launch - 1) // per_launch)
+    c0, sb, k = _stream_inputs_from_state(state, n_launches)
+    outs = _native_stream(f"threefry_streaming_{kind}", n_launches, c0, sb, k)
+    return _stream_result(outs, n_elements)
 
 
 def threefry_stream_normal(

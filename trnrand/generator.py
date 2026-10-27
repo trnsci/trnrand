@@ -13,7 +13,9 @@ tiles, and used by both PyTorch and JAX as their default engine.
 
 from __future__ import annotations
 
+import itertools
 import math
+import weakref
 from typing import TYPE_CHECKING
 
 import torch
@@ -24,6 +26,20 @@ if TYPE_CHECKING:
 # Threefry batch: _THREEFRY_LANES × 4 output words = 128 × 4 = 512 samples.
 # Drives partition counter arithmetic and advance() / position() conversions.
 _BATCH_SIZE: int = 128 * 4
+
+# Live generators by integer handle. Under torch.compile the state step runs in
+# an opaque custom op (trnrand/_compile.py), which cannot take a Generator or
+# torch.Generator argument (Dynamo cannot proxy either, #61); it takes the
+# handle and looks the generator up here at run time.
+_HANDLES = itertools.count()
+_REGISTRY: weakref.WeakValueDictionary[int, Generator] = weakref.WeakValueDictionary()
+
+
+def _lookup(handle: int) -> Generator:
+    gen = _REGISTRY.get(handle)
+    if gen is None:
+        raise RuntimeError(f"trnrand Generator handle {handle} is no longer alive")
+    return gen
 
 
 class Generator:
@@ -73,6 +89,11 @@ class Generator:
         if seed is not None:
             self._torch_gen.manual_seed(seed)
         self._seed = seed
+        self._handle: int = next(_HANDLES)
+        _REGISTRY[self._handle] = self
+        # Bumped by the torch.compile state-step ops, which declare it mutated so
+        # graph passes keep every draw, in order, even when its output is unused.
+        self._compile_token = torch.zeros((), dtype=torch.int64)
 
     @property
     def seed(self) -> int | None:

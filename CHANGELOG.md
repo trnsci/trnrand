@@ -97,6 +97,38 @@ drawn are unchanged; only their order changes.
 
 ### Fixed
 
+#### `torch.compile(fullgraph=True)` graph-breaks on `normal()` / `uniform()` (#61)
+
+`torch.compile(lambda: trnrand.normal(n), fullgraph=True)` (and `uniform`,
+`standard_normal`) failed with `Unsupported: Failed to convert args/kwargs to
+proxy` on every backend (`neuron` on Trn2, `eager` on CPU). Root cause: the
+draw passed a `torch.Generator` to a traced call (`Tensor.normal_` /
+`uniform_(generator=...)` on the PyTorch path, `torch.randint(generator=...)`
+for the 24-bit kernel seed on the NKI path), and Dynamo cannot proxy a
+Generator. `torch.compiler.disable` is not a fix under `fullgraph=True`.
+
+- While compiling, the generator-state step runs in opaque custom ops that
+  take the generator's integer handle (new `trnrand/_compile.py`):
+  `trnrand::gen_fill` (PyTorch-path fill), `trnrand::gen_nki_state` (seed
+  draw + partition counter offset + advance, returned as an int64 tensor) and
+  `trnrand::gen_nki_draw` (whole draw, for the XLA / simulator / per-tile
+  routes). Each declares a mutation of a per-generator token tensor so
+  AOT/Inductor keep every draw, in order, even if its output is unused.
+- On the native TorchNeuron path the streaming kernel launches stay in the
+  graph: `dispatch.threefry_stream_from_state` builds the kernel inputs with
+  torch ops from the state tensor (seed and offset are not baked in as
+  constants, so repeated calls neither recompile nor repeat values) and
+  shares the launch/copy code with the eager wrapper.
+- Eager calls are unchanged. Compiled output is bit-identical to eager for
+  every seed, and the generator ends in the same state.
+- `Generator` gains a private `_handle` (registry lookup) and
+  `_compile_token`. Needs PyTorch 2.4+ (`torch.library.custom_op`); older
+  PyTorch keeps the previous behaviour.
+- Tests: `tests/test_torch_compile.py` (CPU: `backend="eager"`, zero graph
+  breaks via `torch._dynamo.explain`, compiled == eager for fixed seeds on the
+  PyTorch, native-NKI (CPU stand-in kernels) and per-tile NKI paths; plus a
+  `neuron`-marked `backend="neuron"` check).
+
 #### NKI kernels fail to compile on neuronxcc 2.26 / NKI 0.5+ (#56)
 
 Hardware compilation failed with `'nisa.tensor_scalar_arith' op 'operand0'
