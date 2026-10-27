@@ -109,7 +109,7 @@ class TestNativeDispatch:
 
     def test_generator_program_streams_on_native_path(self):
         import trnrand
-        from trnrand.nki.dispatch import threefry_normal_nki
+        from trnrand.nki.dispatch import _threefry_normal_per_tile
 
         n = 16_384
         prog = trnrand.Generator(seed=5).new_program().normal(n, out="z").build()
@@ -117,7 +117,7 @@ class TestNativeDispatch:
         prog.stream_into({"z": z})
         # Streams emit per-tile order: element-for-element equal to the per-tile
         # wrapper for the same seed/offset (#58).
-        torch.testing.assert_close(z, threefry_normal_nki(n, seed=5), rtol=0, atol=0)
+        torch.testing.assert_close(z, _threefry_normal_per_tile(n, seed=5), rtol=0, atol=0)
 
     def test_partitioned_program_concatenates_to_single_chip(self):
         import trnrand

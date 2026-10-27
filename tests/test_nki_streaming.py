@@ -20,9 +20,14 @@ import numpy as np
 import pytest
 import torch
 
-from trnrand.nki.dispatch import _PROGRAM_TILES, _stream_tile_order
+from trnrand.nki.dispatch import (
+    _PROGRAM_TILES,
+    _stream_tile_order,
+    _threefry_normal_per_tile,
+    _threefry_uniform_per_tile,
+)
 
-# _THREEFRY_LANES is inside if HAS_NKI; use the well-known constant directly.
+# Same value as dispatch._THREEFRY_LANES (128-lane Threefry tile).
 _THREEFRY_LANES = 128
 _NORMALS_PER_LAUNCH = _PROGRAM_TILES * _THREEFRY_LANES * 4  # 32×128×4 = 16,384
 
@@ -93,21 +98,33 @@ class TestStreamMatchesPerTile:
     def test_normal_one_launch(self):
         n = _NORMALS_PER_LAUNCH
         streaming = threefry_stream_normal(n, seed=5, counter_offset=0)
-        per_tile = threefry_normal_nki(n, seed=5, counter_offset=0)
+        per_tile = _threefry_normal_per_tile(n, seed=5, counter_offset=0)
         assert torch.allclose(streaming, per_tile, atol=1e-6)
 
     def test_uniform_one_launch(self):
         n = _NORMALS_PER_LAUNCH
         streaming = threefry_stream_uniform(n, seed=5, counter_offset=0)
-        per_tile = threefry_uniform_nki(n, seed=5, counter_offset=0)
+        per_tile = _threefry_uniform_per_tile(n, seed=5, counter_offset=0)
         assert torch.equal(streaming, per_tile)
 
     def test_uniform_multi_launch_offset_partial(self):
         # Two launches, nonzero counter_offset, n not a multiple of one tile.
         n = _NORMALS_PER_LAUNCH + 1000
         streaming = threefry_stream_uniform(n, seed=11, counter_offset=7)
-        per_tile = threefry_uniform_nki(n, seed=11, counter_offset=7)
+        per_tile = _threefry_uniform_per_tile(n, seed=11, counter_offset=7)
         assert torch.equal(streaming, per_tile)
+
+    @pytest.mark.parametrize(
+        "n,seed,offset", [(513, 3, 0), (16_385, 21, 5), (40_000, 2**24 - 1, 99)]
+    )
+    def test_bulk_wrappers_bit_identical_to_per_tile(self, monkeypatch, n, seed, offset):
+        # threefry_{normal,uniform}_nki now route through the streaming kernels
+        # (#60); values and order must be exactly those of the per-tile path.
+        monkeypatch.delenv("TRNRAND_BULK_STREAMING", raising=False)
+        z = threefry_normal_nki(n, seed=seed, counter_offset=offset)
+        assert torch.equal(z, _threefry_normal_per_tile(n, seed=seed, counter_offset=offset))
+        u = threefry_uniform_nki(n, seed=seed, counter_offset=offset)
+        assert torch.equal(u, _threefry_uniform_per_tile(n, seed=seed, counter_offset=offset))
 
 
 # ── Shape and dtype ────────────────────────────────────────────────────────────

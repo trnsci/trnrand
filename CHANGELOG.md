@@ -45,6 +45,27 @@ are unchanged.
 
 ### Changed
 
+#### Bulk `uniform`/`normal` use multi-tile launches (#60)
+
+`threefry_uniform_nki` and `threefry_normal_nki` (behind `trnrand.uniform`,
+`normal`, `exponential`, and the gamma/beta/chi-squared/Poisson/
+truncated-normal NKI paths) launched one kernel per 512 values, so
+`normal(4_194_304)` was 8,192 launches (about 9 s on Trn2 at the native
+dispatch floor). They now go through the streaming kernels
+(`threefry_stream_*`, 16,384 values per launch): 256 launches for 4M values,
+ceil(N / 16,384) in general. Output values and order are unchanged for every
+seed and `counter_offset` (#58). Tests: CPU launch-count and bit-identity
+tests with a stand-in launcher (`tests/test_launch_granularity.py`), and
+simulator bit-identity against the per-tile path.
+
+- The per-tile wrappers are kept as `_threefry_uniform_per_tile` /
+  `_threefry_normal_per_tile`. They are still used on the XLA path when
+  `neuronx-cc` is older than 2.28, where the streaming kernels hit SBUF OOM
+  at compile (#57). `TRNRAND_BULK_STREAMING=0|1` forces the choice.
+- The Threefry host wrappers now live at module level in
+  `trnrand/nki/dispatch.py`, outside `if HAS_NKI:`, so they import and can
+  be tested on hosts without NKI.
+
 #### Streaming output is in per-tile order (#58)
 
 **Reproducibility break.** For a given seed and counter, the streaming

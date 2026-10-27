@@ -404,6 +404,10 @@ THREEFRY_ROTATIONS = [(10, 26), (11, 21), (13, 27), (23, 5)]
 # import it for test parameterisation without requiring neuronxcc.
 _PROGRAM_TILES = 32  # tiles per streaming launch; 32 × 128 × 4 = 16,384 samples/call
 
+# 128 lanes per Threefry tile (Trainium partition-axis limit). Module level so the
+# host wrappers below `if HAS_NKI:` work (and are testable) without neuronxcc.
+_THREEFRY_LANES = 128
+
 
 def _stream_tile_order(out: torch.Tensor) -> torch.Tensor:
     """Flatten one streaming launch's (P, 4 × _PROGRAM_TILES) output in per-tile order.
@@ -1004,8 +1008,6 @@ if HAS_NKI:
     # THREEFRY_ROTATIONS = [(10,26),(11,21),(13,27),(23,5)]
     # Flattened: [10, 26, 11, 21, 13, 27, 23, 5]
     _THREEFRY_ROT_QR = tuple((rot // 8, rot % 8) for pair in THREEFRY_ROTATIONS for rot in pair)
-    # 128 lanes per tile (Trainium partition-axis limit).
-    _THREEFRY_LANES = 128
 
     def _b_split(v_ref):
         """Load a (P,1) int32 tile and split into 4 byte tiles, each in [0,255].
@@ -1471,123 +1473,6 @@ if HAS_NKI:
         out[:, 2:3] = z2
         out[:, 3:4] = z3
         return out
-
-    def threefry_uniform_nki(
-        n_elements: int,
-        seed: int = 0,
-        counter_offset: int = 0,
-    ) -> torch.Tensor:
-        """Host-side wrapper: Threefry4×32-20 → float32 uniforms in [0, 1).
-
-        Counter design (ensures all tile inputs < 2^24 for the host's
-        typical workload up to ~128 * 2^16 = ~8M elements per call):
-            c0 = lane index within tile (0..127)
-            c1 = batch/tile index (0..n_batches-1)
-            c2 = counter_offset high word
-            c3 = 0
-        Key: k0=seed&0xFFFFFF, k1=(seed>>24)&0xFFFFFF, k2=k3=0
-        (trimmed to 24 bits to guarantee < 2^24 at tile load time).
-        """
-        LANES = _THREEFRY_LANES
-        n_words = (n_elements + 3) // 4  # each lane emits 4 words
-        n_batches = (n_words + LANES - 1) // LANES
-
-        k0_val = seed & 0xFFFFFF
-        k1_val = (seed >> 24) & 0xFFFFFF
-
-        chunks = []
-        for batch in range(n_batches):
-            tile_lanes = min(LANES, n_words - batch * LANES)
-            c0_np = np.arange(tile_lanes, dtype=np.int32).reshape(-1, 1)
-            c1_np = np.full((tile_lanes, 1), (batch + counter_offset) & 0xFFFFFF, dtype=np.int32)
-            c2_np = np.zeros((tile_lanes, 1), dtype=np.int32)
-            c3_np = np.zeros((tile_lanes, 1), dtype=np.int32)
-            k0_np = np.full((tile_lanes, 1), k0_val, dtype=np.int32)
-            k1_np = np.full((tile_lanes, 1), k1_val, dtype=np.int32)
-            k2_np = np.zeros((tile_lanes, 1), dtype=np.int32)
-            k3_np = np.zeros((tile_lanes, 1), dtype=np.int32)
-
-            if _use_simulator():
-                out_np = nki.simulate(threefry4x32_kernel)(
-                    c0_np,
-                    c1_np,
-                    c2_np,
-                    c3_np,
-                    k0_np,
-                    k1_np,
-                    k2_np,
-                    k3_np,
-                )
-                out_tile = torch.from_numpy(np.asarray(out_np).reshape(-1))
-            else:
-                out_tile = _launch(
-                    threefry4x32_kernel,
-                    "threefry4x32",
-                    *(
-                        torch.from_numpy(a)
-                        for a in (c0_np, c1_np, c2_np, c3_np, k0_np, k1_np, k2_np, k3_np)
-                    ),
-                ).reshape(-1)
-            chunks.append(out_tile)
-
-        result = torch.cat(chunks) if len(chunks) > 1 else chunks[0]
-        return result.float()[:n_elements]
-
-    def threefry_normal_nki(
-        n_elements: int,
-        seed: int = 0,
-        counter_offset: int = 0,
-    ) -> torch.Tensor:
-        """Host-side wrapper: Threefry4×32-20 + Box-Muller → N(0,1) floats.
-
-        Uses the fused `threefry_normal_kernel`. Each tile emits 4 normals
-        per lane (2 Box-Muller pairs). Counter layout matches
-        `threefry_uniform_nki`.
-        """
-        LANES = _THREEFRY_LANES
-        n_words = (n_elements + 3) // 4
-        n_batches = (n_words + LANES - 1) // LANES
-
-        k0_val = seed & 0xFFFFFF
-        k1_val = (seed >> 24) & 0xFFFFFF
-
-        chunks = []
-        for batch in range(n_batches):
-            tile_lanes = min(LANES, n_words - batch * LANES)
-            c0_np = np.arange(tile_lanes, dtype=np.int32).reshape(-1, 1)
-            c1_np = np.full((tile_lanes, 1), (batch + counter_offset) & 0xFFFFFF, dtype=np.int32)
-            c2_np = np.zeros((tile_lanes, 1), dtype=np.int32)
-            c3_np = np.zeros((tile_lanes, 1), dtype=np.int32)
-            k0_np = np.full((tile_lanes, 1), k0_val, dtype=np.int32)
-            k1_np = np.full((tile_lanes, 1), k1_val, dtype=np.int32)
-            k2_np = np.zeros((tile_lanes, 1), dtype=np.int32)
-            k3_np = np.zeros((tile_lanes, 1), dtype=np.int32)
-
-            if _use_simulator():
-                out_np = nki.simulate(threefry_normal_kernel)(
-                    c0_np,
-                    c1_np,
-                    c2_np,
-                    c3_np,
-                    k0_np,
-                    k1_np,
-                    k2_np,
-                    k3_np,
-                )
-                out_tile = torch.from_numpy(np.asarray(out_np).reshape(-1))
-            else:
-                out_tile = _launch(
-                    threefry_normal_kernel,
-                    "threefry_normal",
-                    *(
-                        torch.from_numpy(a)
-                        for a in (c0_np, c1_np, c2_np, c3_np, k0_np, k1_np, k2_np, k3_np)
-                    ),
-                ).reshape(-1)
-            chunks.append(out_tile)
-
-        result = torch.cat(chunks) if len(chunks) > 1 else chunks[0]
-        return result.float()[:n_elements]
 
     def truncated_normal_nki(
         n_elements,
@@ -2424,111 +2309,304 @@ if HAS_NKI:
 
         return out
 
-    def threefry_stream_normal(
-        n_elements: int,
-        seed: int = 0,
-        counter_offset: int = 0,
-    ) -> torch.Tensor:
-        """Host wrapper: streaming Threefry4×32-20 + Box-Muller → N(0,1) floats.
 
-        Each call reuses the fixed-size NEFF compiled for `threefry_streaming_normal_kernel`,
-        running _PROGRAM_TILES Threefry tiles in one XLA invocation — 16,384 samples per
-        XLA call vs 512 per call in threefry_normal_nki. For 1M samples: 245 XLA calls vs
-        7813 in the per-tile wrapper (~31× reduction in launch overhead).
+# ── Threefry host wrappers (module level) ────────────────────────────────────
+#
+# Defined outside `if HAS_NKI:` so launch counts and output order are testable
+# on CPU-only hosts with a stand-in `_launch` (tests/test_launch_granularity.py).
+# Kernels are looked up by name at call time; they exist only when HAS_NKI.
 
-        Counter-offset compatibility: outputs are bit-exact with threefry_normal_nki when
-        both use the same seed and counter_offset. Launch L tile T uses
-        c1 = (counter_offset + L*_PROGRAM_TILES + T) & 0xFFFFFF, matching the per-tile
-        wrapper's c1 = (batch + counter_offset) & 0xFFFFFF at batch = L*_PROGRAM_TILES + T.
-        Each launch's output is flattened in per-tile (tiles, P, 4) order by
-        _stream_tile_order, so the stream equals the per-tile output element-for-element
-        (#58).
-        """
-        LANES = _THREEFRY_LANES
-        NORMALS_PER_LAUNCH = _PROGRAM_TILES * LANES * 4  # 32 × 128 × 4 = 16,384
 
-        n_launches = (n_elements + NORMALS_PER_LAUNCH - 1) // NORMALS_PER_LAUNCH
+def _kernel(name: str):
+    """Return the `@nki.jit` kernel `name`, or None when NKI is not installed."""
+    return globals().get(name)
 
-        k0_val = seed & 0xFFFFFF
-        k1_val = (seed >> 24) & 0xFFFFFF
 
-        c0_np = np.arange(LANES, dtype=np.int32).reshape(-1, 1)
-        k0_np = np.full((LANES, 1), k0_val, dtype=np.int32)
-        k1_np = np.full((LANES, 1), k1_val, dtype=np.int32)
-        k2_np = np.zeros((LANES, 1), dtype=np.int32)
-        k3_np = np.zeros((LANES, 1), dtype=np.int32)
+def _neuronx_cc_version():
+    """(major, minor) of the installed neuronx-cc, or None if it is absent."""
+    try:
+        from importlib.metadata import version
 
-        chunks = []
-        for launch in range(n_launches):
-            start_batch = (counter_offset + launch * _PROGRAM_TILES) & 0xFFFFFF
-            start_batch_np = np.full((LANES, 1), start_batch, dtype=np.int32)
+        major, minor = version("neuronx-cc").split(".")[:2]
+        return int(major), int(minor)
+    except Exception:
+        return None
 
-            if _use_simulator():
-                out_np = nki.simulate(threefry_streaming_normal_kernel)(
-                    c0_np, start_batch_np, k0_np, k1_np, k2_np, k3_np
-                )
-                out_tile = torch.from_numpy(np.asarray(out_np))
-            else:
-                out_tile = _launch(
-                    threefry_streaming_normal_kernel,
-                    "threefry_streaming_normal",
-                    *(
-                        torch.from_numpy(a)
-                        for a in (c0_np, start_batch_np, k0_np, k1_np, k2_np, k3_np)
-                    ),
-                )
-            chunks.append(_stream_tile_order(out_tile))
 
-        result = torch.cat(chunks) if len(chunks) > 1 else chunks[0]
-        return result.float()[:n_elements]
+def _bulk_streaming() -> bool:
+    """Whether bulk uniform/normal generation uses the multi-tile streaming kernels.
 
-    def threefry_stream_uniform(
-        n_elements: int,
-        seed: int = 0,
-        counter_offset: int = 0,
-    ) -> torch.Tensor:
-        """Host wrapper: streaming Threefry4×32-20 → float32 uniforms in [0, 1).
+    The per-tile kernels emit 512 values per launch, so `normal(4M)` was 8,192
+    launches at the ~0.2 ms native dispatch floor or worse (#60). The streaming
+    kernels emit _PROGRAM_TILES × 512 = 16,384 values per launch, element-for-
+    element equal to the per-tile path (#58), so they are the default.
 
-        Same launch/counter scheme as threefry_stream_normal; 16,384 uniforms per
-        XLA call, ~31× fewer round-trips than the per-tile threefry_uniform_nki
-        for large n.
-        Output is in per-tile order, element-for-element equal to
-        threefry_uniform_nki for the same seed and counter_offset (#58).
-        """
-        LANES = _THREEFRY_LANES
-        UNIFORMS_PER_LAUNCH = _PROGRAM_TILES * LANES * 4  # 32 × 128 × 4 = 16,384
+    They do not compile on neuronx-cc 2.26 (SBUF OOM, #57), the compiler on the
+    Trn1 / XLA DLAMI, so the XLA path keeps the per-tile kernels on neuronx-cc
+    older than 2.28. TRNRAND_BULK_STREAMING=0/1 overrides the choice.
+    """
+    env = os.environ.get("TRNRAND_BULK_STREAMING", "").lower()
+    if env in ("1", "true", "yes"):
+        return True
+    if env in ("0", "false", "no"):
+        return False
+    if _use_simulator() or _get_dispatch_path() == "native":
+        return True
+    ver = _neuronx_cc_version()
+    return ver is None or ver >= (2, 28)
 
-        n_launches = (n_elements + UNIFORMS_PER_LAUNCH - 1) // UNIFORMS_PER_LAUNCH
 
-        k0_val = seed & 0xFFFFFF
-        k1_val = (seed >> 24) & 0xFFFFFF
+def threefry_uniform_nki(
+    n_elements: int,
+    seed: int = 0,
+    counter_offset: int = 0,
+) -> torch.Tensor:
+    """Threefry4×32-20 → float32 uniforms in [0, 1).
 
-        c0_np = np.arange(LANES, dtype=np.int32).reshape(-1, 1)
-        k0_np = np.full((LANES, 1), k0_val, dtype=np.int32)
-        k1_np = np.full((LANES, 1), k1_val, dtype=np.int32)
-        k2_np = np.zeros((LANES, 1), dtype=np.int32)
-        k3_np = np.zeros((LANES, 1), dtype=np.int32)
+    Routes through `threefry_stream_uniform` (16,384 values per kernel launch)
+    unless `_bulk_streaming()` says otherwise, else `_threefry_uniform_per_tile`
+    (512 per launch). Both give the same values in the same order for a given
+    seed and counter_offset (#58, #60); counter_offset is in 512-value tiles.
+    """
+    if _bulk_streaming():
+        return threefry_stream_uniform(n_elements, seed=seed, counter_offset=counter_offset)
+    return _threefry_uniform_per_tile(n_elements, seed=seed, counter_offset=counter_offset)
 
-        chunks = []
-        for launch in range(n_launches):
-            start_batch = (counter_offset + launch * _PROGRAM_TILES) & 0xFFFFFF
-            start_batch_np = np.full((LANES, 1), start_batch, dtype=np.int32)
 
-            if _use_simulator():
-                out_np = nki.simulate(threefry_streaming_uniform_kernel)(
-                    c0_np, start_batch_np, k0_np, k1_np, k2_np, k3_np
-                )
-                out_tile = torch.from_numpy(np.asarray(out_np))
-            else:
-                out_tile = _launch(
-                    threefry_streaming_uniform_kernel,
-                    "threefry_streaming_uniform",
-                    *(
-                        torch.from_numpy(a)
-                        for a in (c0_np, start_batch_np, k0_np, k1_np, k2_np, k3_np)
-                    ),
-                )
-            chunks.append(_stream_tile_order(out_tile))
+def threefry_normal_nki(
+    n_elements: int,
+    seed: int = 0,
+    counter_offset: int = 0,
+) -> torch.Tensor:
+    """Threefry4×32-20 + Box-Muller → N(0,1) float32.
 
-        result = torch.cat(chunks) if len(chunks) > 1 else chunks[0]
-        return result.float()[:n_elements]
+    Same routing as `threefry_uniform_nki`: `threefry_stream_normal` by default,
+    `_threefry_normal_per_tile` on old compilers; identical output either way.
+    """
+    if _bulk_streaming():
+        return threefry_stream_normal(n_elements, seed=seed, counter_offset=counter_offset)
+    return _threefry_normal_per_tile(n_elements, seed=seed, counter_offset=counter_offset)
+
+
+def _threefry_uniform_per_tile(
+    n_elements: int,
+    seed: int = 0,
+    counter_offset: int = 0,
+) -> torch.Tensor:
+    """Host-side wrapper: Threefry4×32-20 → float32 uniforms in [0, 1).
+
+    Counter design (ensures all tile inputs < 2^24 for the host's
+    typical workload up to ~128 * 2^16 = ~8M elements per call):
+        c0 = lane index within tile (0..127)
+        c1 = batch/tile index (0..n_batches-1)
+        c2 = counter_offset high word
+        c3 = 0
+    Key: k0=seed&0xFFFFFF, k1=(seed>>24)&0xFFFFFF, k2=k3=0
+    (trimmed to 24 bits to guarantee < 2^24 at tile load time).
+    """
+    LANES = _THREEFRY_LANES
+    n_words = (n_elements + 3) // 4  # each lane emits 4 words
+    n_batches = (n_words + LANES - 1) // LANES
+
+    k0_val = seed & 0xFFFFFF
+    k1_val = (seed >> 24) & 0xFFFFFF
+
+    chunks = []
+    for batch in range(n_batches):
+        tile_lanes = min(LANES, n_words - batch * LANES)
+        c0_np = np.arange(tile_lanes, dtype=np.int32).reshape(-1, 1)
+        c1_np = np.full((tile_lanes, 1), (batch + counter_offset) & 0xFFFFFF, dtype=np.int32)
+        c2_np = np.zeros((tile_lanes, 1), dtype=np.int32)
+        c3_np = np.zeros((tile_lanes, 1), dtype=np.int32)
+        k0_np = np.full((tile_lanes, 1), k0_val, dtype=np.int32)
+        k1_np = np.full((tile_lanes, 1), k1_val, dtype=np.int32)
+        k2_np = np.zeros((tile_lanes, 1), dtype=np.int32)
+        k3_np = np.zeros((tile_lanes, 1), dtype=np.int32)
+
+        if _use_simulator():
+            out_np = nki.simulate(_kernel("threefry4x32_kernel"))(
+                c0_np,
+                c1_np,
+                c2_np,
+                c3_np,
+                k0_np,
+                k1_np,
+                k2_np,
+                k3_np,
+            )
+            out_tile = torch.from_numpy(np.asarray(out_np).reshape(-1))
+        else:
+            out_tile = _launch(
+                _kernel("threefry4x32_kernel"),
+                "threefry4x32",
+                *(
+                    torch.from_numpy(a)
+                    for a in (c0_np, c1_np, c2_np, c3_np, k0_np, k1_np, k2_np, k3_np)
+                ),
+            ).reshape(-1)
+        chunks.append(out_tile)
+
+    result = torch.cat(chunks) if len(chunks) > 1 else chunks[0]
+    return result.float()[:n_elements]
+
+
+def _threefry_normal_per_tile(
+    n_elements: int,
+    seed: int = 0,
+    counter_offset: int = 0,
+) -> torch.Tensor:
+    """Host-side wrapper: Threefry4×32-20 + Box-Muller → N(0,1) floats.
+
+    Uses the fused `threefry_normal_kernel`. Each tile emits 4 normals
+    per lane (2 Box-Muller pairs). Counter layout matches
+    `threefry_uniform_nki`.
+    """
+    LANES = _THREEFRY_LANES
+    n_words = (n_elements + 3) // 4
+    n_batches = (n_words + LANES - 1) // LANES
+
+    k0_val = seed & 0xFFFFFF
+    k1_val = (seed >> 24) & 0xFFFFFF
+
+    chunks = []
+    for batch in range(n_batches):
+        tile_lanes = min(LANES, n_words - batch * LANES)
+        c0_np = np.arange(tile_lanes, dtype=np.int32).reshape(-1, 1)
+        c1_np = np.full((tile_lanes, 1), (batch + counter_offset) & 0xFFFFFF, dtype=np.int32)
+        c2_np = np.zeros((tile_lanes, 1), dtype=np.int32)
+        c3_np = np.zeros((tile_lanes, 1), dtype=np.int32)
+        k0_np = np.full((tile_lanes, 1), k0_val, dtype=np.int32)
+        k1_np = np.full((tile_lanes, 1), k1_val, dtype=np.int32)
+        k2_np = np.zeros((tile_lanes, 1), dtype=np.int32)
+        k3_np = np.zeros((tile_lanes, 1), dtype=np.int32)
+
+        if _use_simulator():
+            out_np = nki.simulate(_kernel("threefry_normal_kernel"))(
+                c0_np,
+                c1_np,
+                c2_np,
+                c3_np,
+                k0_np,
+                k1_np,
+                k2_np,
+                k3_np,
+            )
+            out_tile = torch.from_numpy(np.asarray(out_np).reshape(-1))
+        else:
+            out_tile = _launch(
+                _kernel("threefry_normal_kernel"),
+                "threefry_normal",
+                *(
+                    torch.from_numpy(a)
+                    for a in (c0_np, c1_np, c2_np, c3_np, k0_np, k1_np, k2_np, k3_np)
+                ),
+            ).reshape(-1)
+        chunks.append(out_tile)
+
+    result = torch.cat(chunks) if len(chunks) > 1 else chunks[0]
+    return result.float()[:n_elements]
+
+
+def threefry_stream_normal(
+    n_elements: int,
+    seed: int = 0,
+    counter_offset: int = 0,
+) -> torch.Tensor:
+    """Host wrapper: streaming Threefry4×32-20 + Box-Muller → N(0,1) floats.
+
+    Each call reuses the fixed-size NEFF compiled for `threefry_streaming_normal_kernel`,
+    running _PROGRAM_TILES Threefry tiles in one XLA invocation — 16,384 samples per
+    XLA call vs 512 per call in threefry_normal_nki. For 1M samples: 245 XLA calls vs
+    7813 in the per-tile wrapper (~31× reduction in launch overhead).
+
+    Counter-offset compatibility: outputs are bit-exact with threefry_normal_nki when
+    both use the same seed and counter_offset. Launch L tile T uses
+    c1 = (counter_offset + L*_PROGRAM_TILES + T) & 0xFFFFFF, matching the per-tile
+    wrapper's c1 = (batch + counter_offset) & 0xFFFFFF at batch = L*_PROGRAM_TILES + T.
+    Each launch's output is flattened in per-tile (tiles, P, 4) order by
+    _stream_tile_order, so the stream equals the per-tile output element-for-element
+    (#58).
+    """
+    LANES = _THREEFRY_LANES
+    NORMALS_PER_LAUNCH = _PROGRAM_TILES * LANES * 4  # 32 × 128 × 4 = 16,384
+
+    n_launches = (n_elements + NORMALS_PER_LAUNCH - 1) // NORMALS_PER_LAUNCH
+
+    k0_val = seed & 0xFFFFFF
+    k1_val = (seed >> 24) & 0xFFFFFF
+
+    c0_np = np.arange(LANES, dtype=np.int32).reshape(-1, 1)
+    k0_np = np.full((LANES, 1), k0_val, dtype=np.int32)
+    k1_np = np.full((LANES, 1), k1_val, dtype=np.int32)
+    k2_np = np.zeros((LANES, 1), dtype=np.int32)
+    k3_np = np.zeros((LANES, 1), dtype=np.int32)
+
+    chunks = []
+    for launch in range(n_launches):
+        start_batch = (counter_offset + launch * _PROGRAM_TILES) & 0xFFFFFF
+        start_batch_np = np.full((LANES, 1), start_batch, dtype=np.int32)
+
+        if _use_simulator():
+            out_np = nki.simulate(_kernel("threefry_streaming_normal_kernel"))(
+                c0_np, start_batch_np, k0_np, k1_np, k2_np, k3_np
+            )
+            out_tile = torch.from_numpy(np.asarray(out_np))
+        else:
+            out_tile = _launch(
+                _kernel("threefry_streaming_normal_kernel"),
+                "threefry_streaming_normal",
+                *(torch.from_numpy(a) for a in (c0_np, start_batch_np, k0_np, k1_np, k2_np, k3_np)),
+            )
+        chunks.append(_stream_tile_order(out_tile))
+
+    result = torch.cat(chunks) if len(chunks) > 1 else chunks[0]
+    return result.float()[:n_elements]
+
+
+def threefry_stream_uniform(
+    n_elements: int,
+    seed: int = 0,
+    counter_offset: int = 0,
+) -> torch.Tensor:
+    """Host wrapper: streaming Threefry4×32-20 → float32 uniforms in [0, 1).
+
+    Same launch/counter scheme as threefry_stream_normal; 16,384 uniforms per
+    XLA call, ~31× fewer round-trips than the per-tile threefry_uniform_nki
+    for large n.
+    Output is in per-tile order, element-for-element equal to
+    threefry_uniform_nki for the same seed and counter_offset (#58).
+    """
+    LANES = _THREEFRY_LANES
+    UNIFORMS_PER_LAUNCH = _PROGRAM_TILES * LANES * 4  # 32 × 128 × 4 = 16,384
+
+    n_launches = (n_elements + UNIFORMS_PER_LAUNCH - 1) // UNIFORMS_PER_LAUNCH
+
+    k0_val = seed & 0xFFFFFF
+    k1_val = (seed >> 24) & 0xFFFFFF
+
+    c0_np = np.arange(LANES, dtype=np.int32).reshape(-1, 1)
+    k0_np = np.full((LANES, 1), k0_val, dtype=np.int32)
+    k1_np = np.full((LANES, 1), k1_val, dtype=np.int32)
+    k2_np = np.zeros((LANES, 1), dtype=np.int32)
+    k3_np = np.zeros((LANES, 1), dtype=np.int32)
+
+    chunks = []
+    for launch in range(n_launches):
+        start_batch = (counter_offset + launch * _PROGRAM_TILES) & 0xFFFFFF
+        start_batch_np = np.full((LANES, 1), start_batch, dtype=np.int32)
+
+        if _use_simulator():
+            out_np = nki.simulate(_kernel("threefry_streaming_uniform_kernel"))(
+                c0_np, start_batch_np, k0_np, k1_np, k2_np, k3_np
+            )
+            out_tile = torch.from_numpy(np.asarray(out_np))
+        else:
+            out_tile = _launch(
+                _kernel("threefry_streaming_uniform_kernel"),
+                "threefry_streaming_uniform",
+                *(torch.from_numpy(a) for a in (c0_np, start_batch_np, k0_np, k1_np, k2_np, k3_np)),
+            )
+        chunks.append(_stream_tile_order(out_tile))
+
+    result = torch.cat(chunks) if len(chunks) > 1 else chunks[0]
+    return result.float()[:n_elements]
