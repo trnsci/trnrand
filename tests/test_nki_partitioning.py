@@ -373,17 +373,18 @@ class TestHardwarePartition:
         gen = Generator(seed=0, partition_rank=0, partition_size=4)
         prog = gen.new_program().normal(1_000_000, out="z").build()
         z = torch.empty(1_000_000)
-        t0 = time.perf_counter()
-        prog.stream_into({"z": z})  # cold: compile
-        cold_ms = (time.perf_counter() - t0) * 1_000
+        prog.stream_into({"z": z})  # cold, or warm if the NEFF cache already has it
 
-        t0 = time.perf_counter()
-        prog.stream_into({"z": z})
-        warm_ms = (time.perf_counter() - t0) * 1_000
+        def timed():
+            t0 = time.perf_counter()
+            prog.stream_into({"z": z})
+            return (time.perf_counter() - t0) * 1_000
 
-        # Relative, not absolute: a warm call does the real work (~60 launches
-        # for 1M normals) but must not recompile. A cache miss costs roughly a
-        # full cold call; an absolute 100 ms bound only held on the XLA path.
-        assert warm_ms < 0.25 * cold_ms, (
-            f"Second stream_into took {warm_ms:.1f}ms vs cold {cold_ms:.1f}ms — NEFF cache miss?"
+        second_ms = timed()
+        steady_ms = sorted(timed() for _ in range(3))[1]
+        # A recompile on the second call makes it far slower than steady state.
+        # Comparing to steady state (not the first call) stays valid when a
+        # persistent NEFF cache made the first call warm too.
+        assert second_ms < 1.5 * steady_ms + 50, (
+            f"Second stream_into took {second_ms:.1f}ms vs steady {steady_ms:.1f}ms — recompile?"
         )
