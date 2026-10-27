@@ -565,6 +565,93 @@ def _rotl32_bytes_numpy(a_u32, R: int):
     ).astype(np.uint32)
 
 
+# ── Sobol quasi-random sequence (GpSimd XOR accumulation) ─────────────────
+#
+# Sobol coordinates are computed via Gray-code-indexed XOR accumulation:
+#   s[p, d] = XOR{ v[d][k]  for k=0..B-1  if bit k of gray(i_p) is set }
+# where v[d][k] is the Joe-Kuo 2010 direction vector for dimension d,
+# bit position k, and gray(i) = i XOR (i >> 1) is the Gray code.
+#
+# Using 24-bit direction vectors (_SOBOL_BITS = 24) keeps all operands
+# well inside float32's 2^24 exact-integer envelope.  The XOR loops are
+# unrolled at @nki.jit trace time via nl.static_range.
+#
+# Reference: Joe & Kuo (2010), "Constructing Sobol sequences with better
+# two-dimensional projections", SIAM J. Sci. Comput. 30(5):2635–2654.
+
+_SOBOL_BITS = 24  # bits of precision — supports up to 2^24 ≈ 16.7M points
+_SOBOL_MAX_DIMS = 10  # Joe-Kuo table covers dims 2-10; dim 1 is Van der Corput
+_SOBOL_SCALE = 1.0 / 16777216.0  # 1 / 2^24 — same constant as Threefry inv24
+
+
+def _init_sobol_directions():
+    """Compute 24-bit Joe-Kuo 2010 direction vectors for the first 10 dims.
+
+    Returns a tuple of 10 tuples, each of length _SOBOL_BITS.
+    _SOBOL_DIR_VECS[d][k] is the 24-bit integer for dimension d, bit k.
+    Computed once at module import; embedded as nl.full constants in the kernel.
+
+    (s, a, m_init) rows are from Joe-Kuo ``new-joe-kuo-6.21201``, the table
+    ``torch.quasirandom.SobolEngine`` uses; ``tests/test_quasi.py`` checks the
+    result against ``SobolEngine.sobolstate`` for every dimension (#59).
+    """
+    joe_kuo = [
+        (1, 0, [1]),  # dim 2
+        (2, 1, [1, 3]),  # dim 3
+        (3, 1, [1, 3, 1]),  # dim 4
+        (3, 2, [1, 1, 1]),  # dim 5
+        (4, 1, [1, 1, 3, 3]),  # dim 6
+        (4, 4, [1, 3, 5, 13]),  # dim 7
+        (5, 2, [1, 1, 5, 5, 17]),  # dim 8
+        (5, 4, [1, 1, 5, 5, 5]),  # dim 9
+        (5, 7, [1, 1, 7, 11, 19]),  # dim 10
+    ]
+    B = _SOBOL_BITS
+    dirs = []
+    # Dim 0: Van der Corput base-2 (v[k] = 2^(B-1-k))
+    dirs.append(tuple(1 << (B - 1 - k) for k in range(B)))
+    # Dims 1-9: Joe-Kuo recurrence
+    #   v[k] = v[k-s] XOR (v[k-s] >> s)
+    #          XOR c_{s-1}*v[k-1] XOR ... XOR c_0*v[k-s+1]
+    for s, a, m_init in joe_kuo:
+        v = [0] * B
+        for k in range(s):
+            v[k] = m_init[k] << (B - 1 - k)
+        for k in range(s, B):
+            val = v[k - s] ^ (v[k - s] >> s)
+            for j in range(1, s):
+                if (a >> (s - 1 - j)) & 1:
+                    val ^= v[k - j]
+            v[k] = val
+        dirs.append(tuple(v))
+    return tuple(dirs)
+
+
+_SOBOL_DIR_VECS = _init_sobol_directions()
+
+
+def sobol_reference(n_points: int, n_dims: int, start_index: int = 0) -> torch.Tensor:
+    """CPU reference for the NKI Sobol path (unscrambled), bit-exact.
+
+    Mirrors ``sobol_gray_code_kernel``: point ``i`` is the XOR of
+    ``_SOBOL_DIR_VECS[d][k]`` over the set bits ``k`` of ``gray(i)``, scaled by
+    ``2^-24``. Equals the top 24 bits of ``SobolEngine(scramble=False)`` after
+    ``fast_forward(start_index)``.
+
+    Returns:
+        Float32 tensor of shape (n_points, n_dims) with values in [0, 1).
+    """
+    assert 1 <= n_dims <= _SOBOL_MAX_DIMS
+    idx = np.arange(start_index, start_index + n_points, dtype=np.int64)
+    gray = idx ^ (idx >> 1)
+    dirs = np.asarray(_SOBOL_DIR_VECS[:n_dims], dtype=np.int64)  # (n_dims, B)
+    acc = np.zeros((n_points, n_dims), dtype=np.int64)
+    for k in range(_SOBOL_BITS):
+        bit = ((gray >> k) & 1).astype(bool)
+        acc[bit] ^= dirs[:, k]
+    return torch.from_numpy((acc * _SOBOL_SCALE).astype(np.float32))
+
+
 if HAS_NKI:
     # NKI's `nl.multiply` routes uint32 operands through the activation
     # engine's float32 path on both simulator and hardware. float32
@@ -1677,61 +1764,8 @@ if HAS_NKI:
 
     # ── Sobol quasi-random sequence (GpSimd XOR accumulation) ─────────────────
     #
-    # Sobol coordinates are computed via Gray-code-indexed XOR accumulation:
-    #   s[p, d] = XOR{ v[d][k]  for k=0..B-1  if bit k of gray(i_p) is set }
-    # where v[d][k] is the Joe-Kuo 2010 direction vector for dimension d,
-    # bit position k, and gray(i) = i XOR (i >> 1) is the Gray code.
-    #
-    # Using 24-bit direction vectors (_SOBOL_BITS = 24) keeps all operands
-    # well inside float32's 2^24 exact-integer envelope.  The XOR loops are
-    # unrolled at @nki.jit trace time via nl.static_range.
-    #
-    # Reference: Joe & Kuo (2010), "Constructing Sobol sequences with better
-    # two-dimensional projections", SIAM J. Sci. Comput. 30(5):2635–2654.
-
-    _SOBOL_BITS = 24  # bits of precision — supports up to 2^24 ≈ 16.7M points
-    _SOBOL_MAX_DIMS = 10  # Joe-Kuo table covers dims 2-10; dim 1 is Van der Corput
-    _SOBOL_SCALE = 1.0 / 16777216.0  # 1 / 2^24 — same constant as Threefry inv24
-
-    def _init_sobol_directions():
-        """Compute 24-bit Joe-Kuo 2010 direction vectors for the first 10 dims.
-
-        Returns a tuple of 10 tuples, each of length _SOBOL_BITS.
-        _SOBOL_DIR_VECS[d][k] is the 24-bit integer for dimension d, bit k.
-        Computed once at module import; embedded as nl.full constants in the kernel.
-        """
-        joe_kuo = [
-            (1, 0, [1]),  # dim 2
-            (2, 1, [1, 1]),  # dim 3
-            (3, 1, [1, 1, 1]),  # dim 4
-            (3, 2, [1, 1, 3]),  # dim 5
-            (4, 1, [1, 1, 1, 1]),  # dim 6
-            (4, 4, [1, 3, 5, 13]),  # dim 7
-            (5, 2, [1, 1, 5, 5, 17]),  # dim 8
-            (5, 4, [1, 1, 5, 5, 5]),  # dim 9
-            (5, 7, [1, 1, 7, 11, 19]),  # dim 10
-        ]
-        B = _SOBOL_BITS
-        dirs = []
-        # Dim 0: Van der Corput base-2 (v[k] = 2^(B-1-k))
-        dirs.append(tuple(1 << (B - 1 - k) for k in range(B)))
-        # Dims 1-9: Joe-Kuo recurrence
-        #   v[k] = v[k-s] XOR (v[k-s] >> s)
-        #          XOR c_{s-1}*v[k-1] XOR ... XOR c_0*v[k-s+1]
-        for s, a, m_init in joe_kuo:
-            v = [0] * B
-            for k in range(s):
-                v[k] = m_init[k] << (B - 1 - k)
-            for k in range(s, B):
-                val = v[k - s] ^ (v[k - s] >> s)
-                for j in range(1, s):
-                    if (a >> (s - 1 - j)) & 1:
-                        val ^= v[k - j]
-                v[k] = val
-            dirs.append(tuple(v))
-        return tuple(dirs)
-
-    _SOBOL_DIR_VECS = _init_sobol_directions()
+    # Direction vectors and the CPU reference live at module level (above
+    # `if HAS_NKI:`) so CPU-only installs can check them against SobolEngine.
 
     @nki.jit
     def sobol_gray_code_kernel(gray_ref):
