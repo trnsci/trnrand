@@ -109,26 +109,38 @@ unrolled chunks per launch. One launch covers up to 4,194,304 values.
   are added to the MLIR verifier check for trn1 and trn2
   (`tests/test_nki_compile.py`).
 
-#### Bulk kernels on 16-bit limbs or full words, opt-in (#60)
+#### Bulk kernels run on full uint32 words by default (#60)
 
-`TRNRAND_LIMB_BITS` picks the word representation of the bulk Threefry
-kernels: `8` (default, unchanged), `16` or `32`. Values are bit-identical
-for all three.
+On the native TorchNeuron path (Trn2+), the bulk Threefry kernels now hold
+each word as one uint32 tile instead of four byte tiles. `TRNRAND_LIMB_BITS`
+selects the width: `32` (default), or `8` for the byte-limb kernels as a
+fallback. Values are bit-identical for every width. The XLA/Trn1 path never
+uses the bulk kernels (it streams on the byte kernels), so it is unchanged.
 
 - Bytes were used because integer `nl.add` / `tensor_scalar` arithmetic runs
   in float32 (exact only below 2^24, aws-neuron-sdk#1308), and the byte
   form was carried over from the Philox multiply, which needs 8-bit
-  sub-products. Threefry has no multiply, so 16-bit limbs are enough: every
-  add is below 2^17 and stays exact in float32. Each word has 2 limbs
-  instead of 4, which roughly halves the compute instructions (about 1,040
-  vs 1,950 per (128, 512) chunk in trn2 MLIR). New kernels:
-  `threefry_bulk16_{normal,uniform}_kernel`, ops
-  `trnrand::threefry_bulk16_{normal,uniform}`.
-- `32` is experimental: full uint32 words, with adds on
-  `nisa.tensor_tensor(..., engine=gpsimd)`, which NKI 0.7 documents as
-  native integer arithmetic, and xor/rotate as bitvec ops. That is about
-  510 instructions per chunk. Wrap-around mod 2^32 on Trn2 has not been
-  confirmed on hardware yet. Kernels and ops are `threefry_bulk32_*`.
+  sub-products. NKI 0.7 documents `nisa.tensor_tensor` with all-int32/uint32
+  operands as native integer arithmetic on GpSimd. The full-word kernels
+  (`threefry_bulk32_{normal,uniform}_kernel`, ops
+  `trnrand::threefry_bulk32_*`) pin their adds there and do xor/rotate as
+  bitvec ops. That is about 510 compute instructions per (128, 512) chunk
+  in trn2 MLIR, against about 1,950 for bytes. On Trn2 (SDK 2.33.0) the add
+  wraps mod 2^32: results matched the 8-bit kernels exactly in
+  `test_limb_variants_bit_identical` (all 4 cases), the full `-m neuron`
+  suite (88 passed, 1 xpassed) and the 17-case edge sweep.
+- `normal` latency on Trn2, 32-bit vs 8-bit:
+
+  | n | 32-bit | 8-bit |
+  |---|---|---|
+  | 16k | 0.78 ms | 0.90 ms |
+  | 262k | 1.25 ms | 2.46 ms |
+  | 1M | 5.0 ms | 10.6 ms |
+  | 4M | 15.9 ms | 37.1 ms |
+
+- `TRNRAND_LIMB_BITS=16` (two 16-bit limbs, every add below 2^17) is kept
+  for diagnostics only. It is also bit-identical, but slower than 32 at
+  every size.
 - Plan buckets: the chunk count C no longer rounds up to a power of two.
   Launches split the chunks evenly, and C rounds up to one of
   1-8, 10, 12, 14 or 16, so a request computes at most about 25% more than it
@@ -141,7 +153,8 @@ for all three.
   and checked against the 8-bit kernels on the simulator (including
   multi-chunk/multi-launch plans and 2^24 - 5 offsets). They are added to
   the trn1/trn2 MLIR verifier check. `tests/test_nki_native.py` adds a
-  device bit-identity test for 16 and 32 against 8.
+  device bit-identity test for 16 and 32 against 8. The CPU tests check that
+  32 is the default and that the XLA path does not select the bulk kernels.
 
 #### Streaming output is in per-tile order (#58)
 

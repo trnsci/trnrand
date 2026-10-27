@@ -198,7 +198,7 @@ class TestBulkPlan:
 
     def test_limb_bits_env(self, monkeypatch):
         monkeypatch.delenv("TRNRAND_LIMB_BITS", raising=False)
-        assert dispatch._limb_bits() == 8
+        assert dispatch._limb_bits() == 32
         for v in ("8", "16", "32"):
             monkeypatch.setenv("TRNRAND_LIMB_BITS", v)
             assert dispatch._limb_bits() == int(v)
@@ -242,7 +242,7 @@ class TestBulkMatchesReference:
         assert L > 1 and C == 4
         got = dispatch.threefry_normal_nki(n, seed=99, counter_offset=2**24 - 40)
         assert torch.equal(got, _reference(n, 99, 2**24 - 40, True))
-        assert native.calls["threefry_bulk_normal"] == L
+        assert native.calls["threefry_bulk32_normal"] == L  # default width
         assert native.h2d == 6 and native.d2h == 1
 
     @pytest.mark.parametrize("n", [1, 16_384, 1_048_576, 4_194_304])
@@ -259,7 +259,7 @@ class TestBulkMatchesReference:
             shapes.append((tuple(c0.shape), tuple(start.shape)))
             return torch.zeros(LANES, start.shape[1] * 4 * c0.shape[1])
 
-        monkeypatch.setattr(dispatch, "_get_native_ops", lambda: {"threefry_bulk_normal": op})
+        monkeypatch.setattr(dispatch, "_get_native_ops", lambda: {"threefry_bulk32_normal": op})
         assert dispatch.threefry_normal_nki(n, seed=1).shape == (n,)
         assert shapes == [((LANES, F), (LANES, C))]
 
@@ -295,19 +295,30 @@ class TestBulkMatchesReference:
 
 
 class TestLimbVariants:
-    """TRNRAND_LIMB_BITS=16|32 route to their own ops and keep the same values."""
+    """TRNRAND_LIMB_BITS=8|16|32 route to their own ops and keep the same values."""
 
-    @pytest.mark.parametrize("bits,variant", [("16", "bulk16"), ("32", "bulk32")])
+    def test_xla_path_never_selects_full_words(self, monkeypatch):
+        # Trn1/XLA: integer adds are float32 (aws-neuron-sdk#1308); no bulk kernels.
+        monkeypatch.setattr(dispatch, "_use_simulator", lambda: False)
+        monkeypatch.setattr(dispatch, "_get_dispatch_path", lambda: "xla")
+        monkeypatch.delenv("TRNRAND_BULK_KERNEL", raising=False)
+        assert not dispatch._use_bulk()
+
+    @pytest.mark.parametrize(
+        "bits,variant", [(None, "bulk32"), ("32", "bulk32"), ("8", "bulk"), ("16", "bulk16")]
+    )
     @pytest.mark.parametrize("n", [1, 513, 16_385, 262_145])
     @pytest.mark.parametrize("normal", [True, False])
     def test_routes_and_values(self, native, monkeypatch, bits, variant, n, normal):
-        monkeypatch.setenv("TRNRAND_LIMB_BITS", bits)
+        if bits is not None:
+            monkeypatch.setenv("TRNRAND_LIMB_BITS", bits)
         fn = dispatch.threefry_normal_nki if normal else dispatch.threefry_uniform_nki
         got = fn(n, seed=2**40 + 3, counter_offset=2**24 - 5)
         assert torch.equal(got, _reference(n, 2**40 + 3, 2**24 - 5, normal))
         kind = "normal" if normal else "uniform"
         assert native.calls[f"threefry_{variant}_{kind}"] == dispatch._bulk_plan(n)[2]
-        assert native.calls[f"threefry_bulk_{kind}"] == 0
+        others = {"bulk", "bulk16", "bulk32"} - {variant}
+        assert all(native.calls[f"threefry_{o}_{kind}"] == 0 for o in others)
 
     @pytest.mark.parametrize("parts", [2, 4])
     def test_partitioned_generators(self, native, monkeypatch, parts):
@@ -324,6 +335,7 @@ class TestLimbVariants:
         ]
         assert torch.equal(torch.cat(chunks), full)
         assert native.calls["threefry_bulk_normal"] == 0
+        assert native.calls["threefry_bulk16_normal"] > 0
 
 
 # numpy port of the 16-bit limb kernel (`_threefry_bulk16_body`), op for op.

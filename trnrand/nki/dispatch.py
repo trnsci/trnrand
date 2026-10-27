@@ -2601,7 +2601,7 @@ if HAS_NKI:
         """Uniform twin of `threefry_bulk_normal_kernel`: float32 in [0, 1), same layout."""
         return _threefry_bulk_body(c0_ref, start_ref, k0_ref, k1_ref, k2_ref, k3_ref, False)
 
-    # ── 16-bit limb variant of the bulk kernels (#60, TRNRAND_LIMB_BITS=16) ──
+    # ── 16-bit limb variant of the bulk kernels (#60, TRNRAND_LIMB_BITS=16, diagnostic) ──
     #
     # Why limbs at all: aws-neuron-sdk#1308 / ed05ad3 -- integer arithmetic
     # (`nl.add`, `nl.multiply`, `tensor_scalar_arith`) runs through the
@@ -2822,14 +2822,14 @@ if HAS_NKI:
         """`threefry_bulk_uniform_kernel` on 16-bit limbs; same inputs, layout and bits."""
         return _threefry_bulk16_body(c0_ref, start_ref, k0_ref, k1_ref, k2_ref, k3_ref, False)
 
-    # ── Full-word variant (#60, TRNRAND_LIMB_BITS=32, experimental) ──────────
+    # ── Full-word variant (#60, TRNRAND_LIMB_BITS=32, the native default) ──────
     #
     # NKI 0.7 documents that `nisa.tensor_tensor` with all-int32/uint32
     # operands runs on the GpSimd engine with native integer arithmetic
     # ("exact results for all 32-bit integer values"); earlier NKI routed it
-    # through float32. Whether the add WRAPS mod 2^32 (rather than saturating)
-    # on Trn2 is not documented and the simulator cannot tell, so this path is
-    # opt-in until the device run confirms bit-identity. Adds are pinned to
+    # through float32. The docs do not say the add WRAPS mod 2^32 and the
+    # simulator cannot tell; the Trn2 run of ea3800e confirmed it (bit-identical
+    # to the 8-bit kernels, tests/test_nki_native.py). Adds are pinned to
     # GpSimd; xor and rotate are bitvec ops (Vector engine, bit patterns).
     # Key words are broadcast to (P, F) once per launch, since
     # `tensor_scalar` arithmetic operands must be float32.
@@ -3205,7 +3205,11 @@ def _bulk_launches(normal: bool, n_elements, seed, counter_offset):
     """
     LANES = _THREEFRY_LANES
     F, C, n_launches = _bulk_plan(n_elements)
-    variant = {8: "bulk", 16: "bulk16", 32: "bulk32"}[_limb_bits()]
+    # Full-word (32) kernels only on the native TorchNeuron (Trn2+) path and the
+    # simulator; anything else keeps the 8-bit kernels (aws-neuron-sdk#1308).
+    native = _use_simulator() or _get_dispatch_path() == "native"
+    bits = _limb_bits() if native else 8
+    variant = {8: "bulk", 16: "bulk16", 32: "bulk32"}[bits]
     op_name = f"threefry_{variant}_{'normal' if normal else 'uniform'}"
     kernel_name = op_name + "_kernel"
 
@@ -3245,18 +3249,20 @@ def _bulk_launches(normal: bool, n_elements, seed, counter_offset):
 
 
 def _limb_bits() -> int:
-    """Limb width of the bulk Threefry kernels: TRNRAND_LIMB_BITS=8 (default), 16 or 32.
+    """Word width of the bulk Threefry kernels on the native path (#60).
 
-    All widths compute the same values. 16-bit limbs issue about half the
-    instructions of 8-bit ones; 32 (full words, GpSimd integer adds) is
-    experimental until confirmed bit-identical on Trn2.
+    TRNRAND_LIMB_BITS=32 (default): full uint32 words, adds on GpSimd native
+    integer arithmetic (wraps mod 2^32 on Trn2). TRNRAND_LIMB_BITS=8: the
+    byte-limb kernels, the documented fallback. 16 is a diagnostic width.
+    All three are bit-identical. The XLA/Trn1 path never uses the bulk
+    kernels (it streams), so this never changes it.
     """
     env = os.environ.get("TRNRAND_LIMB_BITS", "").strip()
-    if env in ("", "8"):
-        return 8
-    if env in ("16", "32"):
+    if env in ("", "32"):
+        return 32
+    if env in ("8", "16"):
         return int(env)
-    raise ValueError(f"TRNRAND_LIMB_BITS must be 8, 16 or 32, got {env!r}")
+    raise ValueError(f"TRNRAND_LIMB_BITS must be 32, 8 or 16, got {env!r}")
 
 
 def _use_bulk() -> bool:
