@@ -132,10 +132,12 @@ class _FakeNative:
 
             return run
 
-        return {
-            "threefry_bulk_normal": counted("threefry_bulk_normal", _fake_bulk(True)),
-            "threefry_bulk_uniform": counted("threefry_bulk_uniform", _fake_bulk(False)),
-        }
+        ops = {}
+        for variant in ("bulk", "bulk16", "bulk32"):  # TRNRAND_LIMB_BITS = 8 / 16 / 32
+            for kind, normal in (("normal", True), ("uniform", False)):
+                name = f"threefry_{variant}_{kind}"
+                ops[name] = counted(name, _fake_bulk(normal))
+        return ops
 
     def to_device(self, t):
         self.h2d += 1
@@ -156,6 +158,7 @@ def native(monkeypatch):
     monkeypatch.setattr(dispatch, "_d2h", nat.to_host)
     monkeypatch.delenv("TRNRAND_BULK_STREAMING", raising=False)
     monkeypatch.delenv("TRNRAND_BULK_KERNEL", raising=False)
+    monkeypatch.delenv("TRNRAND_LIMB_BITS", raising=False)
     return nat
 
 
@@ -172,12 +175,36 @@ class TestBulkPlan:
             (262_144, (512, 1, 1)),
             (262_145, (512, 2, 1)),
             (1_048_576, (512, 4, 1)),
+            (1_048_577, (512, 5, 1)),  # was (512, 8, 1): 1.7x the 2^20 latency
+            (3 * 2**20, (512, 12, 1)),
             (4_194_304, (512, 16, 1)),
-            (4_194_305, (512, 16, 2)),
+            (4_194_305, (512, 10, 2)),  # 17 chunks: 2 x 10, not 2 x 16
         ],
     )
     def test_plan(self, n, plan):
         assert dispatch._bulk_plan(n) == plan
+
+    def test_plan_overcompute_and_shape_count(self):
+        # Every request computes at most ~25% more chunks than it needs (one
+        # chunk minimum), and a bounded set of C values (NEFF shapes) appears.
+        cs = set()
+        for chunks in range(1, 200):
+            n = chunks * 512 * LANES * 4
+            F, C, L = dispatch._bulk_plan(n)
+            assert F == 512 and C <= dispatch._BULK_CHUNKS_MAX
+            assert 0 <= C * L - chunks <= max(1, chunks // 4)
+            cs.add(C)
+        assert cs <= {1, 2, 3, 4, 5, 6, 7, 8, 10, 12, 14, 16}
+
+    def test_limb_bits_env(self, monkeypatch):
+        monkeypatch.delenv("TRNRAND_LIMB_BITS", raising=False)
+        assert dispatch._limb_bits() == 8
+        for v in ("8", "16", "32"):
+            monkeypatch.setenv("TRNRAND_LIMB_BITS", v)
+            assert dispatch._limb_bits() == int(v)
+        monkeypatch.setenv("TRNRAND_LIMB_BITS", "12")
+        with pytest.raises(ValueError):
+            dispatch._limb_bits()
 
     @pytest.mark.parametrize("n", [1, 777, 16_385, 300_000, 5_000_000])
     def test_plan_covers_request(self, n):
@@ -267,6 +294,125 @@ class TestBulkMatchesReference:
         assert not dispatch._use_bulk()
 
 
+class TestLimbVariants:
+    """TRNRAND_LIMB_BITS=16|32 route to their own ops and keep the same values."""
+
+    @pytest.mark.parametrize("bits,variant", [("16", "bulk16"), ("32", "bulk32")])
+    @pytest.mark.parametrize("n", [1, 513, 16_385, 262_145])
+    @pytest.mark.parametrize("normal", [True, False])
+    def test_routes_and_values(self, native, monkeypatch, bits, variant, n, normal):
+        monkeypatch.setenv("TRNRAND_LIMB_BITS", bits)
+        fn = dispatch.threefry_normal_nki if normal else dispatch.threefry_uniform_nki
+        got = fn(n, seed=2**40 + 3, counter_offset=2**24 - 5)
+        assert torch.equal(got, _reference(n, 2**40 + 3, 2**24 - 5, normal))
+        kind = "normal" if normal else "uniform"
+        assert native.calls[f"threefry_{variant}_{kind}"] == dispatch._bulk_plan(n)[2]
+        assert native.calls[f"threefry_bulk_{kind}"] == 0
+
+    @pytest.mark.parametrize("parts", [2, 4])
+    def test_partitioned_generators(self, native, monkeypatch, parts):
+        monkeypatch.setenv("TRNRAND_LIMB_BITS", "16")
+        monkeypatch.setattr(distributions, "_nki_active", lambda: True)
+        n = 512 * parts * 37
+        full = trnrand.normal(n, generator=trnrand.Generator(seed=31))
+        chunks = [
+            trnrand.normal(
+                n // parts,
+                generator=trnrand.Generator(seed=31, partition_rank=r, partition_size=parts),
+            )
+            for r in range(parts)
+        ]
+        assert torch.equal(torch.cat(chunks), full)
+        assert native.calls["threefry_bulk_normal"] == 0
+
+
+# numpy port of the 16-bit limb kernel (`_threefry_bulk16_body`), op for op.
+# Every add runs in float32, as the engines do for integer arithmetic, so this
+# checks the exactness envelope (no intermediate >= 2^24) on CPU without NKI.
+
+
+def _f32_add(*xs):
+    acc = np.float32(0)
+    for x in xs:
+        acc = (np.asarray(acc, np.float32) + np.asarray(x, np.uint64).astype(np.float32)).astype(
+            np.float32
+        )
+    assert float(np.max(acc)) < 2**24
+    return acc.astype(np.uint64)
+
+
+def _add32_h_np(a, b):
+    s0 = _f32_add(a[0], b[0])
+    s1 = _f32_add(a[1], b[1], s0 >> np.uint64(16))
+    return [s0 & np.uint64(0xFFFF), s1 & np.uint64(0xFFFF)]
+
+
+def _rotl32_h_np(x, rot):
+    q, r = divmod(rot, 16)
+    a, b = (x[0], x[1]) if q == 0 else (x[1], x[0])
+    if r == 0:
+        return [a, b]
+    m = np.uint64((1 << (16 - r)) - 1)
+    s, t = np.uint64(r), np.uint64(16 - r)
+    return [((a & m) << s) | (b >> t), ((b & m) << s) | (a >> t)]
+
+
+def _threefry_limb16_np(c0, c1, k0, k1):
+    def h(v):
+        v = np.asarray(v, np.uint64)
+        return [v & np.uint64(0xFFFF), v >> np.uint64(16)]
+
+    shape = np.broadcast(c0, c1).shape
+    z = np.zeros(shape, np.uint64)
+    x = [h(np.broadcast_to(c0, shape)), h(np.broadcast_to(c1, shape)), h(z), h(z)]
+    ks = [k0, k1, 0, 0, k0 ^ k1 ^ PARITY]
+
+    def inject(s):
+        for i in range(4):
+            k = (ks[(s + i) % 5] + (s if i == 3 else 0)) & 0xFFFFFFFF
+            x[i] = _add32_h_np(x[i], h(np.full(shape, k, np.uint64)))
+
+    inject(0)
+    for rnd in range(20):
+        ra, rb = ROT[rnd % 4]
+        pairs = [(0, 1, ra), (2, 3, rb)] if rnd % 2 == 0 else [(0, 3, ra), (2, 1, rb)]
+        for i, j, rot in pairs:
+            x[i] = _add32_h_np(x[i], x[j])
+            xr = _rotl32_h_np(x[j], rot)
+            x[j] = [xr[0] ^ x[i][0], xr[1] ^ x[i][1]]
+        if (rnd + 1) % 4 == 0:
+            inject((rnd + 1) // 4)
+    return [w[0] | (w[1] << np.uint64(16)) for w in x]
+
+
+class TestLimb16Arithmetic:
+    @pytest.mark.parametrize("seed", [0, 12345, 2**40 + 3, 2**48 - 1])
+    @pytest.mark.parametrize("offset", [0, 2**24 - 5, 2**24 - 1])
+    def test_matches_full_word_reference(self, seed, offset):
+        p = np.arange(LANES, dtype=np.uint64)[None, :]
+        b = ((offset + np.arange(64, dtype=np.uint64)) & np.uint64(0xFFFFFF))[:, None]
+        k0, k1 = seed & 0xFFFFFF, (seed >> 24) & 0xFFFFFF
+        want = _threefry_np(p, b, k0, k1)
+        got = _threefry_limb16_np(p, b, k0, k1)
+        for w, g in zip(want, got, strict=True):
+            assert np.array_equal(w, g)
+
+    def test_all_rotations_and_carries(self):
+        rng = np.random.default_rng(0)
+        v = rng.integers(0, 2**32, 4096, dtype=np.uint64)
+        v[:4] = [0, 0xFFFFFFFF, 0xFFFF, 0xFFFF0000]
+        w = rng.integers(0, 2**32, 4096, dtype=np.uint64)
+        w[:4] = [0xFFFFFFFF, 1, 1, 0x10000]
+        hv = [v & np.uint64(0xFFFF), v >> np.uint64(16)]
+        hw = [w & np.uint64(0xFFFF), w >> np.uint64(16)]
+        s = _add32_h_np(hv, hw)
+        assert np.array_equal(s[0] | (s[1] << np.uint64(16)), (v + w) & M32)
+        for rot in range(1, 32):
+            r = _rotl32_h_np(hv, rot)
+            want = ((v << np.uint64(rot)) | (v >> np.uint64(32 - rot))) & M32
+            assert np.array_equal(r[0] | (r[1] << np.uint64(16)), want)
+
+
 # ── Simulator: real bulk kernels vs the caa9aec streaming kernels ─────────────
 
 
@@ -294,6 +440,32 @@ class TestBulkKernelSimulator:
         assert torch.equal(new, self._old(normal, n, seed, offset))
         if not normal:
             assert torch.equal(new, _reference(n, seed, offset, False))
+
+    @pytest.mark.parametrize("bits", ["16", "32"])
+    @pytest.mark.parametrize("normal", [True, False])
+    @pytest.mark.parametrize(
+        "n,seed,offset",
+        [(1, 0, 0), (513, 7, 3), (16_385, 12345, 2**24 - 5), (70_001, 2**40 + 3, 2**24 - 40)],
+    )
+    def test_limb_variant_matches(self, monkeypatch, bits, normal, n, seed, offset):
+        monkeypatch.setenv("TRNRAND_LIMB_BITS", "8")
+        old = dispatch._bulk_launches(normal, n, seed, offset)
+        monkeypatch.setenv("TRNRAND_LIMB_BITS", bits)
+        new = dispatch._bulk_launches(normal, n, seed, offset)
+        assert torch.equal(new, old)
+        if not normal:
+            assert torch.equal(new, _reference(n, seed, offset, False))
+
+    @pytest.mark.parametrize("bits", ["16", "32"])
+    def test_limb_variant_multi_chunk(self, monkeypatch, bits):
+        monkeypatch.setattr(dispatch, "_BULK_COLS_MAX", 32)
+        monkeypatch.setattr(dispatch, "_BULK_CHUNKS_MAX", 2)
+        n = 3 * 32 * 512 + 100
+        for normal in (True, False):
+            monkeypatch.setenv("TRNRAND_LIMB_BITS", "8")
+            old = dispatch._bulk_launches(normal, n, 77, 2**24 - 50)
+            monkeypatch.setenv("TRNRAND_LIMB_BITS", bits)
+            assert torch.equal(dispatch._bulk_launches(normal, n, 77, 2**24 - 50), old)
 
     def test_multi_chunk_multi_launch(self, monkeypatch):
         monkeypatch.setattr(dispatch, "_BULK_COLS_MAX", 32)

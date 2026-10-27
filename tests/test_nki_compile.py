@@ -52,6 +52,11 @@ _KERNEL_INPUTS = {
     # The largest default shape, F = 512 columns × C = 16 chunks.
     "threefry_bulk_normal_kernel": lambda: _bulk(512, 16),
     "threefry_bulk_uniform_kernel": lambda: _bulk(512, 16),
+    # Same kernels on 16-bit limbs / full words (TRNRAND_LIMB_BITS=16|32).
+    "threefry_bulk16_normal_kernel": lambda: _bulk(512, 16),
+    "threefry_bulk16_uniform_kernel": lambda: _bulk(512, 16),
+    "threefry_bulk32_normal_kernel": lambda: _bulk(512, 16),
+    "threefry_bulk32_uniform_kernel": lambda: _bulk(512, 16),
 }
 
 

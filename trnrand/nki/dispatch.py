@@ -424,14 +424,34 @@ def _next_pow2(n: int) -> int:
     return 1 << max(0, int(n) - 1).bit_length()
 
 
+def _chunk_bucket(chunks: int) -> int:
+    """Smallest allowed chunk count >= `chunks`: powers of two and their 1.5x / 1.25x
+    / 1.75x midpoints (1, 2, 3, 4, 5, 6, 7, 8, 10, 12, 14, 16, ...), capped at
+    _BULK_CHUNKS_MAX. At most ~4 chunk shapes per octave, so the NEFF count stays
+    bounded, and a request never computes more than ~25% extra chunks (the
+    pure power-of-two rounding cost up to 2x: 2^20 + 1 values ran 8 chunks)."""
+    chunks = max(1, int(chunks))
+    if chunks <= 4:
+        return chunks
+    p = _next_pow2(chunks) // 2  # chunks in (p, 2p]
+    step = p // 4
+    return min(_BULK_CHUNKS_MAX, -(-chunks // step) * step)
+
+
 def _bulk_plan(n_elements: int) -> tuple[int, int, int]:
-    """(cols F, chunks C, launches) for `n_elements` values on the bulk kernels."""
+    """(cols F, chunks C, launches) for `n_elements` values on the bulk kernels.
+
+    Launches split the chunks as evenly as possible, then C is rounded up to a
+    `_chunk_bucket` size, so the total work tracks the request instead of
+    jumping to the next power of two.
+    """
     n_batches = max(1, -(-int(n_elements) // (_THREEFRY_LANES * 4)))
     if n_batches <= _BULK_COLS_MAX:
         return max(_BULK_COLS_MIN, _next_pow2(n_batches)), 1, 1
     F = _BULK_COLS_MAX
     chunks = -(-n_batches // F)
-    C = min(_BULK_CHUNKS_MAX, _next_pow2(chunks))
+    launches = -(-chunks // _BULK_CHUNKS_MAX)
+    C = _chunk_bucket(-(-chunks // launches))
     return F, C, -(-chunks // C)
 
 
@@ -2581,6 +2601,386 @@ if HAS_NKI:
         """Uniform twin of `threefry_bulk_normal_kernel`: float32 in [0, 1), same layout."""
         return _threefry_bulk_body(c0_ref, start_ref, k0_ref, k1_ref, k2_ref, k3_ref, False)
 
+    # ── 16-bit limb variant of the bulk kernels (#60, TRNRAND_LIMB_BITS=16) ──
+    #
+    # Why limbs at all: aws-neuron-sdk#1308 / ed05ad3 -- integer arithmetic
+    # (`nl.add`, `nl.multiply`, `tensor_scalar_arith`) runs through the
+    # engines' float32 datapath, so a uint32 add is exact only while every
+    # operand and result is < 2^24. A full-word (mod 2^32) add is therefore
+    # not available; bitwise ops (and/or/xor/shifts, `tensor_scalar_bitvec`)
+    # are integer-exact. Bytes (8-bit limbs) were chosen originally because
+    # the Philox 32x32 multiply needed byte sub-products (<= 2^16) and the
+    # Threefry port reused the same representation. Threefry has no multiply,
+    # so 16-bit limbs suffice: limb + limb + carry <= 2^17 - 1, exact in fp32.
+    # Every word is [lo, hi], each a (P, F) uint32 tile in [0, 2^16).
+    # Half the limbs -> about half the instructions per add / xor / rotate.
+    # Left shifts mask first, so no intermediate ever reaches 2^16 either.
+
+    _THREEFRY_ROT_QR16 = tuple((rot // 16, rot % 16) for pair in THREEFRY_ROTATIONS for rot in pair)
+
+    def _w16_from_bytes_f32(b):
+        """Four (P, 1) uint32 byte tiles -> [lo, hi] (P, 1) float32 limbs (< 2^16)."""
+        lo = nl.bitwise_or(b[0], nl.left_shift(b[1], 8, dtype=nl.uint32), dtype=nl.uint32)
+        hi = nl.bitwise_or(b[2], nl.left_shift(b[3], 8, dtype=nl.uint32), dtype=nl.uint32)
+        return [nl.copy(lo, dtype=nl.float32), nl.copy(hi, dtype=nl.float32)]
+
+    def _add32_h(a_h, b_h):
+        """(a + b) mod 2^32, both [lo, hi] (P, F) uint32 limbs; sums < 2^17."""
+        s0 = _nki_add_u32(a_h[0], b_h[0])
+        c0 = nl.right_shift(s0, 16, dtype=nl.uint32)
+        r0 = nl.bitwise_and(s0, 0xFFFF, dtype=nl.uint32)
+        s1 = _nki_add_u32(_nki_add_u32(a_h[1], b_h[1]), c0)
+        r1 = nl.bitwise_and(s1, 0xFFFF, dtype=nl.uint32)
+        return [r0, r1]
+
+    def _add32_hs(a_h, k_f):
+        """(a + k) mod 2^32; a: [lo, hi] (P, F) uint32, k: [lo, hi] (P, 1) float32."""
+        s0 = _ts_add_u32(a_h[0], k_f[0])
+        c0 = nl.right_shift(s0, 16, dtype=nl.uint32)
+        r0 = nl.bitwise_and(s0, 0xFFFF, dtype=nl.uint32)
+        s1 = _nki_add_u32(_ts_add_u32(a_h[1], k_f[1]), c0)
+        r1 = nl.bitwise_and(s1, 0xFFFF, dtype=nl.uint32)
+        return [r0, r1]
+
+    def _rot_limb16(h, lo_src, r):
+        """((h << r) | (lo_src >> (16 - r))) & 0xFFFF with h masked before the shift."""
+        return nl.bitwise_or(
+            nl.left_shift(
+                nl.bitwise_and(h, (1 << (16 - r)) - 1, dtype=nl.uint32), r, dtype=nl.uint32
+            ),
+            nl.right_shift(lo_src, 16 - r, dtype=nl.uint32),
+            dtype=nl.uint32,
+        )
+
+    def _rotl32_h(x_h, q, r):
+        """Rotate-left by 16 q + r bits on [lo, hi] limbs."""
+        if q == 0:
+            a, b = x_h[0], x_h[1]
+        else:
+            a, b = x_h[1], x_h[0]
+        # After the q swap the word is b:a; output lo = (a << r) | (b >> (16 - r)), hi likewise.
+        if r == 0:
+            return [a, b]
+        return [_rot_limb16(a, b, r), _rot_limb16(b, a, r)]
+
+    def _mix_h(a_h, b_h, q, r):
+        a_new = _add32_h(a_h, b_h)
+        b_rot = _rotl32_h(b_h, q, r)
+        b_new = [
+            nl.bitwise_xor(b_rot[0], a_new[0], dtype=nl.uint32),
+            nl.bitwise_xor(b_rot[1], a_new[1], dtype=nl.uint32),
+        ]
+        return a_new, b_new
+
+    def _key_inject_hs(x_h, ks_f, ksp_f, step):
+        out0 = _add32_hs(x_h[0], ks_f[(step + 0) % 5])
+        out1 = _add32_hs(x_h[1], ks_f[(step + 1) % 5])
+        out2 = _add32_hs(x_h[2], ks_f[(step + 2) % 5])
+        out3 = _add32_hs(x_h[3], ksp_f[step])
+        return [out0, out1, out2, out3]
+
+    def _u24_f32_h(w, scale65536):
+        """Low 24 bits of a [lo, hi] word as float32 lo + 65536 (hi & 0xFF) (exact)."""
+        return nl.add(
+            nl.copy(w[0], dtype=nl.float32),
+            nl.multiply(
+                nl.copy(nl.bitwise_and(w[1], 0xFF, dtype=nl.uint32), dtype=nl.float32),
+                scale65536,
+                dtype=nl.float32,
+            ),
+            dtype=nl.float32,
+        )
+
+    def _threefry_bulk16_body(c0_ref, start_ref, k0_ref, k1_ref, k2_ref, k3_ref, normal):
+        P = c0_ref.shape[0]
+        F = c0_ref.shape[1]
+        C = start_ref.shape[1]
+
+        # Key schedule on (P, 1) byte tiles (as in the 8-bit body), then 16-bit limbs.
+        k0_b = _b_split(k0_ref)
+        k1_b = _b_split(k1_ref)
+        k2_b = _b_split(k2_ref)
+        k3_b = _b_split(k3_ref)
+        parity_b = _b_from_scalar(P, THREEFRY_SKEIN_KS_PARITY)
+        k4_b = _xor32_b(_xor32_b(_xor32_b(_xor32_b(k0_b, k1_b), k2_b), k3_b), parity_b)
+        ks_b = [k0_b, k1_b, k2_b, k3_b, k4_b]
+        ks_f = [
+            _w16_from_bytes_f32(k0_b),
+            _w16_from_bytes_f32(k1_b),
+            _w16_from_bytes_f32(k2_b),
+            _w16_from_bytes_f32(k3_b),
+            _w16_from_bytes_f32(k4_b),
+        ]
+        ksp_f = [
+            _w16_from_bytes_f32(_add32_b(ks_b[3], _b_from_scalar(P, 0))),
+            _w16_from_bytes_f32(_add32_b(ks_b[4], _b_from_scalar(P, 1))),
+            _w16_from_bytes_f32(_add32_b(ks_b[0], _b_from_scalar(P, 2))),
+            _w16_from_bytes_f32(_add32_b(ks_b[1], _b_from_scalar(P, 3))),
+            _w16_from_bytes_f32(_add32_b(ks_b[2], _b_from_scalar(P, 4))),
+            _w16_from_bytes_f32(_add32_b(ks_b[3], _b_from_scalar(P, 5))),
+        ]
+
+        zero = nl.full((P, F), 0, dtype=nl.uint32)
+        c0_u = _as_u32(nl.load(c0_ref))  # lane index p < 128 in every column
+        c0_h = [c0_u, zero]
+
+        col = nl.ndarray((P, F), dtype=nl.uint32, buffer=nl.sbuf)
+        nisa.iota(col, [[1, F]], offset=0, channel_multiplier=0)
+        col_h = [col, zero]  # F <= 2^16
+
+        inv24 = nl.full((P, 1), 1.0 / 16777216.0, dtype=nl.float32)
+        scale65536 = nl.full((P, 1), 65536.0, dtype=nl.float32)
+        clamp_eps = nl.full((P, 1), 1e-7, dtype=nl.float32)
+        neg_two = nl.full((P, 1), -2.0, dtype=nl.float32)
+        two_pi = nl.full((P, 1), TWO_PI, dtype=nl.float32)
+
+        out = nl.ndarray((P, C * 4 * F), dtype=nl.float32, buffer=nl.shared_hbm)
+
+        for c in nl.static_range(C):
+            # c1 = (start[c] + j) & 0xFFFFFF; start[c] is already masked to 24 bits.
+            start_b = _b_split(start_ref[:, c : c + 1])
+            c1_full = _add32_hs(col_h, _w16_from_bytes_f32(start_b))
+            c1_h = [c1_full[0], nl.bitwise_and(c1_full[1], 0xFF, dtype=nl.uint32)]
+
+            _ki = _key_inject_hs([c0_h, c1_h, [zero, zero], [zero, zero]], ks_f, ksp_f, 0)
+            x0 = _ki[0]
+            x1 = _ki[1]
+            x2 = _ki[2]
+            x3 = _ki[3]
+
+            for round_num in nl.static_range(THREEFRY_ROUNDS):
+                pair_idx = round_num % 4
+                q0, r0 = _THREEFRY_ROT_QR16[pair_idx * 2 + 0]
+                q1, r1 = _THREEFRY_ROT_QR16[pair_idx * 2 + 1]
+                if round_num % 2 == 0:
+                    x0, x1 = _mix_h(x0, x1, q0, r0)
+                    x2, x3 = _mix_h(x2, x3, q1, r1)
+                else:
+                    x0, x3 = _mix_h(x0, x3, q0, r0)
+                    x2, x1 = _mix_h(x2, x1, q1, r1)
+                if (round_num + 1) % 4 == 0:
+                    _ki = _key_inject_hs([x0, x1, x2, x3], ks_f, ksp_f, (round_num + 1) // 4)
+                    x0 = _ki[0]
+                    x1 = _ki[1]
+                    x2 = _ki[2]
+                    x3 = _ki[3]
+
+            res = nl.ndarray((P, 4 * F), dtype=nl.float32, buffer=nl.sbuf)
+            if normal:
+                u0 = nl.maximum(
+                    nl.multiply(_u24_f32_h(x0, scale65536), inv24, dtype=nl.float32), clamp_eps
+                )
+                u1 = nl.maximum(
+                    nl.multiply(_u24_f32_h(x1, scale65536), inv24, dtype=nl.float32), clamp_eps
+                )
+                u2 = nl.maximum(
+                    nl.multiply(_u24_f32_h(x2, scale65536), inv24, dtype=nl.float32), clamp_eps
+                )
+                u3 = nl.maximum(
+                    nl.multiply(_u24_f32_h(x3, scale65536), inv24, dtype=nl.float32), clamp_eps
+                )
+                bm_r0 = nl.sqrt(nl.multiply(nl.log(u0), neg_two))
+                bm_theta0 = nl.multiply(u1, two_pi)
+                bm_r1 = nl.sqrt(nl.multiply(nl.log(u2), neg_two))
+                bm_theta1 = nl.multiply(u3, two_pi)
+                nisa.tensor_tensor(res[:, 0:F], bm_r0, nl.cos(bm_theta0), op=nl.multiply)
+                nisa.tensor_tensor(res[:, F : 2 * F], bm_r0, nl.sin(bm_theta0), op=nl.multiply)
+                nisa.tensor_tensor(res[:, 2 * F : 3 * F], bm_r1, nl.cos(bm_theta1), op=nl.multiply)
+                nisa.tensor_tensor(res[:, 3 * F : 4 * F], bm_r1, nl.sin(bm_theta1), op=nl.multiply)
+            else:
+                nisa.tensor_scalar(
+                    res[:, 0:F], _u24_f32_h(x0, scale65536), op0=nl.multiply, operand0=inv24
+                )
+                nisa.tensor_scalar(
+                    res[:, F : 2 * F], _u24_f32_h(x1, scale65536), op0=nl.multiply, operand0=inv24
+                )
+                nisa.tensor_scalar(
+                    res[:, 2 * F : 3 * F],
+                    _u24_f32_h(x2, scale65536),
+                    op0=nl.multiply,
+                    operand0=inv24,
+                )
+                nisa.tensor_scalar(
+                    res[:, 3 * F : 4 * F],
+                    _u24_f32_h(x3, scale65536),
+                    op0=nl.multiply,
+                    operand0=inv24,
+                )
+
+            base = c * 4 * F
+            nl.store(out[:, base : base + 4 * F], res)
+
+        return out
+
+    @nki.jit
+    def threefry_bulk16_normal_kernel(c0_ref, start_ref, k0_ref, k1_ref, k2_ref, k3_ref):
+        """`threefry_bulk_normal_kernel` on 16-bit limbs; same inputs, layout and bits."""
+        return _threefry_bulk16_body(c0_ref, start_ref, k0_ref, k1_ref, k2_ref, k3_ref, True)
+
+    @nki.jit
+    def threefry_bulk16_uniform_kernel(c0_ref, start_ref, k0_ref, k1_ref, k2_ref, k3_ref):
+        """`threefry_bulk_uniform_kernel` on 16-bit limbs; same inputs, layout and bits."""
+        return _threefry_bulk16_body(c0_ref, start_ref, k0_ref, k1_ref, k2_ref, k3_ref, False)
+
+    # ── Full-word variant (#60, TRNRAND_LIMB_BITS=32, experimental) ──────────
+    #
+    # NKI 0.7 documents that `nisa.tensor_tensor` with all-int32/uint32
+    # operands runs on the GpSimd engine with native integer arithmetic
+    # ("exact results for all 32-bit integer values"); earlier NKI routed it
+    # through float32. Whether the add WRAPS mod 2^32 (rather than saturating)
+    # on Trn2 is not documented and the simulator cannot tell, so this path is
+    # opt-in until the device run confirms bit-identity. Adds are pinned to
+    # GpSimd; xor and rotate are bitvec ops (Vector engine, bit patterns).
+    # Key words are broadcast to (P, F) once per launch, since
+    # `tensor_scalar` arithmetic operands must be float32.
+
+    def _add32_w(x, y):
+        out = nl.ndarray(x.shape, dtype=nl.uint32, buffer=nl.sbuf)
+        nisa.tensor_tensor(out, x, y, op=nl.add, engine=nisa.engine.gpsimd)
+        return out
+
+    def _rotl32_w(x, rot):
+        return nl.bitwise_or(
+            nl.left_shift(x, rot, dtype=nl.uint32),
+            nl.right_shift(x, 32 - rot, dtype=nl.uint32),
+            dtype=nl.uint32,
+        )
+
+    def _mix_w(a, b, rot):
+        a_new = _add32_w(a, b)
+        b_new = nl.bitwise_xor(_rotl32_w(b, rot), a_new, dtype=nl.uint32)
+        return a_new, b_new
+
+    def _pack_bytes_wide(b, zero):
+        """Four (P, 1) uint32 byte tiles -> one (P, F) uint32 word (broadcast over F)."""
+        w = nl.bitwise_or(
+            nl.bitwise_or(b[0], nl.left_shift(b[1], 8, dtype=nl.uint32), dtype=nl.uint32),
+            nl.bitwise_or(
+                nl.left_shift(b[2], 16, dtype=nl.uint32),
+                nl.left_shift(b[3], 24, dtype=nl.uint32),
+                dtype=nl.uint32,
+            ),
+            dtype=nl.uint32,
+        )
+        return nl.bitwise_or(zero, w, dtype=nl.uint32)
+
+    def _key_inject_w(x, ks_w, ksp_w, step):
+        return [
+            _add32_w(x[0], ks_w[(step + 0) % 5]),
+            _add32_w(x[1], ks_w[(step + 1) % 5]),
+            _add32_w(x[2], ks_w[(step + 2) % 5]),
+            _add32_w(x[3], ksp_w[step]),
+        ]
+
+    def _u24_f32_w(w):
+        return nl.copy(nl.bitwise_and(w, 0xFFFFFF, dtype=nl.uint32), dtype=nl.float32)
+
+    def _threefry_bulk32_body(c0_ref, start_ref, k0_ref, k1_ref, k2_ref, k3_ref, normal):
+        P = c0_ref.shape[0]
+        F = c0_ref.shape[1]
+        C = start_ref.shape[1]
+        zero = nl.full((P, F), 0, dtype=nl.uint32)
+
+        k0_b = _b_split(k0_ref)
+        k1_b = _b_split(k1_ref)
+        k2_b = _b_split(k2_ref)
+        k3_b = _b_split(k3_ref)
+        parity_b = _b_from_scalar(P, THREEFRY_SKEIN_KS_PARITY)
+        k4_b = _xor32_b(_xor32_b(_xor32_b(_xor32_b(k0_b, k1_b), k2_b), k3_b), parity_b)
+        ks_b = [k0_b, k1_b, k2_b, k3_b, k4_b]
+        ks_w = [
+            _pack_bytes_wide(k0_b, zero),
+            _pack_bytes_wide(k1_b, zero),
+            _pack_bytes_wide(k2_b, zero),
+            _pack_bytes_wide(k3_b, zero),
+            _pack_bytes_wide(k4_b, zero),
+        ]
+        ksp_w = [
+            _pack_bytes_wide(_add32_b(ks_b[3], _b_from_scalar(P, 0)), zero),
+            _pack_bytes_wide(_add32_b(ks_b[4], _b_from_scalar(P, 1)), zero),
+            _pack_bytes_wide(_add32_b(ks_b[0], _b_from_scalar(P, 2)), zero),
+            _pack_bytes_wide(_add32_b(ks_b[1], _b_from_scalar(P, 3)), zero),
+            _pack_bytes_wide(_add32_b(ks_b[2], _b_from_scalar(P, 4)), zero),
+            _pack_bytes_wide(_add32_b(ks_b[3], _b_from_scalar(P, 5)), zero),
+        ]
+
+        c0_w = _as_u32(nl.load(c0_ref))
+        col = nl.ndarray((P, F), dtype=nl.uint32, buffer=nl.sbuf)
+        nisa.iota(col, [[1, F]], offset=0, channel_multiplier=0)
+
+        inv24 = nl.full((P, 1), 1.0 / 16777216.0, dtype=nl.float32)
+        clamp_eps = nl.full((P, 1), 1e-7, dtype=nl.float32)
+        neg_two = nl.full((P, 1), -2.0, dtype=nl.float32)
+        two_pi = nl.full((P, 1), TWO_PI, dtype=nl.float32)
+
+        out = nl.ndarray((P, C * 4 * F), dtype=nl.float32, buffer=nl.shared_hbm)
+
+        for c in nl.static_range(C):
+            start_w = _pack_bytes_wide(_b_split(start_ref[:, c : c + 1]), zero)
+            c1_w = nl.bitwise_and(_add32_w(col, start_w), 0xFFFFFF, dtype=nl.uint32)
+
+            _ki = _key_inject_w([c0_w, c1_w, zero, zero], ks_w, ksp_w, 0)
+            x0 = _ki[0]
+            x1 = _ki[1]
+            x2 = _ki[2]
+            x3 = _ki[3]
+
+            for round_num in nl.static_range(THREEFRY_ROUNDS):
+                rot0, rot1 = THREEFRY_ROTATIONS[round_num % 4]
+                if round_num % 2 == 0:
+                    x0, x1 = _mix_w(x0, x1, rot0)
+                    x2, x3 = _mix_w(x2, x3, rot1)
+                else:
+                    x0, x3 = _mix_w(x0, x3, rot0)
+                    x2, x1 = _mix_w(x2, x1, rot1)
+                if (round_num + 1) % 4 == 0:
+                    _ki = _key_inject_w([x0, x1, x2, x3], ks_w, ksp_w, (round_num + 1) // 4)
+                    x0 = _ki[0]
+                    x1 = _ki[1]
+                    x2 = _ki[2]
+                    x3 = _ki[3]
+
+            res = nl.ndarray((P, 4 * F), dtype=nl.float32, buffer=nl.sbuf)
+            if normal:
+                u0 = nl.maximum(nl.multiply(_u24_f32_w(x0), inv24, dtype=nl.float32), clamp_eps)
+                u1 = nl.maximum(nl.multiply(_u24_f32_w(x1), inv24, dtype=nl.float32), clamp_eps)
+                u2 = nl.maximum(nl.multiply(_u24_f32_w(x2), inv24, dtype=nl.float32), clamp_eps)
+                u3 = nl.maximum(nl.multiply(_u24_f32_w(x3), inv24, dtype=nl.float32), clamp_eps)
+                bm_r0 = nl.sqrt(nl.multiply(nl.log(u0), neg_two))
+                bm_theta0 = nl.multiply(u1, two_pi)
+                bm_r1 = nl.sqrt(nl.multiply(nl.log(u2), neg_two))
+                bm_theta1 = nl.multiply(u3, two_pi)
+                nisa.tensor_tensor(res[:, 0:F], bm_r0, nl.cos(bm_theta0), op=nl.multiply)
+                nisa.tensor_tensor(res[:, F : 2 * F], bm_r0, nl.sin(bm_theta0), op=nl.multiply)
+                nisa.tensor_tensor(res[:, 2 * F : 3 * F], bm_r1, nl.cos(bm_theta1), op=nl.multiply)
+                nisa.tensor_tensor(res[:, 3 * F : 4 * F], bm_r1, nl.sin(bm_theta1), op=nl.multiply)
+            else:
+                nisa.tensor_scalar(res[:, 0:F], _u24_f32_w(x0), op0=nl.multiply, operand0=inv24)
+                nisa.tensor_scalar(
+                    res[:, F : 2 * F], _u24_f32_w(x1), op0=nl.multiply, operand0=inv24
+                )
+                nisa.tensor_scalar(
+                    res[:, 2 * F : 3 * F], _u24_f32_w(x2), op0=nl.multiply, operand0=inv24
+                )
+                nisa.tensor_scalar(
+                    res[:, 3 * F : 4 * F], _u24_f32_w(x3), op0=nl.multiply, operand0=inv24
+                )
+
+            base = c * 4 * F
+            nl.store(out[:, base : base + 4 * F], res)
+
+        return out
+
+    @nki.jit
+    def threefry_bulk32_normal_kernel(c0_ref, start_ref, k0_ref, k1_ref, k2_ref, k3_ref):
+        """`threefry_bulk_normal_kernel` on full uint32 words (GpSimd integer adds)."""
+        return _threefry_bulk32_body(c0_ref, start_ref, k0_ref, k1_ref, k2_ref, k3_ref, True)
+
+    @nki.jit
+    def threefry_bulk32_uniform_kernel(c0_ref, start_ref, k0_ref, k1_ref, k2_ref, k3_ref):
+        """`threefry_bulk_uniform_kernel` on full uint32 words (GpSimd integer adds)."""
+        return _threefry_bulk32_body(c0_ref, start_ref, k0_ref, k1_ref, k2_ref, k3_ref, False)
+
 
 # ── Threefry host wrappers (module level) ────────────────────────────────────
 #
@@ -2805,8 +3205,9 @@ def _bulk_launches(normal: bool, n_elements, seed, counter_offset):
     """
     LANES = _THREEFRY_LANES
     F, C, n_launches = _bulk_plan(n_elements)
-    kernel_name = "threefry_bulk_normal_kernel" if normal else "threefry_bulk_uniform_kernel"
-    op_name = "threefry_bulk_normal" if normal else "threefry_bulk_uniform"
+    variant = {8: "bulk", 16: "bulk16", 32: "bulk32"}[_limb_bits()]
+    op_name = f"threefry_{variant}_{'normal' if normal else 'uniform'}"
+    kernel_name = op_name + "_kernel"
 
     k0_val = seed & 0xFFFFFF
     k1_val = (seed >> 24) & 0xFFFFFF
@@ -2841,6 +3242,21 @@ def _bulk_launches(normal: bool, n_elements, seed, counter_offset):
     chunks = [_bulk_tile_order(o, F) for o in outs]
     result = torch.cat(chunks) if len(chunks) > 1 else chunks[0]
     return result.float()[:n_elements]
+
+
+def _limb_bits() -> int:
+    """Limb width of the bulk Threefry kernels: TRNRAND_LIMB_BITS=8 (default), 16 or 32.
+
+    All widths compute the same values. 16-bit limbs issue about half the
+    instructions of 8-bit ones; 32 (full words, GpSimd integer adds) is
+    experimental until confirmed bit-identical on Trn2.
+    """
+    env = os.environ.get("TRNRAND_LIMB_BITS", "").strip()
+    if env in ("", "8"):
+        return 8
+    if env in ("16", "32"):
+        return int(env)
+    raise ValueError(f"TRNRAND_LIMB_BITS must be 8, 16 or 32, got {env!r}")
 
 
 def _use_bulk() -> bool:

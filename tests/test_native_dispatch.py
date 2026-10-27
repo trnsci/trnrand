@@ -31,6 +31,10 @@ EXPECTED_OPS = {
     "threefry_streaming_uniform",
     "threefry_bulk_normal",
     "threefry_bulk_uniform",
+    "threefry_bulk16_normal",
+    "threefry_bulk16_uniform",
+    "threefry_bulk32_normal",
+    "threefry_bulk32_uniform",
 }
 
 

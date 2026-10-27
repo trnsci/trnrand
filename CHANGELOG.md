@@ -109,6 +109,40 @@ unrolled chunks per launch. One launch covers up to 4,194,304 values.
   are added to the MLIR verifier check for trn1 and trn2
   (`tests/test_nki_compile.py`).
 
+#### Bulk kernels on 16-bit limbs or full words, opt-in (#60)
+
+`TRNRAND_LIMB_BITS` picks the word representation of the bulk Threefry
+kernels: `8` (default, unchanged), `16` or `32`. Values are bit-identical
+for all three.
+
+- Bytes were used because integer `nl.add` / `tensor_scalar` arithmetic runs
+  in float32 (exact only below 2^24, aws-neuron-sdk#1308), and the byte
+  form was carried over from the Philox multiply, which needs 8-bit
+  sub-products. Threefry has no multiply, so 16-bit limbs are enough: every
+  add is below 2^17 and stays exact in float32. Each word has 2 limbs
+  instead of 4, which roughly halves the compute instructions (about 1,040
+  vs 1,950 per (128, 512) chunk in trn2 MLIR). New kernels:
+  `threefry_bulk16_{normal,uniform}_kernel`, ops
+  `trnrand::threefry_bulk16_{normal,uniform}`.
+- `32` is experimental: full uint32 words, with adds on
+  `nisa.tensor_tensor(..., engine=gpsimd)`, which NKI 0.7 documents as
+  native integer arithmetic, and xor/rotate as bitvec ops. That is about
+  510 instructions per chunk. Wrap-around mod 2^32 on Trn2 has not been
+  confirmed on hardware yet. Kernels and ops are `threefry_bulk32_*`.
+- Plan buckets: the chunk count C no longer rounds up to a power of two.
+  Launches split the chunks evenly, and C rounds up to one of
+  1-8, 10, 12, 14 or 16, so a request computes at most about 25% more than it
+  needs. Before, 2^20 + 1 values ran 8 chunks (1.7x the 2^20 latency); now
+  they run 5. That makes at most 12 C shapes.
+- Tests: a numpy port of the 16-bit limb kernel that does every add in
+  float32 is checked against the full-word reference, including all
+  rotations, carry edge cases and the counter wrap at 2^24. The new ops are
+  checked for routing and values on CPU, including partitioned generators,
+  and checked against the 8-bit kernels on the simulator (including
+  multi-chunk/multi-launch plans and 2^24 - 5 offsets). They are added to
+  the trn1/trn2 MLIR verifier check. `tests/test_nki_native.py` adds a
+  device bit-identity test for 16 and 32 against 8.
+
 #### Streaming output is in per-tile order (#58)
 
 **Reproducibility break.** For a given seed and counter, the streaming
