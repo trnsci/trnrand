@@ -20,9 +20,14 @@ import numpy as np
 import pytest
 import torch
 
-from trnrand.nki.dispatch import _PROGRAM_TILES
+from trnrand.nki.dispatch import (
+    _PROGRAM_TILES,
+    _stream_tile_order,
+    _threefry_normal_per_tile,
+    _threefry_uniform_per_tile,
+)
 
-# _THREEFRY_LANES is inside if HAS_NKI; use the well-known constant directly.
+# Same value as dispatch._THREEFRY_LANES (128-lane Threefry tile).
 _THREEFRY_LANES = 128
 _NORMALS_PER_LAUNCH = _PROGRAM_TILES * _THREEFRY_LANES * 4  # 32×128×4 = 16,384
 
@@ -59,6 +64,67 @@ def _require_simulator(request):
         pytest.skip("TRNRAND_USE_SIMULATOR=1 required")
     if not _HAS_NKI:
         pytest.skip("nki>=0.3.0 not importable on this host")
+
+
+# ── Output order (CPU, no NKI needed) ─────────────────────────────────────────
+
+
+class TestStreamTileOrder:
+    """_stream_tile_order flattens kernel output (P, 4×tiles) as (tiles, P, 4) (#58)."""
+
+    def test_per_tile_order(self):
+        lanes = _THREEFRY_LANES
+        # Kernel layout: lane p, tile t, word w lives at out[p, 4t + w].
+        p = torch.arange(lanes).reshape(lanes, 1, 1)
+        t = torch.arange(_PROGRAM_TILES).reshape(1, _PROGRAM_TILES, 1)
+        w = torch.arange(4).reshape(1, 1, 4)
+        code = (t * lanes + p) * 4 + w  # per-tile flat index of (t, p, w)
+        out = code.reshape(lanes, 4 * _PROGRAM_TILES)
+        flat = _stream_tile_order(out)
+        assert torch.equal(flat, torch.arange(lanes * _PROGRAM_TILES * 4))
+
+    def test_first_tile_is_all_lanes_of_batch_zero(self):
+        out = torch.arange(_THREEFRY_LANES * 4 * _PROGRAM_TILES).reshape(
+            _THREEFRY_LANES, 4 * _PROGRAM_TILES
+        )
+        flat = _stream_tile_order(out)
+        assert torch.equal(flat[: _THREEFRY_LANES * 4], out[:, :4].reshape(-1))
+
+
+@pytest.mark.nki_simulator
+class TestStreamMatchesPerTile:
+    """Streams equal the per-tile path element-for-element for the same seed (#58)."""
+
+    def test_normal_one_launch(self):
+        n = _NORMALS_PER_LAUNCH
+        streaming = threefry_stream_normal(n, seed=5, counter_offset=0)
+        per_tile = _threefry_normal_per_tile(n, seed=5, counter_offset=0)
+        assert torch.allclose(streaming, per_tile, atol=1e-6)
+
+    def test_uniform_one_launch(self):
+        n = _NORMALS_PER_LAUNCH
+        streaming = threefry_stream_uniform(n, seed=5, counter_offset=0)
+        per_tile = _threefry_uniform_per_tile(n, seed=5, counter_offset=0)
+        assert torch.equal(streaming, per_tile)
+
+    def test_uniform_multi_launch_offset_partial(self):
+        # Two launches, nonzero counter_offset, n not a multiple of one tile.
+        n = _NORMALS_PER_LAUNCH + 1000
+        streaming = threefry_stream_uniform(n, seed=11, counter_offset=7)
+        per_tile = _threefry_uniform_per_tile(n, seed=11, counter_offset=7)
+        assert torch.equal(streaming, per_tile)
+
+    @pytest.mark.parametrize(
+        "n,seed,offset", [(513, 3, 0), (16_385, 21, 5), (40_000, 2**24 - 1, 99)]
+    )
+    def test_bulk_wrappers_bit_identical_to_per_tile(self, monkeypatch, n, seed, offset):
+        # threefry_{normal,uniform}_nki now route through the streaming kernels
+        # (#60); values and order must be exactly those of the per-tile path.
+        monkeypatch.delenv("TRNRAND_BULK_STREAMING", raising=False)
+        z = threefry_normal_nki(n, seed=seed, counter_offset=offset)
+        assert torch.equal(z, _threefry_normal_per_tile(n, seed=seed, counter_offset=offset))
+        u = threefry_uniform_nki(n, seed=seed, counter_offset=offset)
+        assert torch.equal(u, _threefry_uniform_per_tile(n, seed=seed, counter_offset=offset))
 
 
 # ── Shape and dtype ────────────────────────────────────────────────────────────
@@ -216,13 +282,12 @@ class TestCounterAdvance:
 
 @pytest.mark.neuron
 class TestHardwareBitExact:
-    """Bit-exact agreement between streaming and per-tile kernels.
+    """Streams equal the per-tile path element-for-element on hardware (#58).
 
-    Requires physical hardware — the NKI simulator does not guarantee
-    bit-exact equivalence between a streaming kernel's nl.static_range
-    tile loop and sequential individual per-tile kernel invocations due
-    to differences in tile execution ordering in the simulator model.
-    On hardware, NEFF compilation produces consistent deterministic output.
+    Contract: for the same seed and counter_offset, threefry_stream_* emits the
+    same values in the same order as threefry_*_nki — per-tile (tiles, P, 4)
+    order, i.e. all lanes of counter batch 0, then batch 1, and so on. The
+    simulator twin is TestStreamMatchesPerTile.
     """
 
     def test_bit_exact_with_per_tile_normal(self):
@@ -245,6 +310,15 @@ class TestHardwareBitExact:
         per_tile = threefry_uniform_nki(n, seed=5, counter_offset=0)
         assert torch.equal(streaming, per_tile), (
             f"max abs diff: {(streaming - per_tile).abs().max().item():.2e}"
+        )
+
+    def test_bit_exact_with_per_tile_multi_launch(self):
+        """Order holds across launches, a nonzero counter_offset, and a partial tile."""
+        n = 2 * _NORMALS_PER_LAUNCH + 1000
+        streaming = threefry_stream_uniform(n, seed=11, counter_offset=7)
+        per_tile = threefry_uniform_nki(n, seed=11, counter_offset=7)
+        assert torch.equal(streaming, per_tile), (
+            f"mismatches: {(streaming != per_tile).sum().item()} of {n}"
         )
 
 

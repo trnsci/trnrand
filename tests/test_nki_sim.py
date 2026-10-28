@@ -19,16 +19,11 @@ import torch
 
 pytestmark = pytest.mark.nki_simulator
 
-# Upstream platform block. NKI ops on uint32 tiles route through the
-# float32 activation engine; values > 2^24 lose precision at the
-# NKI boundary (including nl.copy's internal cast). No kernel-level
-# decomposition can work around this — Philox counters themselves
-# exceed 2^24. Tracked in aws-neuron-sdk#1308. Mark the dependent
-# tests as xfail until AWS ships a true integer multiply primitive.
-_XFAIL_NKI_1308 = pytest.mark.xfail(
-    reason="aws-neuron-sdk#1308 — NKI uint32 ops lose precision above 2^24",
-    strict=False,
-)
+# The Philox tests below were xfailed as aws-neuron-sdk#1308 ("NKI uint32
+# ops lose precision above 2^24"). The loss was the kernel's own
+# int32 <-> uint32 `nl.copy(x, dtype=...)` boundary casts, which are value
+# conversions (they saturate and round through float32), not bit
+# reinterpretations. With `.view(dtype)` at the boundary they pass exactly.
 
 
 @pytest.fixture(autouse=True)
@@ -57,6 +52,7 @@ from trnrand.nki.dispatch import (  # noqa: E402
     box_muller_cpu,
     philox4x32_reference,
     philox_uniform_cpu,
+    sobol_reference,
     threefry4x32_reference,
     threefry_uniform_cpu,
 )
@@ -75,6 +71,12 @@ try:
 except ImportError:
     threefry4x32_kernel = None
     threefry_normal_kernel = None
+
+try:
+    from trnrand.nki.dispatch import sobol_gray_code_kernel, sobol_nki  # noqa: E402
+except ImportError:
+    sobol_gray_code_kernel = None
+    sobol_nki = None
 
 _PHILOX_LANES_PER_TILE = 128
 _THREEFRY_LANES = 128
@@ -107,7 +109,6 @@ _THREEFRY_LANES = 128
         ),
     ],
 )
-@_XFAIL_NKI_1308
 def test_philox_spec_vectors_via_simulator(counter, key, expected):
     """Lane 0 of the 128-lane tile must emit the Salmon SC'11 vector."""
     if counter[1] != 0 or counter[2] != 0 or counter[3] != 0:
@@ -132,7 +133,6 @@ def test_philox_spec_vectors_via_simulator(counter, key, expected):
     )
 
 
-@_XFAIL_NKI_1308
 def test_philox_kernel_matches_reference():
     """Full 128-lane tile: simulator output must equal CPU reference."""
     import nki
@@ -154,7 +154,6 @@ def test_philox_kernel_matches_reference():
     np.testing.assert_array_equal(out.astype(np.int64) & UINT32_MASK, expected)
 
 
-@_XFAIL_NKI_1308
 def test_philox_kernel_distribution():
     """128-lane × 4 uint32 outputs converted to floats should be ~U[0,1)."""
     import nki
@@ -170,10 +169,50 @@ def test_philox_kernel_distribution():
     assert abs(u.var() - 1 / 12) < 0.02
 
 
+def test_philox_full_range_words_bit_exact():
+    """Counters, keys and outputs >= 2^31 must survive the int32 kernel boundary.
+
+    Kernel inputs/outputs are int32 tensors holding uint32 bit patterns. A
+    value conversion between int32 and uint32 (rather than a bit
+    reinterpretation) saturates: uint32 >= 2^31 -> 0x7FFFFFFF, negative
+    int32 -> 0. This test fails under saturation: inputs are full-range
+    random words (most lanes have the top bit set) and every output word
+    must match `philox4x32_reference` bit for bit, with about half the
+    output words >= 2^31.
+    """
+    import nki
+
+    lanes = _PHILOX_LANES_PER_TILE
+    rng = np.random.default_rng(56)
+    ctr_u = rng.integers(0, 1 << 32, size=(lanes, 1), dtype=np.uint64).astype(np.uint32)
+    kl_u = rng.integers(0, 1 << 32, size=(lanes, 1), dtype=np.uint64).astype(np.uint32)
+    kh_u = rng.integers(0, 1 << 32, size=(lanes, 1), dtype=np.uint64).astype(np.uint32)
+    ctr_u[0, 0], kl_u[0, 0], kh_u[0, 0] = 0xFFFFFFFF, 0x80000000, 0xFFFFFFFF
+    assert (ctr_u >= 1 << 31).any() and (kl_u >= 1 << 31).any()
+
+    out = nki.simulate(philox4x32_kernel)(
+        ctr_u.view(np.int32), kl_u.view(np.int32), kh_u.view(np.int32)
+    )
+    out = np.asarray(out)
+    assert out.dtype == np.int32
+    got = out.view(np.uint32).astype(np.int64)
+
+    ctr_ref = torch.zeros(lanes, 4, dtype=torch.int64)
+    ctr_ref[:, 0] = torch.from_numpy(ctr_u.reshape(-1).astype(np.int64))
+    key_ref = torch.zeros(lanes, 2, dtype=torch.int64)
+    key_ref[:, 0] = torch.from_numpy(kl_u.reshape(-1).astype(np.int64))
+    key_ref[:, 1] = torch.from_numpy(kh_u.reshape(-1).astype(np.int64))
+    expected = philox4x32_reference(ctr_ref, key_ref).reshape(lanes, 4).numpy()
+
+    np.testing.assert_array_equal(got, expected)
+    high = (got >= 1 << 31).mean()
+    assert 0.35 < high < 0.65, f"fraction of words >= 2^31 is {high:.3f}"
+    assert (got == 0x7FFFFFFF).sum() <= 1, "saturated words (0x7FFFFFFF) in output"
+
+
 # ── _mul32_hi_lo simulator parity vs numpy port ────────────────────────────
 
 
-@_XFAIL_NKI_1308
 def test_mul32_simulator_matches_numpy():
     """NKI's `_mul32_hi_lo` (via `nki.simulate`) must bit-match the numpy port.
 
@@ -194,14 +233,14 @@ def test_mul32_simulator_matches_numpy():
 
     @nki.jit
     def _mul32_kernel(a_ref, out_hi_ref, out_lo_ref):
-        a = nl.load(a_ref)
+        a = nl.load(a_ref).view(nl.uint32)
         hi, lo = _mul32_hi_lo(a, 0x1F53, 0xD251)
         # Allocate output buffers via the output refs
         P = a_ref.shape[0]
         out_hi = nl.ndarray((P, 1), dtype=nl.int32, buffer=nl.shared_hbm)
         out_lo = nl.ndarray((P, 1), dtype=nl.int32, buffer=nl.shared_hbm)
-        out_hi[:, 0:1] = hi
-        out_lo[:, 0:1] = lo
+        out_hi[:, 0:1] = hi.view(nl.int32)
+        out_lo[:, 0:1] = lo.view(nl.int32)
         return out_hi, out_lo
 
     # Same test inputs as the numpy ground-truth test.
@@ -278,9 +317,8 @@ def test_box_muller_kernel_distribution():
 
 # ── Threefry 4×32-20 correctness via nki.simulate ─────────────────────────────
 #
-# No _XFAIL_NKI_1308 marks: Threefry uses no integer multiply and works
-# entirely in byte-tile arithmetic where every intermediate ≤ 511 < 2^24.
-# These tests should PASS on the simulator without qualification.
+# Threefry uses no integer multiply and works entirely in byte-tile
+# arithmetic where every intermediate ≤ 511 < 2^24.
 
 
 def _make_threefry_inputs(n_lanes, seed=0, batch=0):
@@ -327,6 +365,30 @@ def test_threefry_kernel_matches_reference():
         atol=1e-5,
         err_msg="Threefry simulator output differs from CPU reference",
     )
+
+
+def test_threefry_full_range_keys_bit_exact():
+    """Threefry key words >= 2^31 must reach the kernel unsaturated.
+
+    The host wrappers keep counters and keys below 2^24, but the kernel's
+    int32 -> uint32 load is a bit reinterpretation and must handle any
+    32-bit word. Under a saturating conversion these keys would read as 0.
+    """
+    import nki
+
+    lanes = _THREEFRY_LANES
+    keys_u = np.array([0xDEADBEEF, 0x80000001, 0xFFFFFFFF, 0x9ABCDEF0], dtype=np.uint32)
+    c0, c1, c2, c3, *_ = _make_threefry_inputs(lanes)
+    ks = [np.full((lanes, 1), k, dtype=np.uint32).view(np.int32) for k in keys_u]
+    out_np = np.asarray(nki.simulate(threefry4x32_kernel)(c0, c1, c2, c3, *ks))
+
+    ctr = torch.zeros(lanes, 4, dtype=torch.int64)
+    ctr[:, 0] = torch.from_numpy(c0.reshape(-1)).to(torch.int64)
+    key = torch.tensor([int(k) for k in keys_u], dtype=torch.int64).expand(lanes, 4)
+    ref_u32 = threefry4x32_reference(ctr, key).numpy()
+    expected = ((ref_u32 & 0xFFFFFF) / 16777216.0).astype(np.float32)
+    # 24-bit mantissas are exact in float32: compare exactly.
+    np.testing.assert_array_equal(out_np, expected)
 
 
 def test_threefry_spec_vectors_via_simulator():
@@ -382,3 +444,28 @@ def test_threefry_normal_kernel_distribution():
     z = out_np.reshape(-1)
     assert abs(float(z.mean())) < 0.2
     assert abs(float(z.std()) - 1.0) < 0.2
+
+
+# ── Sobol conformance via nki.simulate (#59) ───────────────────────────────
+
+
+def test_sobol_kernel_matches_reference():
+    """Full 128-lane tile, all 10 dims: simulator must bit-match the CPU reference."""
+    import nki
+
+    idx = np.arange(128, dtype=np.int32)
+    gray = (idx ^ (idx >> 1)).reshape(-1, 1)
+    out = np.asarray(nki.simulate(sobol_gray_code_kernel)(gray))
+    np.testing.assert_array_equal(out, sobol_reference(128, 10).numpy())
+
+
+@pytest.mark.parametrize("start_index", [0, 256])
+def test_sobol_nki_matches_sobol_engine(start_index):
+    """sobol_nki (unscrambled) equals SobolEngine's top 24 bits in every dim."""
+    n = 256
+    engine = torch.quasirandom.SobolEngine(10, scramble=False)
+    engine.fast_forward(start_index)
+    expected = (engine.draw(n, dtype=torch.float64) * 2.0**30).round().long() >> 6
+    got = sobol_nki(n, 10, seed=0, start_index=start_index)
+    got_int = (got.double() * 2.0**24).round().long()
+    assert torch.equal(got_int, expected)

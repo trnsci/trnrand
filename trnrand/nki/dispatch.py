@@ -26,6 +26,7 @@ import torch
 
 try:
     import nki
+    import nki.isa as nisa
     import nki.language as nl
 
     HAS_NKI = True
@@ -375,7 +376,7 @@ def _mul32_hi_lo_numpy(a, b_l: int, b_h: int):
         ),
     )
 
-    # Same bit pattern reinterpreted as int32 (matches NKI's nl.copy cast).
+    # Same bit pattern reinterpreted as int32 (matches the kernel's .view(nl.int32)).
     return hi32_u.astype(np.int32), lo32_u.astype(np.int32)
 
 
@@ -402,6 +403,83 @@ THREEFRY_ROTATIONS = [(10, 26), (11, 21), (13, 27), (23, 5)]
 # Streaming kernel tile count — exported at module level so non-NKI hosts can
 # import it for test parameterisation without requiring neuronxcc.
 _PROGRAM_TILES = 32  # tiles per streaming launch; 32 × 128 × 4 = 16,384 samples/call
+
+# 128 lanes per Threefry tile (Trainium partition-axis limit). Module level so the
+# host wrappers below `if HAS_NKI:` work (and are testable) without neuronxcc.
+_THREEFRY_LANES = 128
+
+
+# Bulk kernels (#60): F Threefry batches per (P, F) chunk, C chunks per launch.
+# F is capped at _BULK_COLS_MAX (SBUF per partition: the kernel keeps ~16 live
+# (P, F) uint32 state tiles plus temporaries) and C at _BULK_CHUNKS_MAX (chunks
+# are unrolled, so C bounds instruction count and compile time). Both are
+# rounded up to powers of two so a handful of NEFFs serve every request size.
+# TRNRAND_BULK_COLS overrides the column cap (must be a power of two <= 4096).
+_BULK_COLS_MIN = 32
+_BULK_COLS_MAX = int(os.environ.get("TRNRAND_BULK_COLS", "512"))
+_BULK_CHUNKS_MAX = 16
+
+
+def _next_pow2(n: int) -> int:
+    return 1 << max(0, int(n) - 1).bit_length()
+
+
+def _chunk_bucket(chunks: int) -> int:
+    """Smallest allowed chunk count >= `chunks`: powers of two and their 1.5x / 1.25x
+    / 1.75x midpoints (1, 2, 3, 4, 5, 6, 7, 8, 10, 12, 14, 16, ...), capped at
+    _BULK_CHUNKS_MAX. At most ~4 chunk shapes per octave, so the NEFF count stays
+    bounded, and a request never computes more than ~25% extra chunks (the
+    pure power-of-two rounding cost up to 2x: 2^20 + 1 values ran 8 chunks)."""
+    chunks = max(1, int(chunks))
+    if chunks <= 4:
+        return chunks
+    p = _next_pow2(chunks) // 2  # chunks in (p, 2p]
+    step = p // 4
+    return min(_BULK_CHUNKS_MAX, -(-chunks // step) * step)
+
+
+def _bulk_plan(n_elements: int) -> tuple[int, int, int]:
+    """(cols F, chunks C, launches) for `n_elements` values on the bulk kernels.
+
+    Launches split the chunks as evenly as possible, then C is rounded up to a
+    `_chunk_bucket` size, so the total work tracks the request instead of
+    jumping to the next power of two.
+    """
+    n_batches = max(1, -(-int(n_elements) // (_THREEFRY_LANES * 4)))
+    if n_batches <= _BULK_COLS_MAX:
+        return max(_BULK_COLS_MIN, _next_pow2(n_batches)), 1, 1
+    F = _BULK_COLS_MAX
+    chunks = -(-n_batches // F)
+    launches = -(-chunks // _BULK_CHUNKS_MAX)
+    C = _chunk_bucket(-(-chunks // launches))
+    return F, C, -(-chunks // C)
+
+
+def _bulk_tile_order(out: torch.Tensor, cols: int) -> torch.Tensor:
+    """Flatten one bulk launch's (P, C × 4 × F) output in per-tile (batch, lane, word) order.
+
+    The bulk kernels write chunk c, word w, column j of lane p at
+    out[p, c·4F + w·F + j], and column j of chunk c is batch c·F + j of the
+    launch. Module-level so it is testable without NKI.
+    """
+    lanes = out.shape[0]
+    chunks = out.shape[1] // (4 * cols)
+    return out.reshape(lanes, chunks, 4, cols).permute(1, 3, 0, 2).contiguous().reshape(-1)
+
+
+def _stream_tile_order(out: torch.Tensor) -> torch.Tensor:
+    """Flatten one streaming launch's (P, 4 × _PROGRAM_TILES) output in per-tile order.
+
+    The streaming kernels write tile T's four words for lane p to
+    out[p, 4T : 4T + 4], so a row-major flatten yields (P, tiles, 4) order. The
+    per-tile wrappers (threefry_normal_nki / threefry_uniform_nki) emit
+    (tiles, P, 4): all lanes of batch 0, then batch 1, and so on. Permuting on the
+    host makes a stream element-for-element identical to the per-tile path for the
+    same seed and counter_offset (#58). Module-level so it is testable without NKI.
+    """
+    lanes = out.shape[0]
+    return out.reshape(lanes, _PROGRAM_TILES, 4).permute(1, 0, 2).contiguous().reshape(-1)
+
 
 # Normal-approximation threshold for Poisson NKI path.
 # For lam >= 20, skewness 1/sqrt(lam) <= 0.22 and the normal approximation
@@ -564,6 +642,93 @@ def _rotl32_bytes_numpy(a_u32, R: int):
     ).astype(np.uint32)
 
 
+# ── Sobol quasi-random sequence (GpSimd XOR accumulation) ─────────────────
+#
+# Sobol coordinates are computed via Gray-code-indexed XOR accumulation:
+#   s[p, d] = XOR{ v[d][k]  for k=0..B-1  if bit k of gray(i_p) is set }
+# where v[d][k] is the Joe-Kuo 2010 direction vector for dimension d,
+# bit position k, and gray(i) = i XOR (i >> 1) is the Gray code.
+#
+# Using 24-bit direction vectors (_SOBOL_BITS = 24) keeps all operands
+# well inside float32's 2^24 exact-integer envelope.  The XOR loops are
+# unrolled at @nki.jit trace time via nl.static_range.
+#
+# Reference: Joe & Kuo (2010), "Constructing Sobol sequences with better
+# two-dimensional projections", SIAM J. Sci. Comput. 30(5):2635–2654.
+
+_SOBOL_BITS = 24  # bits of precision — supports up to 2^24 ≈ 16.7M points
+_SOBOL_MAX_DIMS = 10  # Joe-Kuo table covers dims 2-10; dim 1 is Van der Corput
+_SOBOL_SCALE = 1.0 / 16777216.0  # 1 / 2^24 — same constant as Threefry inv24
+
+
+def _init_sobol_directions():
+    """Compute 24-bit Joe-Kuo 2010 direction vectors for the first 10 dims.
+
+    Returns a tuple of 10 tuples, each of length _SOBOL_BITS.
+    _SOBOL_DIR_VECS[d][k] is the 24-bit integer for dimension d, bit k.
+    Computed once at module import; embedded as nl.full constants in the kernel.
+
+    (s, a, m_init) rows are from Joe-Kuo ``new-joe-kuo-6.21201``, the table
+    ``torch.quasirandom.SobolEngine`` uses; ``tests/test_quasi.py`` checks the
+    result against ``SobolEngine.sobolstate`` for every dimension (#59).
+    """
+    joe_kuo = [
+        (1, 0, [1]),  # dim 2
+        (2, 1, [1, 3]),  # dim 3
+        (3, 1, [1, 3, 1]),  # dim 4
+        (3, 2, [1, 1, 1]),  # dim 5
+        (4, 1, [1, 1, 3, 3]),  # dim 6
+        (4, 4, [1, 3, 5, 13]),  # dim 7
+        (5, 2, [1, 1, 5, 5, 17]),  # dim 8
+        (5, 4, [1, 1, 5, 5, 5]),  # dim 9
+        (5, 7, [1, 1, 7, 11, 19]),  # dim 10
+    ]
+    B = _SOBOL_BITS
+    dirs = []
+    # Dim 0: Van der Corput base-2 (v[k] = 2^(B-1-k))
+    dirs.append(tuple(1 << (B - 1 - k) for k in range(B)))
+    # Dims 1-9: Joe-Kuo recurrence
+    #   v[k] = v[k-s] XOR (v[k-s] >> s)
+    #          XOR c_{s-1}*v[k-1] XOR ... XOR c_0*v[k-s+1]
+    for s, a, m_init in joe_kuo:
+        v = [0] * B
+        for k in range(s):
+            v[k] = m_init[k] << (B - 1 - k)
+        for k in range(s, B):
+            val = v[k - s] ^ (v[k - s] >> s)
+            for j in range(1, s):
+                if (a >> (s - 1 - j)) & 1:
+                    val ^= v[k - j]
+            v[k] = val
+        dirs.append(tuple(v))
+    return tuple(dirs)
+
+
+_SOBOL_DIR_VECS = _init_sobol_directions()
+
+
+def sobol_reference(n_points: int, n_dims: int, start_index: int = 0) -> torch.Tensor:
+    """CPU reference for the NKI Sobol path (unscrambled), bit-exact.
+
+    Mirrors ``sobol_gray_code_kernel``: point ``i`` is the XOR of
+    ``_SOBOL_DIR_VECS[d][k]`` over the set bits ``k`` of ``gray(i)``, scaled by
+    ``2^-24``. Equals the top 24 bits of ``SobolEngine(scramble=False)`` after
+    ``fast_forward(start_index)``.
+
+    Returns:
+        Float32 tensor of shape (n_points, n_dims) with values in [0, 1).
+    """
+    assert 1 <= n_dims <= _SOBOL_MAX_DIMS
+    idx = np.arange(start_index, start_index + n_points, dtype=np.int64)
+    gray = idx ^ (idx >> 1)
+    dirs = np.asarray(_SOBOL_DIR_VECS[:n_dims], dtype=np.int64)  # (n_dims, B)
+    acc = np.zeros((n_points, n_dims), dtype=np.int64)
+    for k in range(_SOBOL_BITS):
+        bit = ((gray >> k) & 1).astype(bool)
+        acc[bit] ^= dirs[:, k]
+    return torch.from_numpy((acc * _SOBOL_SCALE).astype(np.float32))
+
+
 if HAS_NKI:
     # NKI's `nl.multiply` routes uint32 operands through the activation
     # engine's float32 path on both simulator and hardware. float32
@@ -584,17 +749,50 @@ if HAS_NKI:
     # NKI rejects inner function definitions inside functions called from
     # @nki.jit kernels, so all helpers must live at module scope.
 
+    # Integer add/multiply go through `nisa.tensor_tensor` directly, not
+    # `nl.add` / `nl.multiply`. `nl`'s binary ops lower any (P, 1) operand —
+    # a Python scalar *or* a (P, 1) tile, which is every tile in these
+    # kernels — to `nisa.tensor_scalar`, and arithmetic `tensor_scalar`
+    # (`tensor_scalar_arith`) requires a float32 operand. Newer compilers
+    # (neuronxcc 2.26, NKI 0.5+) reject a uint32 operand outright:
+    # "'nisa.tensor_scalar_arith' op 'operand0' must be float32, got 'ui32'"
+    # (#56). `tensor_tensor` accepts integer operands. Bitwise ops and
+    # shifts lower to `tensor_scalar_bitvec`, which takes integer operands,
+    # so they keep their scalar operands.
+
     def _nki_mul_u32(x, y):
-        return nl.multiply(x, y, dtype=nl.uint32)
+        out = nl.ndarray(x.shape, dtype=nl.uint32, buffer=nl.sbuf)
+        nisa.tensor_tensor(out, x, y, op=nl.multiply)
+        return out
 
     def _nki_add_u32(x, y):
-        return nl.add(x, y, dtype=nl.uint32)
+        out = nl.ndarray(x.shape, dtype=nl.uint32, buffer=nl.sbuf)
+        nisa.tensor_tensor(out, x, y, op=nl.add)
+        return out
+
+    # int32 <-> uint32 crossings use `.view(dtype)`, a bit reinterpretation
+    # (no data copied, like `numpy.ndarray.view`), never `nl.copy(x, dtype=...)`.
+    # `nl.copy` and dtype-converting loads/stores are VALUE conversions: on
+    # Trn2 hardware and in `nki.simulate` they saturate (uint32 >= 2^31 ->
+    # int32 0x7FFFFFFF, negative int32 -> uint32 0), which corrupted Philox,
+    # Threefry keys >= 2^31 and the streaming kernels. Kernel inputs and
+    # outputs stay int32 (torch has no general uint32 device path); the
+    # arithmetic is all uint32, so the bits are reinterpreted once at each
+    # boundary.
+
+    def _as_u32(t):
+        """Reinterpret an int32 tile's bits as uint32 (no value conversion)."""
+        return t.view(nl.uint32)
+
+    def _as_i32(t):
+        """Reinterpret a uint32 tile's bits as int32 (no value conversion)."""
+        return t.view(nl.int32)
 
     def _nki_carry_step(acc, col):
         """Extract low byte and carry, add carry to next column."""
         byte = nl.bitwise_and(acc, 0xFF, dtype=nl.uint32)
         carry = nl.right_shift(acc, 8, dtype=nl.uint32)
-        return byte, nl.add(carry, col, dtype=nl.uint32)
+        return byte, _nki_add_u32(carry, col)
 
     def _nki_pack4_u32(b0, b1, b2, b3):
         """Pack 4 byte tiles into a single uint32 tile."""
@@ -607,7 +805,7 @@ if HAS_NKI:
         )
 
     def _mul32_hi_lo(a, b_l, b_h):
-        """32×32→64 multiply returning (hi32, lo32) int32 tensors.
+        """32×32→64 multiply returning (hi32, lo32) uint32 tiles.
 
         8-bit byte decomposition:
 
@@ -622,14 +820,13 @@ if HAS_NKI:
         intermediate stays well below 2^24, avoiding the float32
         precision loss on the activation-engine multiply path.
 
-        `a` is a uint32-valued int32 tile of shape (P, 1). `b_l`, `b_h`
-        are Python-int constants (low/high 16 bits of the full 32-bit
-        multiplier).
+        `a` is a uint32 tile of shape (P, 1). `b_l`, `b_h` are Python-int
+        constants (low/high 16 bits of the full 32-bit multiplier).
         """
-        # Cast `a` to uint32 up front so the dst/src dtype match in
-        # MLIR tensor_scalar_bitvec ops. Hardware verifier rejects
+        # `a` is uint32 so the dst/src dtypes match in the MLIR
+        # tensor_scalar_bitvec ops; the hardware verifier rejects
         # src=i32/dst=ui32 mismatches.
-        a_u = nl.copy(a, dtype=nl.uint32)
+        a_u = a
         a0 = nl.bitwise_and(a_u, 0xFF, dtype=nl.uint32)
         a1 = nl.bitwise_and(nl.right_shift(a_u, 8, dtype=nl.uint32), 0xFF, dtype=nl.uint32)
         a2 = nl.bitwise_and(nl.right_shift(a_u, 16, dtype=nl.uint32), 0xFF, dtype=nl.uint32)
@@ -678,8 +875,9 @@ if HAS_NKI:
         lo32_u = _nki_pack4_u32(byte0, byte1, byte2, byte3)
         hi32_u = _nki_pack4_u32(byte4, byte5, byte6, byte7)
 
-        # Return int32 for downstream XOR — same bit pattern.
-        return nl.copy(hi32_u, dtype=nl.int32), nl.copy(lo32_u, dtype=nl.int32)
+        # Stay uint32: the Philox state is uint32 end to end and is only
+        # reinterpreted as int32 at the output store.
+        return hi32_u, lo32_u
 
     @nki.jit
     def philox4x32_kernel(counter_lo_ref, key_lo_ref, key_hi_ref):
@@ -691,12 +889,14 @@ if HAS_NKI:
         lane. The wrapper flattens to `(P*4,)` interleaved.
         """
         P = counter_lo_ref.shape[0]
-        c0 = nl.load(counter_lo_ref)
+        # Inputs are int32 bit patterns of uint32 words: reinterpret, don't
+        # convert (a value conversion saturates words >= 2^31).
+        c0 = _as_u32(nl.load(counter_lo_ref))
         c1 = nl.zeros_like(c0)
         c2 = nl.zeros_like(c0)
         c3 = nl.zeros_like(c0)
-        k0 = nl.load(key_lo_ref)
-        k1 = nl.load(key_hi_ref)
+        k0 = _as_u32(nl.load(key_lo_ref))
+        k1 = _as_u32(nl.load(key_hi_ref))
 
         # Materialize the key-bump constants as uint32 vector-immediates
         # up front. PHILOX_W0 = 0x9E3779B9 and PHILOX_W1 = 0xBB67AE85
@@ -720,16 +920,16 @@ if HAS_NKI:
             c0, c1, c2, c3 = new_c0, new_c1, new_c2, new_c3
 
             # Key bump: (k + W) mod 2^32 via the vector-immediate W.
-            k0_u = nl.add(nl.copy(k0, dtype=nl.uint32), w0_vec, dtype=nl.uint32)
-            k1_u = nl.add(nl.copy(k1, dtype=nl.uint32), w1_vec, dtype=nl.uint32)
-            k0 = nl.copy(k0_u, dtype=nl.int32)
-            k1 = nl.copy(k1_u, dtype=nl.int32)
+            k0 = _nki_add_u32(k0, w0_vec)
+            k1 = _nki_add_u32(k1, w1_vec)
 
-        out = nl.ndarray((P, 4), dtype=counter_lo_ref.dtype, buffer=nl.shared_hbm)
-        out[:, 0:1] = c0
-        out[:, 1:2] = c1
-        out[:, 2:3] = c2
-        out[:, 3:4] = c3
+        # int32 output holding the uint32 bit patterns (reinterpret, not
+        # a saturating uint32 -> int32 value conversion).
+        out = nl.ndarray((P, 4), dtype=nl.int32, buffer=nl.shared_hbm)
+        out[:, 0:1] = _as_i32(c0)
+        out[:, 1:2] = _as_i32(c1)
+        out[:, 2:3] = _as_i32(c2)
+        out[:, 3:4] = _as_i32(c3)
         return out
 
     @nki.jit
@@ -866,8 +1066,6 @@ if HAS_NKI:
     # THREEFRY_ROTATIONS = [(10,26),(11,21),(13,27),(23,5)]
     # Flattened: [10, 26, 11, 21, 13, 27, 23, 5]
     _THREEFRY_ROT_QR = tuple((rot // 8, rot % 8) for pair in THREEFRY_ROTATIONS for rot in pair)
-    # 128 lanes per tile (Trainium partition-axis limit).
-    _THREEFRY_LANES = 128
 
     def _b_split(v_ref):
         """Load a (P,1) int32 tile and split into 4 byte tiles, each in [0,255].
@@ -875,8 +1073,7 @@ if HAS_NKI:
         Returns [b0, b1, b2, b3] where b0 is the least-significant byte.
         All returned tiles are uint32-typed with values ≤ 255.
         """
-        v = nl.load(v_ref)
-        v_u = nl.copy(v, dtype=nl.uint32)
+        v_u = _as_u32(nl.load(v_ref))
         b0 = nl.bitwise_and(v_u, 0xFF, dtype=nl.uint32)
         b1 = nl.bitwise_and(nl.right_shift(v_u, 8, dtype=nl.uint32), 0xFF, dtype=nl.uint32)
         b2 = nl.bitwise_and(nl.right_shift(v_u, 16, dtype=nl.uint32), 0xFF, dtype=nl.uint32)
@@ -898,16 +1095,16 @@ if HAS_NKI:
         Each byte tile is in [0, 255]; sums ≤ 511 < 2^10 (exact in float32).
         Returns 4 byte tiles representing (a + b) mod 2^32.
         """
-        s0 = nl.add(a_b[0], b_b[0], dtype=nl.uint32)  # ≤ 510
+        s0 = _nki_add_u32(a_b[0], b_b[0])  # ≤ 510
         c0 = nl.right_shift(s0, 8, dtype=nl.uint32)
         r0 = nl.bitwise_and(s0, 0xFF, dtype=nl.uint32)
-        s1 = nl.add(nl.add(a_b[1], b_b[1], dtype=nl.uint32), c0, dtype=nl.uint32)
+        s1 = _nki_add_u32(_nki_add_u32(a_b[1], b_b[1]), c0)
         c1 = nl.right_shift(s1, 8, dtype=nl.uint32)
         r1 = nl.bitwise_and(s1, 0xFF, dtype=nl.uint32)
-        s2 = nl.add(nl.add(a_b[2], b_b[2], dtype=nl.uint32), c1, dtype=nl.uint32)
+        s2 = _nki_add_u32(_nki_add_u32(a_b[2], b_b[2]), c1)
         c2 = nl.right_shift(s2, 8, dtype=nl.uint32)
         r2 = nl.bitwise_and(s2, 0xFF, dtype=nl.uint32)
-        s3 = nl.add(nl.add(a_b[3], b_b[3], dtype=nl.uint32), c2, dtype=nl.uint32)
+        s3 = _nki_add_u32(_nki_add_u32(a_b[3], b_b[3]), c2)
         r3 = nl.bitwise_and(s3, 0xFF, dtype=nl.uint32)  # carry out discarded
         return [r0, r1, r2, r3]
 
@@ -1335,123 +1532,6 @@ if HAS_NKI:
         out[:, 3:4] = z3
         return out
 
-    def threefry_uniform_nki(
-        n_elements: int,
-        seed: int = 0,
-        counter_offset: int = 0,
-    ) -> torch.Tensor:
-        """Host-side wrapper: Threefry4×32-20 → float32 uniforms in [0, 1).
-
-        Counter design (ensures all tile inputs < 2^24 for the host's
-        typical workload up to ~128 * 2^16 = ~8M elements per call):
-            c0 = lane index within tile (0..127)
-            c1 = batch/tile index (0..n_batches-1)
-            c2 = counter_offset high word
-            c3 = 0
-        Key: k0=seed&0xFFFFFF, k1=(seed>>24)&0xFFFFFF, k2=k3=0
-        (trimmed to 24 bits to guarantee < 2^24 at tile load time).
-        """
-        LANES = _THREEFRY_LANES
-        n_words = (n_elements + 3) // 4  # each lane emits 4 words
-        n_batches = (n_words + LANES - 1) // LANES
-
-        k0_val = seed & 0xFFFFFF
-        k1_val = (seed >> 24) & 0xFFFFFF
-
-        chunks = []
-        for batch in range(n_batches):
-            tile_lanes = min(LANES, n_words - batch * LANES)
-            c0_np = np.arange(tile_lanes, dtype=np.int32).reshape(-1, 1)
-            c1_np = np.full((tile_lanes, 1), (batch + counter_offset) & 0xFFFFFF, dtype=np.int32)
-            c2_np = np.zeros((tile_lanes, 1), dtype=np.int32)
-            c3_np = np.zeros((tile_lanes, 1), dtype=np.int32)
-            k0_np = np.full((tile_lanes, 1), k0_val, dtype=np.int32)
-            k1_np = np.full((tile_lanes, 1), k1_val, dtype=np.int32)
-            k2_np = np.zeros((tile_lanes, 1), dtype=np.int32)
-            k3_np = np.zeros((tile_lanes, 1), dtype=np.int32)
-
-            if _use_simulator():
-                out_np = nki.simulate(threefry4x32_kernel)(
-                    c0_np,
-                    c1_np,
-                    c2_np,
-                    c3_np,
-                    k0_np,
-                    k1_np,
-                    k2_np,
-                    k3_np,
-                )
-                out_tile = torch.from_numpy(np.asarray(out_np).reshape(-1))
-            else:
-                out_tile = _launch(
-                    threefry4x32_kernel,
-                    "threefry4x32",
-                    *(
-                        torch.from_numpy(a)
-                        for a in (c0_np, c1_np, c2_np, c3_np, k0_np, k1_np, k2_np, k3_np)
-                    ),
-                ).reshape(-1)
-            chunks.append(out_tile)
-
-        result = torch.cat(chunks) if len(chunks) > 1 else chunks[0]
-        return result.float()[:n_elements]
-
-    def threefry_normal_nki(
-        n_elements: int,
-        seed: int = 0,
-        counter_offset: int = 0,
-    ) -> torch.Tensor:
-        """Host-side wrapper: Threefry4×32-20 + Box-Muller → N(0,1) floats.
-
-        Uses the fused `threefry_normal_kernel`. Each tile emits 4 normals
-        per lane (2 Box-Muller pairs). Counter layout matches
-        `threefry_uniform_nki`.
-        """
-        LANES = _THREEFRY_LANES
-        n_words = (n_elements + 3) // 4
-        n_batches = (n_words + LANES - 1) // LANES
-
-        k0_val = seed & 0xFFFFFF
-        k1_val = (seed >> 24) & 0xFFFFFF
-
-        chunks = []
-        for batch in range(n_batches):
-            tile_lanes = min(LANES, n_words - batch * LANES)
-            c0_np = np.arange(tile_lanes, dtype=np.int32).reshape(-1, 1)
-            c1_np = np.full((tile_lanes, 1), (batch + counter_offset) & 0xFFFFFF, dtype=np.int32)
-            c2_np = np.zeros((tile_lanes, 1), dtype=np.int32)
-            c3_np = np.zeros((tile_lanes, 1), dtype=np.int32)
-            k0_np = np.full((tile_lanes, 1), k0_val, dtype=np.int32)
-            k1_np = np.full((tile_lanes, 1), k1_val, dtype=np.int32)
-            k2_np = np.zeros((tile_lanes, 1), dtype=np.int32)
-            k3_np = np.zeros((tile_lanes, 1), dtype=np.int32)
-
-            if _use_simulator():
-                out_np = nki.simulate(threefry_normal_kernel)(
-                    c0_np,
-                    c1_np,
-                    c2_np,
-                    c3_np,
-                    k0_np,
-                    k1_np,
-                    k2_np,
-                    k3_np,
-                )
-                out_tile = torch.from_numpy(np.asarray(out_np).reshape(-1))
-            else:
-                out_tile = _launch(
-                    threefry_normal_kernel,
-                    "threefry_normal",
-                    *(
-                        torch.from_numpy(a)
-                        for a in (c0_np, c1_np, c2_np, c3_np, k0_np, k1_np, k2_np, k3_np)
-                    ),
-                ).reshape(-1)
-            chunks.append(out_tile)
-
-        result = torch.cat(chunks) if len(chunks) > 1 else chunks[0]
-        return result.float()[:n_elements]
-
     def truncated_normal_nki(
         n_elements,
         low=-2.0,
@@ -1642,61 +1722,8 @@ if HAS_NKI:
 
     # ── Sobol quasi-random sequence (GpSimd XOR accumulation) ─────────────────
     #
-    # Sobol coordinates are computed via Gray-code-indexed XOR accumulation:
-    #   s[p, d] = XOR{ v[d][k]  for k=0..B-1  if bit k of gray(i_p) is set }
-    # where v[d][k] is the Joe-Kuo 2010 direction vector for dimension d,
-    # bit position k, and gray(i) = i XOR (i >> 1) is the Gray code.
-    #
-    # Using 24-bit direction vectors (_SOBOL_BITS = 24) keeps all operands
-    # well inside float32's 2^24 exact-integer envelope.  The XOR loops are
-    # unrolled at @nki.jit trace time via nl.static_range.
-    #
-    # Reference: Joe & Kuo (2010), "Constructing Sobol sequences with better
-    # two-dimensional projections", SIAM J. Sci. Comput. 30(5):2635–2654.
-
-    _SOBOL_BITS = 24  # bits of precision — supports up to 2^24 ≈ 16.7M points
-    _SOBOL_MAX_DIMS = 10  # Joe-Kuo table covers dims 2-10; dim 1 is Van der Corput
-    _SOBOL_SCALE = 1.0 / 16777216.0  # 1 / 2^24 — same constant as Threefry inv24
-
-    def _init_sobol_directions():
-        """Compute 24-bit Joe-Kuo 2010 direction vectors for the first 10 dims.
-
-        Returns a tuple of 10 tuples, each of length _SOBOL_BITS.
-        _SOBOL_DIR_VECS[d][k] is the 24-bit integer for dimension d, bit k.
-        Computed once at module import; embedded as nl.full constants in the kernel.
-        """
-        joe_kuo = [
-            (1, 0, [1]),  # dim 2
-            (2, 1, [1, 1]),  # dim 3
-            (3, 1, [1, 1, 1]),  # dim 4
-            (3, 2, [1, 1, 3]),  # dim 5
-            (4, 1, [1, 1, 1, 1]),  # dim 6
-            (4, 4, [1, 3, 5, 13]),  # dim 7
-            (5, 2, [1, 1, 5, 5, 17]),  # dim 8
-            (5, 4, [1, 1, 5, 5, 5]),  # dim 9
-            (5, 7, [1, 1, 7, 11, 19]),  # dim 10
-        ]
-        B = _SOBOL_BITS
-        dirs = []
-        # Dim 0: Van der Corput base-2 (v[k] = 2^(B-1-k))
-        dirs.append(tuple(1 << (B - 1 - k) for k in range(B)))
-        # Dims 1-9: Joe-Kuo recurrence
-        #   v[k] = v[k-s] XOR (v[k-s] >> s)
-        #          XOR c_{s-1}*v[k-1] XOR ... XOR c_0*v[k-s+1]
-        for s, a, m_init in joe_kuo:
-            v = [0] * B
-            for k in range(s):
-                v[k] = m_init[k] << (B - 1 - k)
-            for k in range(s, B):
-                val = v[k - s] ^ (v[k - s] >> s)
-                for j in range(1, s):
-                    if (a >> (s - 1 - j)) & 1:
-                        val ^= v[k - j]
-                v[k] = val
-            dirs.append(tuple(v))
-        return tuple(dirs)
-
-    _SOBOL_DIR_VECS = _init_sobol_directions()
+    # Direction vectors and the CPU reference live at module level (above
+    # `if HAS_NKI:`) so CPU-only installs can check them against SobolEngine.
 
     @nki.jit
     def sobol_gray_code_kernel(gray_ref):
@@ -1718,8 +1745,7 @@ if HAS_NKI:
             (P, _SOBOL_MAX_DIMS) float32 tile — Sobol coordinates in [0, 1).
         """
         P = gray_ref.shape[0]
-        g = nl.load(gray_ref)
-        g = nl.copy(g, dtype=nl.uint32)
+        g = _as_u32(nl.load(gray_ref))
 
         out = nl.ndarray((P, _SOBOL_MAX_DIMS), dtype=nl.float32, buffer=nl.shared_hbm)
 
@@ -1744,7 +1770,7 @@ if HAS_NKI:
                     # bit_k ∈ {0,1} and v_dk < 2^24 → product < 2^24 (float32-exact)
                     s = nl.bitwise_xor(
                         s,
-                        nl.multiply(bit_k, nl.full((P, 1), v_dk, dtype=nl.uint32), dtype=nl.uint32),
+                        _nki_mul_u32(bit_k, nl.full((P, 1), v_dk, dtype=nl.uint32)),
                         dtype=nl.uint32,
                     )
             # Convert s (uint32 in [0, 2^24)) to float32 in [0, 1) via
@@ -2048,7 +2074,7 @@ if HAS_NKI:
         # Runtime start_batch loaded once from HBM; tile_idx offset added per tile.
         # Passing start_batch as a runtime arg lets the SAME NEFF serve every
         # stream_into call — the NEFF cache key depends only on shapes/dtypes.
-        start_batch_u = nl.load(start_batch_ref, dtype=nl.uint32)
+        start_batch_u = _as_u32(nl.load(start_batch_ref))
 
         # Box-Muller constants — hoisted outside the loop (compile-once into NEFF).
         inv24 = nl.full((P, 1), 1.0 / 16777216.0, dtype=nl.float32)
@@ -2067,11 +2093,7 @@ if HAS_NKI:
             # tile_idx is a compile-time Python int from nl.static_range;
             # nl.full materializes it as a constant tile for the add.
             c1_u = nl.bitwise_and(
-                nl.add(
-                    start_batch_u,
-                    nl.full((P, 1), tile_idx, dtype=nl.uint32),
-                    dtype=nl.uint32,
-                ),
+                _nki_add_u32(start_batch_u, nl.full((P, 1), tile_idx, dtype=nl.uint32)),
                 0xFFFFFF,
                 dtype=nl.uint32,
             )
@@ -2238,7 +2260,7 @@ if HAS_NKI:
         c2_b = _b_from_scalar(P, 0)
         c3_b = _b_from_scalar(P, 0)
 
-        start_batch_u = nl.load(start_batch_ref, dtype=nl.uint32)
+        start_batch_u = _as_u32(nl.load(start_batch_ref))
 
         inv24 = nl.full((P, 1), 1.0 / 16777216.0, dtype=nl.float32)
         scale256 = nl.full((P, 1), 256.0, dtype=nl.float32)
@@ -2248,11 +2270,7 @@ if HAS_NKI:
 
         for tile_idx in nl.static_range(_PROGRAM_TILES):
             c1_u = nl.bitwise_and(
-                nl.add(
-                    start_batch_u,
-                    nl.full((P, 1), tile_idx, dtype=nl.uint32),
-                    dtype=nl.uint32,
-                ),
+                _nki_add_u32(start_batch_u, nl.full((P, 1), tile_idx, dtype=nl.uint32)),
                 0xFFFFFF,
                 dtype=nl.uint32,
             )
@@ -2349,106 +2367,1024 @@ if HAS_NKI:
 
         return out
 
-    def threefry_stream_normal(
-        n_elements: int,
-        seed: int = 0,
-        counter_offset: int = 0,
-    ) -> torch.Tensor:
-        """Host wrapper: streaming Threefry4×32-20 + Box-Muller → N(0,1) floats.
+    # ── Bulk Threefry kernels: wide free dimension, one launch per request (#60) ──
+    #
+    # The streaming kernels above hold every byte of every word as a (P, 1)
+    # tile, so each NKI instruction does 128 elements of work (one per
+    # partition) and a 16,384-value launch is ~55k instructions. That is why
+    # `normal()` was linear at ~0.23 ms per 1k values on Trn2: instruction
+    # issue, not the engines, set the rate. The bulk kernels run the same
+    # byte-tile arithmetic on (P, F) tiles, F columns = F Threefry batches at
+    # once, so the instruction count per chunk is the same as one old tile
+    # but each instruction covers P × F elements.
+    #
+    # Layout: column j of chunk c is batch (start[c] + j) & 0xFFFFFF, lane p
+    # is c0 = p, exactly the per-tile counter mapping (#58). The chunk's four
+    # output words land in one (P, 4F) SBUF tile, word w at columns
+    # [w F, (w + 1) F), and leave in a single DMA. The host reorders
+    # (chunks, words, cols) into per-tile order (`_bulk_tile_order`).
+    #
+    # Key words are added with `tensor_scalar` against float32 (P, 1) byte
+    # operands (byte + byte <= 510, exact in float32), so the key schedule is
+    # never broadcast to (P, F). Integer state + state adds stay on
+    # `tensor_tensor` with matching uint32 dtypes.
 
-        Each call reuses the fixed-size NEFF compiled for `threefry_streaming_normal_kernel`,
-        running _PROGRAM_TILES Threefry tiles in one XLA invocation — 16,384 samples per
-        XLA call vs 512 per call in threefry_normal_nki. For 1M samples: 245 XLA calls vs
-        7813 in the per-tile wrapper (~31× reduction in launch overhead).
+    def _ts_add_u32(x, f):
+        """x (P, F) uint32 + f (P, 1) float32 -> (P, F) uint32 (exact for sums < 2^24)."""
+        out = nl.ndarray(x.shape, dtype=nl.uint32, buffer=nl.sbuf)
+        nisa.tensor_scalar(out, x, op0=nl.add, operand0=f)
+        return out
 
-        Counter-offset compatibility: outputs are bit-exact with threefry_normal_nki when
-        both use the same seed and counter_offset. Launch L tile T uses
-        c1 = (counter_offset + L*_PROGRAM_TILES + T) & 0xFFFFFF, matching the per-tile
-        wrapper's c1 = (batch + counter_offset) & 0xFFFFFF at batch = L*_PROGRAM_TILES + T.
-        """
-        LANES = _THREEFRY_LANES
-        NORMALS_PER_LAUNCH = _PROGRAM_TILES * LANES * 4  # 32 × 128 × 4 = 16,384
+    def _bytes_f32(b):
+        """Four (P, 1) uint32 byte tiles -> four (P, 1) float32 byte tiles (values <= 255)."""
+        return [
+            nl.copy(b[0], dtype=nl.float32),
+            nl.copy(b[1], dtype=nl.float32),
+            nl.copy(b[2], dtype=nl.float32),
+            nl.copy(b[3], dtype=nl.float32),
+        ]
 
-        n_launches = (n_elements + NORMALS_PER_LAUNCH - 1) // NORMALS_PER_LAUNCH
+    def _add32_bs(a_b, k_f):
+        """(a + k) mod 2^32 in byte tiles; a: 4 x (P, F) uint32, k: 4 x (P, 1) float32."""
+        s0 = _ts_add_u32(a_b[0], k_f[0])
+        c0 = nl.right_shift(s0, 8, dtype=nl.uint32)
+        r0 = nl.bitwise_and(s0, 0xFF, dtype=nl.uint32)
+        s1 = _nki_add_u32(_ts_add_u32(a_b[1], k_f[1]), c0)
+        c1 = nl.right_shift(s1, 8, dtype=nl.uint32)
+        r1 = nl.bitwise_and(s1, 0xFF, dtype=nl.uint32)
+        s2 = _nki_add_u32(_ts_add_u32(a_b[2], k_f[2]), c1)
+        c2 = nl.right_shift(s2, 8, dtype=nl.uint32)
+        r2 = nl.bitwise_and(s2, 0xFF, dtype=nl.uint32)
+        s3 = _nki_add_u32(_ts_add_u32(a_b[3], k_f[3]), c2)
+        r3 = nl.bitwise_and(s3, 0xFF, dtype=nl.uint32)
+        return [r0, r1, r2, r3]
 
-        k0_val = seed & 0xFFFFFF
-        k1_val = (seed >> 24) & 0xFFFFFF
+    def _key_inject_bs(x_b_list, ks_f, ksp_f, step):
+        """`_key_inject_b` with (P, 1) float32 key bytes; ksp_f[s] = ks[(s+3)%5] + s."""
+        out0 = _add32_bs(x_b_list[0], ks_f[(step + 0) % 5])
+        out1 = _add32_bs(x_b_list[1], ks_f[(step + 1) % 5])
+        out2 = _add32_bs(x_b_list[2], ks_f[(step + 2) % 5])
+        out3 = _add32_bs(x_b_list[3], ksp_f[step])
+        return [out0, out1, out2, out3]
 
-        c0_np = np.arange(LANES, dtype=np.int32).reshape(-1, 1)
-        k0_np = np.full((LANES, 1), k0_val, dtype=np.int32)
-        k1_np = np.full((LANES, 1), k1_val, dtype=np.int32)
-        k2_np = np.zeros((LANES, 1), dtype=np.int32)
-        k3_np = np.zeros((LANES, 1), dtype=np.int32)
+    def _u24_f32(b, scale256, scale65536):
+        """Low 24 bits of a byte-tile word as float32 b0 + 256 b1 + 65536 b2 (exact)."""
+        return nl.add(
+            nl.add(
+                nl.copy(b[0], dtype=nl.float32),
+                nl.multiply(nl.copy(b[1], dtype=nl.float32), scale256, dtype=nl.float32),
+                dtype=nl.float32,
+            ),
+            nl.multiply(nl.copy(b[2], dtype=nl.float32), scale65536, dtype=nl.float32),
+            dtype=nl.float32,
+        )
 
-        chunks = []
-        for launch in range(n_launches):
-            start_batch = (counter_offset + launch * _PROGRAM_TILES) & 0xFFFFFF
-            start_batch_np = np.full((LANES, 1), start_batch, dtype=np.int32)
+    def _threefry_bulk_body(c0_ref, start_ref, k0_ref, k1_ref, k2_ref, k3_ref, normal):
+        P = c0_ref.shape[0]
+        F = c0_ref.shape[1]
+        C = start_ref.shape[1]
 
-            if _use_simulator():
-                out_np = nki.simulate(threefry_streaming_normal_kernel)(
-                    c0_np, start_batch_np, k0_np, k1_np, k2_np, k3_np
+        # Key schedule, (P, 1): bytes as uint32 for the xor, then float32 operands.
+        k0_b = _b_split(k0_ref)
+        k1_b = _b_split(k1_ref)
+        k2_b = _b_split(k2_ref)
+        k3_b = _b_split(k3_ref)
+        parity_b = _b_from_scalar(P, THREEFRY_SKEIN_KS_PARITY)
+        k4_b = _xor32_b(_xor32_b(_xor32_b(_xor32_b(k0_b, k1_b), k2_b), k3_b), parity_b)
+        ks_b = [k0_b, k1_b, k2_b, k3_b, k4_b]
+        ks_f = [
+            _bytes_f32(k0_b),
+            _bytes_f32(k1_b),
+            _bytes_f32(k2_b),
+            _bytes_f32(k3_b),
+            _bytes_f32(k4_b),
+        ]
+        # x3 injection adds ks[(s+3)%5] + s; fold s into the key word once.
+        ksp_f = [
+            _bytes_f32(_add32_b(ks_b[3], _b_from_scalar(P, 0))),
+            _bytes_f32(_add32_b(ks_b[4], _b_from_scalar(P, 1))),
+            _bytes_f32(_add32_b(ks_b[0], _b_from_scalar(P, 2))),
+            _bytes_f32(_add32_b(ks_b[1], _b_from_scalar(P, 3))),
+            _bytes_f32(_add32_b(ks_b[2], _b_from_scalar(P, 4))),
+            _bytes_f32(_add32_b(ks_b[3], _b_from_scalar(P, 5))),
+        ]
+
+        zero = nl.full((P, F), 0, dtype=nl.uint32)
+        c0_b = _b_split(c0_ref)  # (P, F): lane index in every column
+
+        # Column index j (0..F-1) in SBUF, as byte tiles; F <= 2^16.
+        col = nl.ndarray((P, F), dtype=nl.uint32, buffer=nl.sbuf)
+        nisa.iota(col, [[1, F]], offset=0, channel_multiplier=0)
+        col_b = [
+            nl.bitwise_and(col, 0xFF, dtype=nl.uint32),
+            nl.right_shift(col, 8, dtype=nl.uint32),
+            zero,
+            zero,
+        ]
+
+        inv24 = nl.full((P, 1), 1.0 / 16777216.0, dtype=nl.float32)
+        scale256 = nl.full((P, 1), 256.0, dtype=nl.float32)
+        scale65536 = nl.full((P, 1), 65536.0, dtype=nl.float32)
+        clamp_eps = nl.full((P, 1), 1e-7, dtype=nl.float32)
+        neg_two = nl.full((P, 1), -2.0, dtype=nl.float32)
+        two_pi = nl.full((P, 1), TWO_PI, dtype=nl.float32)
+
+        out = nl.ndarray((P, C * 4 * F), dtype=nl.float32, buffer=nl.shared_hbm)
+
+        for c in nl.static_range(C):
+            # c1 = (start[c] + j) & 0xFFFFFF; start[c] is already masked to 24 bits.
+            start_b = _b_split(start_ref[:, c : c + 1])
+            c1_full = _add32_bs(col_b, _bytes_f32(start_b))
+            c1_b = [c1_full[0], c1_full[1], c1_full[2], zero]
+
+            _ki = _key_inject_bs(
+                [c0_b, c1_b, [zero, zero, zero, zero], [zero, zero, zero, zero]], ks_f, ksp_f, 0
+            )
+            x0_b = _ki[0]
+            x1_b = _ki[1]
+            x2_b = _ki[2]
+            x3_b = _ki[3]
+
+            for round_num in nl.static_range(THREEFRY_ROUNDS):
+                pair_idx = round_num % 4
+                q0, r0 = _THREEFRY_ROT_QR[pair_idx * 2 + 0]
+                q1, r1 = _THREEFRY_ROT_QR[pair_idx * 2 + 1]
+                if round_num % 2 == 0:
+                    x0_b, x1_b = _mix_b(x0_b, x1_b, q0, r0)
+                    x2_b, x3_b = _mix_b(x2_b, x3_b, q1, r1)
+                else:
+                    x0_b, x3_b = _mix_b(x0_b, x3_b, q0, r0)
+                    x2_b, x1_b = _mix_b(x2_b, x1_b, q1, r1)
+                if (round_num + 1) % 4 == 0:
+                    _ki = _key_inject_bs(
+                        [x0_b, x1_b, x2_b, x3_b], ks_f, ksp_f, (round_num + 1) // 4
+                    )
+                    x0_b = _ki[0]
+                    x1_b = _ki[1]
+                    x2_b = _ki[2]
+                    x3_b = _ki[3]
+
+            res = nl.ndarray((P, 4 * F), dtype=nl.float32, buffer=nl.sbuf)
+            if normal:
+                # Same op sequence as threefry_streaming_normal_kernel, on (P, F).
+                u0 = nl.maximum(
+                    nl.multiply(_u24_f32(x0_b, scale256, scale65536), inv24, dtype=nl.float32),
+                    clamp_eps,
                 )
-                out_tile = torch.from_numpy(np.asarray(out_np).reshape(-1))
-            else:
-                out_tile = _launch(
-                    threefry_streaming_normal_kernel,
-                    "threefry_streaming_normal",
-                    *(
-                        torch.from_numpy(a)
-                        for a in (c0_np, start_batch_np, k0_np, k1_np, k2_np, k3_np)
-                    ),
-                ).reshape(-1)
-            chunks.append(out_tile)
-
-        result = torch.cat(chunks) if len(chunks) > 1 else chunks[0]
-        return result.float()[:n_elements]
-
-    def threefry_stream_uniform(
-        n_elements: int,
-        seed: int = 0,
-        counter_offset: int = 0,
-    ) -> torch.Tensor:
-        """Host wrapper: streaming Threefry4×32-20 → float32 uniforms in [0, 1).
-
-        Same launch/counter scheme as threefry_stream_normal; 16,384 uniforms per
-        XLA call, ~31× fewer round-trips than the per-tile threefry_uniform_nki
-        for large n.
-        """
-        LANES = _THREEFRY_LANES
-        UNIFORMS_PER_LAUNCH = _PROGRAM_TILES * LANES * 4  # 32 × 128 × 4 = 16,384
-
-        n_launches = (n_elements + UNIFORMS_PER_LAUNCH - 1) // UNIFORMS_PER_LAUNCH
-
-        k0_val = seed & 0xFFFFFF
-        k1_val = (seed >> 24) & 0xFFFFFF
-
-        c0_np = np.arange(LANES, dtype=np.int32).reshape(-1, 1)
-        k0_np = np.full((LANES, 1), k0_val, dtype=np.int32)
-        k1_np = np.full((LANES, 1), k1_val, dtype=np.int32)
-        k2_np = np.zeros((LANES, 1), dtype=np.int32)
-        k3_np = np.zeros((LANES, 1), dtype=np.int32)
-
-        chunks = []
-        for launch in range(n_launches):
-            start_batch = (counter_offset + launch * _PROGRAM_TILES) & 0xFFFFFF
-            start_batch_np = np.full((LANES, 1), start_batch, dtype=np.int32)
-
-            if _use_simulator():
-                out_np = nki.simulate(threefry_streaming_uniform_kernel)(
-                    c0_np, start_batch_np, k0_np, k1_np, k2_np, k3_np
+                u1 = nl.maximum(
+                    nl.multiply(_u24_f32(x1_b, scale256, scale65536), inv24, dtype=nl.float32),
+                    clamp_eps,
                 )
-                out_tile = torch.from_numpy(np.asarray(out_np).reshape(-1))
+                u2 = nl.maximum(
+                    nl.multiply(_u24_f32(x2_b, scale256, scale65536), inv24, dtype=nl.float32),
+                    clamp_eps,
+                )
+                u3 = nl.maximum(
+                    nl.multiply(_u24_f32(x3_b, scale256, scale65536), inv24, dtype=nl.float32),
+                    clamp_eps,
+                )
+                bm_r0 = nl.sqrt(nl.multiply(nl.log(u0), neg_two))
+                bm_theta0 = nl.multiply(u1, two_pi)
+                bm_r1 = nl.sqrt(nl.multiply(nl.log(u2), neg_two))
+                bm_theta1 = nl.multiply(u3, two_pi)
+                nisa.tensor_tensor(res[:, 0:F], bm_r0, nl.cos(bm_theta0), op=nl.multiply)
+                nisa.tensor_tensor(res[:, F : 2 * F], bm_r0, nl.sin(bm_theta0), op=nl.multiply)
+                nisa.tensor_tensor(res[:, 2 * F : 3 * F], bm_r1, nl.cos(bm_theta1), op=nl.multiply)
+                nisa.tensor_tensor(res[:, 3 * F : 4 * F], bm_r1, nl.sin(bm_theta1), op=nl.multiply)
             else:
-                out_tile = _launch(
-                    threefry_streaming_uniform_kernel,
-                    "threefry_streaming_uniform",
-                    *(
-                        torch.from_numpy(a)
-                        for a in (c0_np, start_batch_np, k0_np, k1_np, k2_np, k3_np)
-                    ),
-                ).reshape(-1)
-            chunks.append(out_tile)
+                nisa.tensor_scalar(
+                    res[:, 0:F],
+                    _u24_f32(x0_b, scale256, scale65536),
+                    op0=nl.multiply,
+                    operand0=inv24,
+                )
+                nisa.tensor_scalar(
+                    res[:, F : 2 * F],
+                    _u24_f32(x1_b, scale256, scale65536),
+                    op0=nl.multiply,
+                    operand0=inv24,
+                )
+                nisa.tensor_scalar(
+                    res[:, 2 * F : 3 * F],
+                    _u24_f32(x2_b, scale256, scale65536),
+                    op0=nl.multiply,
+                    operand0=inv24,
+                )
+                nisa.tensor_scalar(
+                    res[:, 3 * F : 4 * F],
+                    _u24_f32(x3_b, scale256, scale65536),
+                    op0=nl.multiply,
+                    operand0=inv24,
+                )
 
-        result = torch.cat(chunks) if len(chunks) > 1 else chunks[0]
-        return result.float()[:n_elements]
+            base = c * 4 * F
+            nl.store(out[:, base : base + 4 * F], res)
+
+        return out
+
+    @nki.jit
+    def threefry_bulk_normal_kernel(c0_ref, start_ref, k0_ref, k1_ref, k2_ref, k3_ref):
+        """Threefry4×32-20 + Box-Muller over C chunks of (P, F) batches in one launch (#60).
+
+        Inputs:
+          c0_ref:    (P, F) int32 — lane index p in every column (sets F)
+          start_ref: (P, C) int32 — chunk c's first batch index, masked to 24 bits (sets C)
+          k0..k3:    (P, 1) int32 — Threefry key words
+
+        Output: (P, C × 4 × F) float32; chunk c, word w, column j at
+        c·4F + w·F + j is normal w of lane p, batch start[c] + j.
+        """
+        return _threefry_bulk_body(c0_ref, start_ref, k0_ref, k1_ref, k2_ref, k3_ref, True)
+
+    @nki.jit
+    def threefry_bulk_uniform_kernel(c0_ref, start_ref, k0_ref, k1_ref, k2_ref, k3_ref):
+        """Uniform twin of `threefry_bulk_normal_kernel`: float32 in [0, 1), same layout."""
+        return _threefry_bulk_body(c0_ref, start_ref, k0_ref, k1_ref, k2_ref, k3_ref, False)
+
+    # ── 16-bit limb variant of the bulk kernels (#60, TRNRAND_LIMB_BITS=16, diagnostic) ──
+    #
+    # Why limbs at all: aws-neuron-sdk#1308 / ed05ad3 -- integer arithmetic
+    # (`nl.add`, `nl.multiply`, `tensor_scalar_arith`) runs through the
+    # engines' float32 datapath, so a uint32 add is exact only while every
+    # operand and result is < 2^24. A full-word (mod 2^32) add is therefore
+    # not available; bitwise ops (and/or/xor/shifts, `tensor_scalar_bitvec`)
+    # are integer-exact. Bytes (8-bit limbs) were chosen originally because
+    # the Philox 32x32 multiply needed byte sub-products (<= 2^16) and the
+    # Threefry port reused the same representation. Threefry has no multiply,
+    # so 16-bit limbs suffice: limb + limb + carry <= 2^17 - 1, exact in fp32.
+    # Every word is [lo, hi], each a (P, F) uint32 tile in [0, 2^16).
+    # Half the limbs -> about half the instructions per add / xor / rotate.
+    # Left shifts mask first, so no intermediate ever reaches 2^16 either.
+
+    _THREEFRY_ROT_QR16 = tuple((rot // 16, rot % 16) for pair in THREEFRY_ROTATIONS for rot in pair)
+
+    def _w16_from_bytes_f32(b):
+        """Four (P, 1) uint32 byte tiles -> [lo, hi] (P, 1) float32 limbs (< 2^16)."""
+        lo = nl.bitwise_or(b[0], nl.left_shift(b[1], 8, dtype=nl.uint32), dtype=nl.uint32)
+        hi = nl.bitwise_or(b[2], nl.left_shift(b[3], 8, dtype=nl.uint32), dtype=nl.uint32)
+        return [nl.copy(lo, dtype=nl.float32), nl.copy(hi, dtype=nl.float32)]
+
+    def _add32_h(a_h, b_h):
+        """(a + b) mod 2^32, both [lo, hi] (P, F) uint32 limbs; sums < 2^17."""
+        s0 = _nki_add_u32(a_h[0], b_h[0])
+        c0 = nl.right_shift(s0, 16, dtype=nl.uint32)
+        r0 = nl.bitwise_and(s0, 0xFFFF, dtype=nl.uint32)
+        s1 = _nki_add_u32(_nki_add_u32(a_h[1], b_h[1]), c0)
+        r1 = nl.bitwise_and(s1, 0xFFFF, dtype=nl.uint32)
+        return [r0, r1]
+
+    def _add32_hs(a_h, k_f):
+        """(a + k) mod 2^32; a: [lo, hi] (P, F) uint32, k: [lo, hi] (P, 1) float32."""
+        s0 = _ts_add_u32(a_h[0], k_f[0])
+        c0 = nl.right_shift(s0, 16, dtype=nl.uint32)
+        r0 = nl.bitwise_and(s0, 0xFFFF, dtype=nl.uint32)
+        s1 = _nki_add_u32(_ts_add_u32(a_h[1], k_f[1]), c0)
+        r1 = nl.bitwise_and(s1, 0xFFFF, dtype=nl.uint32)
+        return [r0, r1]
+
+    def _rot_limb16(h, lo_src, r):
+        """((h << r) | (lo_src >> (16 - r))) & 0xFFFF with h masked before the shift."""
+        return nl.bitwise_or(
+            nl.left_shift(
+                nl.bitwise_and(h, (1 << (16 - r)) - 1, dtype=nl.uint32), r, dtype=nl.uint32
+            ),
+            nl.right_shift(lo_src, 16 - r, dtype=nl.uint32),
+            dtype=nl.uint32,
+        )
+
+    def _rotl32_h(x_h, q, r):
+        """Rotate-left by 16 q + r bits on [lo, hi] limbs."""
+        if q == 0:
+            a, b = x_h[0], x_h[1]
+        else:
+            a, b = x_h[1], x_h[0]
+        # After the q swap the word is b:a; output lo = (a << r) | (b >> (16 - r)), hi likewise.
+        if r == 0:
+            return [a, b]
+        return [_rot_limb16(a, b, r), _rot_limb16(b, a, r)]
+
+    def _mix_h(a_h, b_h, q, r):
+        a_new = _add32_h(a_h, b_h)
+        b_rot = _rotl32_h(b_h, q, r)
+        b_new = [
+            nl.bitwise_xor(b_rot[0], a_new[0], dtype=nl.uint32),
+            nl.bitwise_xor(b_rot[1], a_new[1], dtype=nl.uint32),
+        ]
+        return a_new, b_new
+
+    def _key_inject_hs(x_h, ks_f, ksp_f, step):
+        out0 = _add32_hs(x_h[0], ks_f[(step + 0) % 5])
+        out1 = _add32_hs(x_h[1], ks_f[(step + 1) % 5])
+        out2 = _add32_hs(x_h[2], ks_f[(step + 2) % 5])
+        out3 = _add32_hs(x_h[3], ksp_f[step])
+        return [out0, out1, out2, out3]
+
+    def _u24_f32_h(w, scale65536):
+        """Low 24 bits of a [lo, hi] word as float32 lo + 65536 (hi & 0xFF) (exact)."""
+        return nl.add(
+            nl.copy(w[0], dtype=nl.float32),
+            nl.multiply(
+                nl.copy(nl.bitwise_and(w[1], 0xFF, dtype=nl.uint32), dtype=nl.float32),
+                scale65536,
+                dtype=nl.float32,
+            ),
+            dtype=nl.float32,
+        )
+
+    def _threefry_bulk16_body(c0_ref, start_ref, k0_ref, k1_ref, k2_ref, k3_ref, normal):
+        P = c0_ref.shape[0]
+        F = c0_ref.shape[1]
+        C = start_ref.shape[1]
+
+        # Key schedule on (P, 1) byte tiles (as in the 8-bit body), then 16-bit limbs.
+        k0_b = _b_split(k0_ref)
+        k1_b = _b_split(k1_ref)
+        k2_b = _b_split(k2_ref)
+        k3_b = _b_split(k3_ref)
+        parity_b = _b_from_scalar(P, THREEFRY_SKEIN_KS_PARITY)
+        k4_b = _xor32_b(_xor32_b(_xor32_b(_xor32_b(k0_b, k1_b), k2_b), k3_b), parity_b)
+        ks_b = [k0_b, k1_b, k2_b, k3_b, k4_b]
+        ks_f = [
+            _w16_from_bytes_f32(k0_b),
+            _w16_from_bytes_f32(k1_b),
+            _w16_from_bytes_f32(k2_b),
+            _w16_from_bytes_f32(k3_b),
+            _w16_from_bytes_f32(k4_b),
+        ]
+        ksp_f = [
+            _w16_from_bytes_f32(_add32_b(ks_b[3], _b_from_scalar(P, 0))),
+            _w16_from_bytes_f32(_add32_b(ks_b[4], _b_from_scalar(P, 1))),
+            _w16_from_bytes_f32(_add32_b(ks_b[0], _b_from_scalar(P, 2))),
+            _w16_from_bytes_f32(_add32_b(ks_b[1], _b_from_scalar(P, 3))),
+            _w16_from_bytes_f32(_add32_b(ks_b[2], _b_from_scalar(P, 4))),
+            _w16_from_bytes_f32(_add32_b(ks_b[3], _b_from_scalar(P, 5))),
+        ]
+
+        zero = nl.full((P, F), 0, dtype=nl.uint32)
+        c0_u = _as_u32(nl.load(c0_ref))  # lane index p < 128 in every column
+        c0_h = [c0_u, zero]
+
+        col = nl.ndarray((P, F), dtype=nl.uint32, buffer=nl.sbuf)
+        nisa.iota(col, [[1, F]], offset=0, channel_multiplier=0)
+        col_h = [col, zero]  # F <= 2^16
+
+        inv24 = nl.full((P, 1), 1.0 / 16777216.0, dtype=nl.float32)
+        scale65536 = nl.full((P, 1), 65536.0, dtype=nl.float32)
+        clamp_eps = nl.full((P, 1), 1e-7, dtype=nl.float32)
+        neg_two = nl.full((P, 1), -2.0, dtype=nl.float32)
+        two_pi = nl.full((P, 1), TWO_PI, dtype=nl.float32)
+
+        out = nl.ndarray((P, C * 4 * F), dtype=nl.float32, buffer=nl.shared_hbm)
+
+        for c in nl.static_range(C):
+            # c1 = (start[c] + j) & 0xFFFFFF; start[c] is already masked to 24 bits.
+            start_b = _b_split(start_ref[:, c : c + 1])
+            c1_full = _add32_hs(col_h, _w16_from_bytes_f32(start_b))
+            c1_h = [c1_full[0], nl.bitwise_and(c1_full[1], 0xFF, dtype=nl.uint32)]
+
+            _ki = _key_inject_hs([c0_h, c1_h, [zero, zero], [zero, zero]], ks_f, ksp_f, 0)
+            x0 = _ki[0]
+            x1 = _ki[1]
+            x2 = _ki[2]
+            x3 = _ki[3]
+
+            for round_num in nl.static_range(THREEFRY_ROUNDS):
+                pair_idx = round_num % 4
+                q0, r0 = _THREEFRY_ROT_QR16[pair_idx * 2 + 0]
+                q1, r1 = _THREEFRY_ROT_QR16[pair_idx * 2 + 1]
+                if round_num % 2 == 0:
+                    x0, x1 = _mix_h(x0, x1, q0, r0)
+                    x2, x3 = _mix_h(x2, x3, q1, r1)
+                else:
+                    x0, x3 = _mix_h(x0, x3, q0, r0)
+                    x2, x1 = _mix_h(x2, x1, q1, r1)
+                if (round_num + 1) % 4 == 0:
+                    _ki = _key_inject_hs([x0, x1, x2, x3], ks_f, ksp_f, (round_num + 1) // 4)
+                    x0 = _ki[0]
+                    x1 = _ki[1]
+                    x2 = _ki[2]
+                    x3 = _ki[3]
+
+            res = nl.ndarray((P, 4 * F), dtype=nl.float32, buffer=nl.sbuf)
+            if normal:
+                u0 = nl.maximum(
+                    nl.multiply(_u24_f32_h(x0, scale65536), inv24, dtype=nl.float32), clamp_eps
+                )
+                u1 = nl.maximum(
+                    nl.multiply(_u24_f32_h(x1, scale65536), inv24, dtype=nl.float32), clamp_eps
+                )
+                u2 = nl.maximum(
+                    nl.multiply(_u24_f32_h(x2, scale65536), inv24, dtype=nl.float32), clamp_eps
+                )
+                u3 = nl.maximum(
+                    nl.multiply(_u24_f32_h(x3, scale65536), inv24, dtype=nl.float32), clamp_eps
+                )
+                bm_r0 = nl.sqrt(nl.multiply(nl.log(u0), neg_two))
+                bm_theta0 = nl.multiply(u1, two_pi)
+                bm_r1 = nl.sqrt(nl.multiply(nl.log(u2), neg_two))
+                bm_theta1 = nl.multiply(u3, two_pi)
+                nisa.tensor_tensor(res[:, 0:F], bm_r0, nl.cos(bm_theta0), op=nl.multiply)
+                nisa.tensor_tensor(res[:, F : 2 * F], bm_r0, nl.sin(bm_theta0), op=nl.multiply)
+                nisa.tensor_tensor(res[:, 2 * F : 3 * F], bm_r1, nl.cos(bm_theta1), op=nl.multiply)
+                nisa.tensor_tensor(res[:, 3 * F : 4 * F], bm_r1, nl.sin(bm_theta1), op=nl.multiply)
+            else:
+                nisa.tensor_scalar(
+                    res[:, 0:F], _u24_f32_h(x0, scale65536), op0=nl.multiply, operand0=inv24
+                )
+                nisa.tensor_scalar(
+                    res[:, F : 2 * F], _u24_f32_h(x1, scale65536), op0=nl.multiply, operand0=inv24
+                )
+                nisa.tensor_scalar(
+                    res[:, 2 * F : 3 * F],
+                    _u24_f32_h(x2, scale65536),
+                    op0=nl.multiply,
+                    operand0=inv24,
+                )
+                nisa.tensor_scalar(
+                    res[:, 3 * F : 4 * F],
+                    _u24_f32_h(x3, scale65536),
+                    op0=nl.multiply,
+                    operand0=inv24,
+                )
+
+            base = c * 4 * F
+            nl.store(out[:, base : base + 4 * F], res)
+
+        return out
+
+    @nki.jit
+    def threefry_bulk16_normal_kernel(c0_ref, start_ref, k0_ref, k1_ref, k2_ref, k3_ref):
+        """`threefry_bulk_normal_kernel` on 16-bit limbs; same inputs, layout and bits."""
+        return _threefry_bulk16_body(c0_ref, start_ref, k0_ref, k1_ref, k2_ref, k3_ref, True)
+
+    @nki.jit
+    def threefry_bulk16_uniform_kernel(c0_ref, start_ref, k0_ref, k1_ref, k2_ref, k3_ref):
+        """`threefry_bulk_uniform_kernel` on 16-bit limbs; same inputs, layout and bits."""
+        return _threefry_bulk16_body(c0_ref, start_ref, k0_ref, k1_ref, k2_ref, k3_ref, False)
+
+    # ── Full-word variant (#60, TRNRAND_LIMB_BITS=32, the native default) ──────
+    #
+    # NKI 0.7 documents that `nisa.tensor_tensor` with all-int32/uint32
+    # operands runs on the GpSimd engine with native integer arithmetic
+    # ("exact results for all 32-bit integer values"); earlier NKI routed it
+    # through float32. The docs do not say the add WRAPS mod 2^32 and the
+    # simulator cannot tell; the Trn2 run of ea3800e confirmed it (bit-identical
+    # to the 8-bit kernels, tests/test_nki_native.py). Adds are pinned to
+    # GpSimd; xor and rotate are bitvec ops (Vector engine, bit patterns).
+    # Key words are broadcast to (P, F) once per launch, since
+    # `tensor_scalar` arithmetic operands must be float32.
+
+    def _add32_w(x, y):
+        out = nl.ndarray(x.shape, dtype=nl.uint32, buffer=nl.sbuf)
+        nisa.tensor_tensor(out, x, y, op=nl.add, engine=nisa.engine.gpsimd)
+        return out
+
+    def _rotl32_w(x, rot):
+        return nl.bitwise_or(
+            nl.left_shift(x, rot, dtype=nl.uint32),
+            nl.right_shift(x, 32 - rot, dtype=nl.uint32),
+            dtype=nl.uint32,
+        )
+
+    def _mix_w(a, b, rot):
+        a_new = _add32_w(a, b)
+        b_new = nl.bitwise_xor(_rotl32_w(b, rot), a_new, dtype=nl.uint32)
+        return a_new, b_new
+
+    def _pack_bytes_wide(b, zero):
+        """Four (P, 1) uint32 byte tiles -> one (P, F) uint32 word (broadcast over F)."""
+        w = nl.bitwise_or(
+            nl.bitwise_or(b[0], nl.left_shift(b[1], 8, dtype=nl.uint32), dtype=nl.uint32),
+            nl.bitwise_or(
+                nl.left_shift(b[2], 16, dtype=nl.uint32),
+                nl.left_shift(b[3], 24, dtype=nl.uint32),
+                dtype=nl.uint32,
+            ),
+            dtype=nl.uint32,
+        )
+        return nl.bitwise_or(zero, w, dtype=nl.uint32)
+
+    def _key_inject_w(x, ks_w, ksp_w, step):
+        return [
+            _add32_w(x[0], ks_w[(step + 0) % 5]),
+            _add32_w(x[1], ks_w[(step + 1) % 5]),
+            _add32_w(x[2], ks_w[(step + 2) % 5]),
+            _add32_w(x[3], ksp_w[step]),
+        ]
+
+    def _u24_f32_w(w):
+        return nl.copy(nl.bitwise_and(w, 0xFFFFFF, dtype=nl.uint32), dtype=nl.float32)
+
+    def _threefry_bulk32_body(c0_ref, start_ref, k0_ref, k1_ref, k2_ref, k3_ref, normal):
+        P = c0_ref.shape[0]
+        F = c0_ref.shape[1]
+        C = start_ref.shape[1]
+        zero = nl.full((P, F), 0, dtype=nl.uint32)
+
+        k0_b = _b_split(k0_ref)
+        k1_b = _b_split(k1_ref)
+        k2_b = _b_split(k2_ref)
+        k3_b = _b_split(k3_ref)
+        parity_b = _b_from_scalar(P, THREEFRY_SKEIN_KS_PARITY)
+        k4_b = _xor32_b(_xor32_b(_xor32_b(_xor32_b(k0_b, k1_b), k2_b), k3_b), parity_b)
+        ks_b = [k0_b, k1_b, k2_b, k3_b, k4_b]
+        ks_w = [
+            _pack_bytes_wide(k0_b, zero),
+            _pack_bytes_wide(k1_b, zero),
+            _pack_bytes_wide(k2_b, zero),
+            _pack_bytes_wide(k3_b, zero),
+            _pack_bytes_wide(k4_b, zero),
+        ]
+        ksp_w = [
+            _pack_bytes_wide(_add32_b(ks_b[3], _b_from_scalar(P, 0)), zero),
+            _pack_bytes_wide(_add32_b(ks_b[4], _b_from_scalar(P, 1)), zero),
+            _pack_bytes_wide(_add32_b(ks_b[0], _b_from_scalar(P, 2)), zero),
+            _pack_bytes_wide(_add32_b(ks_b[1], _b_from_scalar(P, 3)), zero),
+            _pack_bytes_wide(_add32_b(ks_b[2], _b_from_scalar(P, 4)), zero),
+            _pack_bytes_wide(_add32_b(ks_b[3], _b_from_scalar(P, 5)), zero),
+        ]
+
+        c0_w = _as_u32(nl.load(c0_ref))
+        col = nl.ndarray((P, F), dtype=nl.uint32, buffer=nl.sbuf)
+        nisa.iota(col, [[1, F]], offset=0, channel_multiplier=0)
+
+        inv24 = nl.full((P, 1), 1.0 / 16777216.0, dtype=nl.float32)
+        clamp_eps = nl.full((P, 1), 1e-7, dtype=nl.float32)
+        neg_two = nl.full((P, 1), -2.0, dtype=nl.float32)
+        two_pi = nl.full((P, 1), TWO_PI, dtype=nl.float32)
+
+        out = nl.ndarray((P, C * 4 * F), dtype=nl.float32, buffer=nl.shared_hbm)
+
+        for c in nl.static_range(C):
+            start_w = _pack_bytes_wide(_b_split(start_ref[:, c : c + 1]), zero)
+            c1_w = nl.bitwise_and(_add32_w(col, start_w), 0xFFFFFF, dtype=nl.uint32)
+
+            _ki = _key_inject_w([c0_w, c1_w, zero, zero], ks_w, ksp_w, 0)
+            x0 = _ki[0]
+            x1 = _ki[1]
+            x2 = _ki[2]
+            x3 = _ki[3]
+
+            for round_num in nl.static_range(THREEFRY_ROUNDS):
+                rot0, rot1 = THREEFRY_ROTATIONS[round_num % 4]
+                if round_num % 2 == 0:
+                    x0, x1 = _mix_w(x0, x1, rot0)
+                    x2, x3 = _mix_w(x2, x3, rot1)
+                else:
+                    x0, x3 = _mix_w(x0, x3, rot0)
+                    x2, x1 = _mix_w(x2, x1, rot1)
+                if (round_num + 1) % 4 == 0:
+                    _ki = _key_inject_w([x0, x1, x2, x3], ks_w, ksp_w, (round_num + 1) // 4)
+                    x0 = _ki[0]
+                    x1 = _ki[1]
+                    x2 = _ki[2]
+                    x3 = _ki[3]
+
+            res = nl.ndarray((P, 4 * F), dtype=nl.float32, buffer=nl.sbuf)
+            if normal:
+                u0 = nl.maximum(nl.multiply(_u24_f32_w(x0), inv24, dtype=nl.float32), clamp_eps)
+                u1 = nl.maximum(nl.multiply(_u24_f32_w(x1), inv24, dtype=nl.float32), clamp_eps)
+                u2 = nl.maximum(nl.multiply(_u24_f32_w(x2), inv24, dtype=nl.float32), clamp_eps)
+                u3 = nl.maximum(nl.multiply(_u24_f32_w(x3), inv24, dtype=nl.float32), clamp_eps)
+                bm_r0 = nl.sqrt(nl.multiply(nl.log(u0), neg_two))
+                bm_theta0 = nl.multiply(u1, two_pi)
+                bm_r1 = nl.sqrt(nl.multiply(nl.log(u2), neg_two))
+                bm_theta1 = nl.multiply(u3, two_pi)
+                nisa.tensor_tensor(res[:, 0:F], bm_r0, nl.cos(bm_theta0), op=nl.multiply)
+                nisa.tensor_tensor(res[:, F : 2 * F], bm_r0, nl.sin(bm_theta0), op=nl.multiply)
+                nisa.tensor_tensor(res[:, 2 * F : 3 * F], bm_r1, nl.cos(bm_theta1), op=nl.multiply)
+                nisa.tensor_tensor(res[:, 3 * F : 4 * F], bm_r1, nl.sin(bm_theta1), op=nl.multiply)
+            else:
+                nisa.tensor_scalar(res[:, 0:F], _u24_f32_w(x0), op0=nl.multiply, operand0=inv24)
+                nisa.tensor_scalar(
+                    res[:, F : 2 * F], _u24_f32_w(x1), op0=nl.multiply, operand0=inv24
+                )
+                nisa.tensor_scalar(
+                    res[:, 2 * F : 3 * F], _u24_f32_w(x2), op0=nl.multiply, operand0=inv24
+                )
+                nisa.tensor_scalar(
+                    res[:, 3 * F : 4 * F], _u24_f32_w(x3), op0=nl.multiply, operand0=inv24
+                )
+
+            base = c * 4 * F
+            nl.store(out[:, base : base + 4 * F], res)
+
+        return out
+
+    @nki.jit
+    def threefry_bulk32_normal_kernel(c0_ref, start_ref, k0_ref, k1_ref, k2_ref, k3_ref):
+        """`threefry_bulk_normal_kernel` on full uint32 words (GpSimd integer adds)."""
+        return _threefry_bulk32_body(c0_ref, start_ref, k0_ref, k1_ref, k2_ref, k3_ref, True)
+
+    @nki.jit
+    def threefry_bulk32_uniform_kernel(c0_ref, start_ref, k0_ref, k1_ref, k2_ref, k3_ref):
+        """`threefry_bulk_uniform_kernel` on full uint32 words (GpSimd integer adds)."""
+        return _threefry_bulk32_body(c0_ref, start_ref, k0_ref, k1_ref, k2_ref, k3_ref, False)
+
+
+# ── Threefry host wrappers (module level) ────────────────────────────────────
+#
+# Defined outside `if HAS_NKI:` so launch counts and output order are testable
+# on CPU-only hosts with a stand-in `_launch` (tests/test_launch_granularity.py).
+# Kernels are looked up by name at call time; they exist only when HAS_NKI.
+
+
+def _kernel(name: str):
+    """Return the `@nki.jit` kernel `name`, or None when NKI is not installed."""
+    return globals().get(name)
+
+
+def _neuronx_cc_version():
+    """(major, minor) of the installed neuronx-cc, or None if it is absent."""
+    try:
+        from importlib.metadata import version
+
+        major, minor = version("neuronx-cc").split(".")[:2]
+        return int(major), int(minor)
+    except Exception:
+        return None
+
+
+def _bulk_streaming() -> bool:
+    """Whether bulk uniform/normal generation uses the multi-tile streaming kernels.
+
+    The per-tile kernels emit 512 values per launch, so `normal(4M)` was 8,192
+    launches at the ~0.2 ms native dispatch floor or worse (#60). The streaming
+    kernels emit _PROGRAM_TILES × 512 = 16,384 values per launch, element-for-
+    element equal to the per-tile path (#58), so they are the default.
+
+    They do not compile on neuronx-cc 2.26 (SBUF OOM, #57), the compiler on the
+    Trn1 / XLA DLAMI, so the XLA path keeps the per-tile kernels on neuronx-cc
+    older than 2.28. TRNRAND_BULK_STREAMING=0/1 overrides the choice.
+    """
+    env = os.environ.get("TRNRAND_BULK_STREAMING", "").lower()
+    if env in ("1", "true", "yes"):
+        return True
+    if env in ("0", "false", "no"):
+        return False
+    if _use_simulator() or _get_dispatch_path() == "native":
+        return True
+    ver = _neuronx_cc_version()
+    return ver is None or ver >= (2, 28)
+
+
+def threefry_uniform_nki(
+    n_elements: int,
+    seed: int = 0,
+    counter_offset: int = 0,
+) -> torch.Tensor:
+    """Threefry4×32-20 → float32 uniforms in [0, 1).
+
+    Routes through `threefry_stream_uniform` (16,384 values per kernel launch)
+    unless `_bulk_streaming()` says otherwise, else `_threefry_uniform_per_tile`
+    (512 per launch). Both give the same values in the same order for a given
+    seed and counter_offset (#58, #60); counter_offset is in 512-value tiles.
+    """
+    if _bulk_streaming():
+        return threefry_stream_uniform(n_elements, seed=seed, counter_offset=counter_offset)
+    return _threefry_uniform_per_tile(n_elements, seed=seed, counter_offset=counter_offset)
+
+
+def threefry_normal_nki(
+    n_elements: int,
+    seed: int = 0,
+    counter_offset: int = 0,
+) -> torch.Tensor:
+    """Threefry4×32-20 + Box-Muller → N(0,1) float32.
+
+    Same routing as `threefry_uniform_nki`: `threefry_stream_normal` by default,
+    `_threefry_normal_per_tile` on old compilers; identical output either way.
+    """
+    if _bulk_streaming():
+        return threefry_stream_normal(n_elements, seed=seed, counter_offset=counter_offset)
+    return _threefry_normal_per_tile(n_elements, seed=seed, counter_offset=counter_offset)
+
+
+def _threefry_uniform_per_tile(
+    n_elements: int,
+    seed: int = 0,
+    counter_offset: int = 0,
+) -> torch.Tensor:
+    """Host-side wrapper: Threefry4×32-20 → float32 uniforms in [0, 1).
+
+    Counter design (ensures all tile inputs < 2^24 for the host's
+    typical workload up to ~128 * 2^16 = ~8M elements per call):
+        c0 = lane index within tile (0..127)
+        c1 = batch/tile index (0..n_batches-1)
+        c2 = counter_offset high word
+        c3 = 0
+    Key: k0=seed&0xFFFFFF, k1=(seed>>24)&0xFFFFFF, k2=k3=0
+    (trimmed to 24 bits to guarantee < 2^24 at tile load time).
+    """
+    LANES = _THREEFRY_LANES
+    n_words = (n_elements + 3) // 4  # each lane emits 4 words
+    n_batches = (n_words + LANES - 1) // LANES
+
+    k0_val = seed & 0xFFFFFF
+    k1_val = (seed >> 24) & 0xFFFFFF
+
+    chunks = []
+    for batch in range(n_batches):
+        tile_lanes = min(LANES, n_words - batch * LANES)
+        c0_np = np.arange(tile_lanes, dtype=np.int32).reshape(-1, 1)
+        c1_np = np.full((tile_lanes, 1), (batch + counter_offset) & 0xFFFFFF, dtype=np.int32)
+        c2_np = np.zeros((tile_lanes, 1), dtype=np.int32)
+        c3_np = np.zeros((tile_lanes, 1), dtype=np.int32)
+        k0_np = np.full((tile_lanes, 1), k0_val, dtype=np.int32)
+        k1_np = np.full((tile_lanes, 1), k1_val, dtype=np.int32)
+        k2_np = np.zeros((tile_lanes, 1), dtype=np.int32)
+        k3_np = np.zeros((tile_lanes, 1), dtype=np.int32)
+
+        if _use_simulator():
+            out_np = nki.simulate(_kernel("threefry4x32_kernel"))(
+                c0_np,
+                c1_np,
+                c2_np,
+                c3_np,
+                k0_np,
+                k1_np,
+                k2_np,
+                k3_np,
+            )
+            out_tile = torch.from_numpy(np.asarray(out_np).reshape(-1))
+        else:
+            out_tile = _launch(
+                _kernel("threefry4x32_kernel"),
+                "threefry4x32",
+                *(
+                    torch.from_numpy(a)
+                    for a in (c0_np, c1_np, c2_np, c3_np, k0_np, k1_np, k2_np, k3_np)
+                ),
+            ).reshape(-1)
+        chunks.append(out_tile)
+
+    result = torch.cat(chunks) if len(chunks) > 1 else chunks[0]
+    return result.float()[:n_elements]
+
+
+def _threefry_normal_per_tile(
+    n_elements: int,
+    seed: int = 0,
+    counter_offset: int = 0,
+) -> torch.Tensor:
+    """Host-side wrapper: Threefry4×32-20 + Box-Muller → N(0,1) floats.
+
+    Uses the fused `threefry_normal_kernel`. Each tile emits 4 normals
+    per lane (2 Box-Muller pairs). Counter layout matches
+    `threefry_uniform_nki`.
+    """
+    LANES = _THREEFRY_LANES
+    n_words = (n_elements + 3) // 4
+    n_batches = (n_words + LANES - 1) // LANES
+
+    k0_val = seed & 0xFFFFFF
+    k1_val = (seed >> 24) & 0xFFFFFF
+
+    chunks = []
+    for batch in range(n_batches):
+        tile_lanes = min(LANES, n_words - batch * LANES)
+        c0_np = np.arange(tile_lanes, dtype=np.int32).reshape(-1, 1)
+        c1_np = np.full((tile_lanes, 1), (batch + counter_offset) & 0xFFFFFF, dtype=np.int32)
+        c2_np = np.zeros((tile_lanes, 1), dtype=np.int32)
+        c3_np = np.zeros((tile_lanes, 1), dtype=np.int32)
+        k0_np = np.full((tile_lanes, 1), k0_val, dtype=np.int32)
+        k1_np = np.full((tile_lanes, 1), k1_val, dtype=np.int32)
+        k2_np = np.zeros((tile_lanes, 1), dtype=np.int32)
+        k3_np = np.zeros((tile_lanes, 1), dtype=np.int32)
+
+        if _use_simulator():
+            out_np = nki.simulate(_kernel("threefry_normal_kernel"))(
+                c0_np,
+                c1_np,
+                c2_np,
+                c3_np,
+                k0_np,
+                k1_np,
+                k2_np,
+                k3_np,
+            )
+            out_tile = torch.from_numpy(np.asarray(out_np).reshape(-1))
+        else:
+            out_tile = _launch(
+                _kernel("threefry_normal_kernel"),
+                "threefry_normal",
+                *(
+                    torch.from_numpy(a)
+                    for a in (c0_np, c1_np, c2_np, c3_np, k0_np, k1_np, k2_np, k3_np)
+                ),
+            ).reshape(-1)
+        chunks.append(out_tile)
+
+    result = torch.cat(chunks) if len(chunks) > 1 else chunks[0]
+    return result.float()[:n_elements]
+
+
+def _h2d(t: torch.Tensor) -> torch.Tensor:
+    """Host → Neuron device copy (one hook so tests can count copies)."""
+    return t.to(_NEURON_DEVICE)
+
+
+def _d2h(t: torch.Tensor) -> torch.Tensor:
+    """Neuron device → host copy (one hook so tests can count copies)."""
+    return t.cpu()
+
+
+def _bulk_launches(normal: bool, n_elements, seed, counter_offset):
+    """Run the bulk Threefry kernel; return host values in per-tile order (#60).
+
+    One launch covers up to _BULK_CHUNKS_MAX × _BULK_COLS_MAX batches
+    (16 × 512 × 512 = 4,194,304 values at the defaults), so `normal(4M)` is
+    one launch instead of 256. Chunk c of launch L starts at batch
+    (counter_offset + (L·C + c)·F) & 0xFFFFFF, and column j of it is batch
+    (start + j) & 0xFFFFFF: the same counter for every element as the
+    per-tile and streaming paths, so the values are bit-identical.
+
+    Native path: the (P, F) lane tile and key words are copied to the device
+    once, every launch's (P, C) start tile goes over as one (L, P, C) tensor,
+    and the outputs come back in one device→host copy.
+    """
+    LANES = _THREEFRY_LANES
+    F, C, n_launches = _bulk_plan(n_elements)
+    # Full-word (32) kernels only on the native TorchNeuron (Trn2+) path and the
+    # simulator; anything else keeps the 8-bit kernels (aws-neuron-sdk#1308).
+    native = _use_simulator() or _get_dispatch_path() == "native"
+    bits = _limb_bits() if native else 8
+    variant = {8: "bulk", 16: "bulk16", 32: "bulk32"}[bits]
+    op_name = f"threefry_{variant}_{'normal' if normal else 'uniform'}"
+    kernel_name = op_name + "_kernel"
+
+    k0_val = seed & 0xFFFFFF
+    k1_val = (seed >> 24) & 0xFFFFFF
+    c0_np = np.ascontiguousarray(
+        np.broadcast_to(np.arange(LANES, dtype=np.int32).reshape(-1, 1), (LANES, F))
+    )
+    k_np = [
+        np.full((LANES, 1), k0_val, dtype=np.int32),
+        np.full((LANES, 1), k1_val, dtype=np.int32),
+        np.zeros((LANES, 1), dtype=np.int32),
+        np.zeros((LANES, 1), dtype=np.int32),
+    ]
+    starts = (counter_offset + np.arange(n_launches * C, dtype=np.int64) * F) & 0xFFFFFF
+    sb_np = np.ascontiguousarray(
+        np.broadcast_to(starts.astype(np.int32).reshape(n_launches, 1, C), (n_launches, LANES, C))
+    )
+
+    if _use_simulator():
+        sim = nki.simulate(_kernel(kernel_name))
+        outs = [
+            torch.from_numpy(np.asarray(sim(c0_np, sb_np[i], *k_np))) for i in range(n_launches)
+        ]
+    else:
+        op = _get_native_ops()[op_name]
+        c0_d = _h2d(torch.from_numpy(c0_np))
+        k_d = [_h2d(torch.from_numpy(a)) for a in k_np]
+        sb_d = _h2d(torch.from_numpy(sb_np))
+        outs_d = [op(c0_d, sb_d[i], *k_d) for i in range(n_launches)]
+        stacked = outs_d[0].unsqueeze(0) if n_launches == 1 else torch.stack(outs_d)
+        outs = list(_d2h(stacked).unbind(0))
+
+    chunks = [_bulk_tile_order(o, F) for o in outs]
+    result = torch.cat(chunks) if len(chunks) > 1 else chunks[0]
+    return result.float()[:n_elements]
+
+
+def _limb_bits() -> int:
+    """Word width of the bulk Threefry kernels on the native path (#60).
+
+    TRNRAND_LIMB_BITS=32 (default): full uint32 words, adds on GpSimd native
+    integer arithmetic (wraps mod 2^32 on Trn2). TRNRAND_LIMB_BITS=8: the
+    byte-limb kernels, the documented fallback. 16 is a diagnostic width.
+    All three are bit-identical. The XLA/Trn1 path never uses the bulk
+    kernels (it streams), so this never changes it.
+    """
+    env = os.environ.get("TRNRAND_LIMB_BITS", "").strip()
+    if env in ("", "32"):
+        return 32
+    if env in ("8", "16"):
+        return int(env)
+    raise ValueError(f"TRNRAND_LIMB_BITS must be 32, 8 or 16, got {env!r}")
+
+
+def _use_bulk() -> bool:
+    """Bulk kernels on the native path and the simulator; TRNRAND_BULK_KERNEL=0 opts out."""
+    if os.environ.get("TRNRAND_BULK_KERNEL", "").lower() in ("0", "false", "no"):
+        return False
+    return _use_simulator() or _get_dispatch_path() == "native"
+
+
+def _stream_launches(kernel_name: str, op_name: str, n_elements, seed, counter_offset):
+    """Run the streaming kernel `ceil(n / 16,384)` times; return host values in per-tile order.
+
+    Launch L uses start_batch = (counter_offset + L × _PROGRAM_TILES) & 0xFFFFFF.
+
+    Native path (#60): the constant (P, 1) inputs (lane index, key words) are
+    copied to the device once, and the start_batch inputs for all launches are
+    copied once as one (L, P, 1) tensor and indexed per launch. Each launch's
+    (P, 4 × tiles) output stays on the device; they are stacked there and
+    copied back in one transfer. That is 6 host→device copies and 1
+    device→host copy per call, instead of 6 and 1 per launch.
+
+    XLA path and simulator: one `_launch` / `nki.simulate` per launch, unchanged.
+    """
+    LANES = _THREEFRY_LANES
+    per_launch = _PROGRAM_TILES * LANES * 4  # 32 × 128 × 4 = 16,384
+    n_launches = max(1, (n_elements + per_launch - 1) // per_launch)
+
+    k0_val = seed & 0xFFFFFF
+    k1_val = (seed >> 24) & 0xFFFFFF
+    c0_np = np.arange(LANES, dtype=np.int32).reshape(-1, 1)
+    k_np = [
+        np.full((LANES, 1), k0_val, dtype=np.int32),
+        np.full((LANES, 1), k1_val, dtype=np.int32),
+        np.zeros((LANES, 1), dtype=np.int32),
+        np.zeros((LANES, 1), dtype=np.int32),
+    ]
+    starts = (counter_offset + np.arange(n_launches, dtype=np.int64) * _PROGRAM_TILES) & 0xFFFFFF
+    sb_np = np.ascontiguousarray(
+        np.broadcast_to(starts.astype(np.int32).reshape(-1, 1, 1), (n_launches, LANES, 1))
+    )
+
+    if _use_simulator():
+        sim = nki.simulate(_kernel(kernel_name))
+        outs = [
+            torch.from_numpy(np.asarray(sim(c0_np, sb_np[i], *k_np))) for i in range(n_launches)
+        ]
+    elif _get_dispatch_path() == "native":
+        op = _get_native_ops()[op_name]
+        c0_d = _h2d(torch.from_numpy(c0_np))
+        k_d = [_h2d(torch.from_numpy(a)) for a in k_np]
+        sb_d = _h2d(torch.from_numpy(sb_np))
+        outs_d = [op(c0_d, sb_d[i], *k_d) for i in range(n_launches)]
+        stacked = outs_d[0].unsqueeze(0) if n_launches == 1 else torch.stack(outs_d)
+        outs = list(_d2h(stacked).unbind(0))
+    else:
+        kernel = _kernel(kernel_name)
+        outs = [
+            _launch(
+                kernel,
+                op_name,
+                torch.from_numpy(c0_np),
+                torch.from_numpy(sb_np[i]),
+                *(torch.from_numpy(a) for a in k_np),
+            )
+            for i in range(n_launches)
+        ]
+
+    chunks = [_stream_tile_order(o) for o in outs]
+    result = torch.cat(chunks) if len(chunks) > 1 else chunks[0]
+    return result.float()[:n_elements]
+
+
+def threefry_stream_normal(
+    n_elements: int,
+    seed: int = 0,
+    counter_offset: int = 0,
+) -> torch.Tensor:
+    """Host wrapper: streaming Threefry4×32-20 + Box-Muller → N(0,1) floats.
+
+    Each call reuses the fixed-size NEFF compiled for `threefry_streaming_normal_kernel`,
+    running _PROGRAM_TILES Threefry tiles in one XLA invocation — 16,384 samples per
+    XLA call vs 512 per call in threefry_normal_nki. For 1M samples: 245 XLA calls vs
+    7813 in the per-tile wrapper (~31× reduction in launch overhead).
+
+    Counter-offset compatibility: outputs are bit-exact with threefry_normal_nki when
+    both use the same seed and counter_offset. Launch L tile T uses
+    c1 = (counter_offset + L*_PROGRAM_TILES + T) & 0xFFFFFF, matching the per-tile
+    wrapper's c1 = (batch + counter_offset) & 0xFFFFFF at batch = L*_PROGRAM_TILES + T.
+    Each launch's output is flattened in per-tile (tiles, P, 4) order by
+    _stream_tile_order, so the stream equals the per-tile output element-for-element
+    (#58).
+    """
+    if _use_bulk():
+        return _bulk_launches(True, n_elements, seed, counter_offset)
+    return _stream_launches(
+        "threefry_streaming_normal_kernel",
+        "threefry_streaming_normal",
+        n_elements,
+        seed,
+        counter_offset,
+    )
+
+
+def threefry_stream_uniform(
+    n_elements: int,
+    seed: int = 0,
+    counter_offset: int = 0,
+) -> torch.Tensor:
+    """Host wrapper: streaming Threefry4×32-20 → float32 uniforms in [0, 1).
+
+    Same launch/counter scheme as threefry_stream_normal; 16,384 uniforms per
+    XLA call, ~31× fewer round-trips than the per-tile threefry_uniform_nki
+    for large n.
+    Output is in per-tile order, element-for-element equal to
+    threefry_uniform_nki for the same seed and counter_offset (#58).
+    """
+    if _use_bulk():
+        return _bulk_launches(False, n_elements, seed, counter_offset)
+    return _stream_launches(
+        "threefry_streaming_uniform_kernel",
+        "threefry_streaming_uniform",
+        n_elements,
+        seed,
+        counter_offset,
+    )

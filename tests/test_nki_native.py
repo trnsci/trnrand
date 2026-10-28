@@ -9,7 +9,6 @@ to it — custom-op registration, no torch_xla, torch.compile, and the
 streaming program path.
 """
 
-import subprocess
 import sys
 
 import pytest
@@ -55,13 +54,14 @@ def _threefry_inputs(seed: int) -> list[torch.Tensor]:
 
 class TestNativeDispatch:
     def test_native_path_never_imports_torch_xla(self):
-        code = (
-            "import sys; from trnrand.nki.dispatch import threefry_uniform_nki, "
-            "_get_dispatch_path; threefry_uniform_nki(512, seed=1); "
-            "assert _get_dispatch_path() == 'native'; "
-            "assert 'torch_xla' not in sys.modules"
-        )
-        subprocess.run([sys.executable, "-c", code], check=True)
+        # In-process: a subprocess can't acquire NeuronCores while this pytest
+        # process holds them. Lazy registration itself is covered on CPU in
+        # tests/test_native_dispatch.py.
+        from trnrand.nki.dispatch import _get_dispatch_path, threefry_uniform_nki
+
+        threefry_uniform_nki(512, seed=1)
+        assert _get_dispatch_path() == "native"
+        assert "torch_xla" not in sys.modules
 
     def test_ops_registered_in_torch_ops(self):
         from trnrand.nki.dispatch import _get_native_ops
@@ -109,14 +109,53 @@ class TestNativeDispatch:
 
     def test_generator_program_streams_on_native_path(self):
         import trnrand
-        from trnrand.nki.dispatch import threefry_normal_nki
+        from trnrand.nki.dispatch import _threefry_normal_per_tile
 
         n = 16_384
         prog = trnrand.Generator(seed=5).new_program().normal(n, out="z").build()
         z = torch.empty(n)
         prog.stream_into({"z": z})
-        # Streaming and per-tile wrappers are bit-exact for the same seed/offset.
-        torch.testing.assert_close(z, threefry_normal_nki(n, seed=5), rtol=0, atol=0)
+        # Streams emit per-tile order: element-for-element equal to the per-tile
+        # wrapper for the same seed/offset (#58).
+        torch.testing.assert_close(z, _threefry_normal_per_tile(n, seed=5), rtol=0, atol=0)
+
+    @pytest.mark.parametrize("n,seed,offset", [(16_385, 3, 0), (3 * 16_384 + 100, 21, 7)])
+    def test_bulk_multi_launch_matches_per_tile(self, n, seed, offset):
+        # Bulk wrappers stream with device-resident inputs indexed per launch and
+        # one stacked copy back (#60); values/order must equal the per-tile path.
+        from trnrand.nki.dispatch import (
+            _threefry_normal_per_tile,
+            _threefry_uniform_per_tile,
+            threefry_normal_nki,
+            threefry_uniform_nki,
+        )
+
+        z = threefry_normal_nki(n, seed=seed, counter_offset=offset)
+        torch.testing.assert_close(
+            z, _threefry_normal_per_tile(n, seed=seed, counter_offset=offset), rtol=0, atol=0
+        )
+        u = threefry_uniform_nki(n, seed=seed, counter_offset=offset)
+        assert torch.equal(u, _threefry_uniform_per_tile(n, seed=seed, counter_offset=offset))
+
+    @pytest.mark.parametrize("bits", ["16", "32"])
+    @pytest.mark.parametrize(
+        "n,seed,offset",
+        [
+            (1, 0, 0),
+            (16_385, 12345, 2**24 - 5),
+            (1_048_577, 2**40 + 3, 7),
+            (4_194_305, 9, 2**24 - 40),
+        ],
+    )
+    def test_limb_variants_bit_identical(self, monkeypatch, bits, n, seed, offset):
+        # TRNRAND_LIMB_BITS=16|32 (#60) must reproduce the 8-bit bulk kernels exactly.
+        from trnrand.nki.dispatch import threefry_normal_nki, threefry_uniform_nki
+
+        for fn in (threefry_normal_nki, threefry_uniform_nki):
+            monkeypatch.setenv("TRNRAND_LIMB_BITS", "8")
+            want = fn(n, seed=seed, counter_offset=offset)
+            monkeypatch.setenv("TRNRAND_LIMB_BITS", bits)
+            assert torch.equal(fn(n, seed=seed, counter_offset=offset), want)
 
     def test_partitioned_program_concatenates_to_single_chip(self):
         import trnrand

@@ -155,19 +155,29 @@ class TestNeffCacheReuse:
     """
 
     @nki_only
-    def test_second_call_under_100ms(self):
-        """Second stream_into must be < 100ms (NEFF cache hit)."""
+    def test_second_call_hits_neff_cache(self):
+        """Second stream_into must not recompile (NEFF cache hit).
+
+        Relative to the cold call: a warm 1M-normal stream is ~60 native launches
+        of real work, so the old absolute 100 ms bound only held on the XLA path.
+        """
         prog = ProgramBuilder(seed=0).normal(1_000_000, out="z").build()
         z = torch.empty(1_000_000)
 
-        prog.stream_into({"z": z})  # may trigger compilation
+        prog.stream_into({"z": z})  # cold, or warm if the NEFF cache already has it
 
-        t0 = time.perf_counter()
-        prog.stream_into({"z": z})
-        elapsed_ms = (time.perf_counter() - t0) * 1_000
+        def timed():
+            t0 = time.perf_counter()
+            prog.stream_into({"z": z})
+            return (time.perf_counter() - t0) * 1_000
 
-        assert elapsed_ms < 100, (
-            f"Second stream_into took {elapsed_ms:.1f}ms — expected NEFF cache hit (< 100ms)"
+        second_ms = timed()
+        steady_ms = sorted(timed() for _ in range(3))[1]
+        # A recompile on the second call makes it far slower than steady state.
+        # Comparing to steady state (not the first call) stays valid when a
+        # persistent NEFF cache made the first call warm too.
+        assert second_ms < 1.5 * steady_ms + 50, (
+            f"Second stream_into took {second_ms:.1f}ms vs steady {steady_ms:.1f}ms — recompile?"
         )
 
     @nki_only

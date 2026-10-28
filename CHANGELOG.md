@@ -43,6 +43,231 @@ are unchanged.
   `@pytest.mark.neuron` native-path tests for Trn2 (not yet run on
   hardware).
 
+### Changed
+
+#### Bulk `uniform`/`normal` use multi-tile launches (#60)
+
+`threefry_uniform_nki` and `threefry_normal_nki` (behind `trnrand.uniform`,
+`normal`, `exponential`, and the gamma/beta/chi-squared/Poisson/
+truncated-normal NKI paths) launched one kernel per 512 values, so
+`normal(4_194_304)` was 8,192 launches (about 9 s on Trn2 at the native
+dispatch floor). They now go through the streaming kernels
+(`threefry_stream_*`, 16,384 values per launch): 256 launches for 4M values,
+ceil(N / 16,384) in general. Output values and order are unchanged for every
+seed and `counter_offset` (#58). Tests: CPU launch-count and bit-identity
+tests with a stand-in launcher (`tests/test_launch_granularity.py`), and
+simulator bit-identity against the per-tile path.
+
+- On the native path the streaming launches keep their inputs and outputs
+  on the device. The lane-index and key inputs are copied to the device
+  once per call, the start-batch inputs for all launches are copied once as
+  one `(launches, 128, 1)` tensor, and the per-launch outputs are stacked on
+  the device and copied back in one transfer: 6 host-to-device copies and 1
+  device-to-host copy per call instead of 6 and 1 per launch. Measured on
+  Trn2 before this step: `normal(4M)` went from 9.2 s to 1.6 s with
+  multi-tile launches alone.
+- The per-tile wrappers are kept as `_threefry_uniform_per_tile` /
+  `_threefry_normal_per_tile`. They are still used on the XLA path when
+  `neuronx-cc` is older than 2.28, where the streaming kernels hit SBUF OOM
+  at compile (#57). `TRNRAND_BULK_STREAMING=0|1` forces the choice.
+- The Threefry host wrappers now live at module level in
+  `trnrand/nki/dispatch.py`, outside `if HAS_NKI:`, so they import and can
+  be tested on hosts without NKI.
+
+#### Bulk `uniform`/`normal` run as one wide-tile kernel launch (#60)
+
+The streaming kernels held every byte of every Threefry word as a `(128, 1)`
+tile, so each NKI instruction did 128 elements of work and a 16,384-value
+launch was about 55k instructions. On Trn2 that made `normal()` linear at
+about 0.23 ms per 1k values (934 ms for 4M) no matter how launches were
+grouped. On the native path and the simulator, `threefry_stream_*` (and so
+`trnrand.uniform`, `normal` and the distributions built on them) now use
+new bulk kernels, `threefry_bulk_normal_kernel` and
+`threefry_bulk_uniform_kernel` (ops `trnrand::threefry_bulk_normal` and
+`trnrand::threefry_bulk_uniform`). They run the same byte-tile arithmetic on
+`(128, F)` tiles, with F up to 512 Threefry batches per chunk and up to 16
+unrolled chunks per launch. One launch covers up to 4,194,304 values.
+
+- Counters are built in SBUF: the column index comes from `nisa.iota` and is
+  added byte-wise to each chunk's start batch. Key words are added as float32
+  `(128, 1)` `tensor_scalar` operands (byte plus byte is at most 510, exact),
+  so the key schedule is never broadcast to `(128, F)`. Box-Muller runs in
+  the same kernel, and each chunk's four output words leave in one DMA.
+- Values and order are bit-identical to the streaming and per-tile kernels
+  for every seed, `counter_offset` and size. The counter for each element is
+  unchanged, including the 24-bit batch wrap. F and C are rounded up to
+  powers of two (F from 32 to 512, C from 1 to 16), so at most 9 NEFF shapes
+  are compiled.
+- `TRNRAND_BULK_COLS` lowers the column cap if a compiler reports SBUF
+  pressure. `TRNRAND_BULK_KERNEL=0` goes back to the 16,384-value streaming
+  kernels. The XLA path (Trn1) still uses the streaming kernels.
+- Tests: `tests/test_bulk_kernel.py` checks the wrapper against an
+  independent numpy Threefry4x32-20 plus Box-Muller reference on CPU for
+  sizes that are and aren't multiples of the tile, for multi-chunk and
+  multi-launch plans, and for partitioned generators. On the simulator it
+  checks the real kernels against the streaming kernels. Both bulk kernels
+  are added to the MLIR verifier check for trn1 and trn2
+  (`tests/test_nki_compile.py`).
+
+#### Bulk kernels run on full uint32 words by default (#60)
+
+On the native TorchNeuron path (Trn2+), the bulk Threefry kernels now hold
+each word as one uint32 tile instead of four byte tiles. `TRNRAND_LIMB_BITS`
+selects the width: `32` (default), or `8` for the byte-limb kernels as a
+fallback. Values are bit-identical for every width. The XLA/Trn1 path never
+uses the bulk kernels (it streams on the byte kernels), so it is unchanged.
+
+- Bytes were used because integer `nl.add` / `tensor_scalar` arithmetic runs
+  in float32 (exact only below 2^24, aws-neuron-sdk#1308), and the byte
+  form was carried over from the Philox multiply, which needs 8-bit
+  sub-products. NKI 0.7 documents `nisa.tensor_tensor` with all-int32/uint32
+  operands as native integer arithmetic on GpSimd. The full-word kernels
+  (`threefry_bulk32_{normal,uniform}_kernel`, ops
+  `trnrand::threefry_bulk32_*`) pin their adds there and do xor/rotate as
+  bitvec ops. That is about 510 compute instructions per (128, 512) chunk
+  in trn2 MLIR, against about 1,950 for bytes. On Trn2 (SDK 2.33.0) the add
+  wraps mod 2^32: results matched the 8-bit kernels exactly in
+  `test_limb_variants_bit_identical` (all 4 cases), the full `-m neuron`
+  suite (88 passed, 1 xpassed) and the 17-case edge sweep.
+- `normal` latency on Trn2, 32-bit vs 8-bit:
+
+  | n | 32-bit | 8-bit |
+  |---|---|---|
+  | 16k | 0.78 ms | 0.90 ms |
+  | 262k | 1.25 ms | 2.46 ms |
+  | 1M | 5.0 ms | 10.6 ms |
+  | 4M | 15.9 ms | 37.1 ms |
+
+- `TRNRAND_LIMB_BITS=16` (two 16-bit limbs, every add below 2^17) is kept
+  for diagnostics only. It is also bit-identical, but slower than 32 at
+  every size.
+- Plan buckets: the chunk count C no longer rounds up to a power of two.
+  Launches split the chunks evenly, and C rounds up to one of
+  1-8, 10, 12, 14 or 16, so a request computes at most about 25% more than it
+  needs. Before, 2^20 + 1 values ran 8 chunks (1.7x the 2^20 latency); now
+  they run 5. That makes at most 12 C shapes.
+- Tests: a numpy port of the 16-bit limb kernel that does every add in
+  float32 is checked against the full-word reference, including all
+  rotations, carry edge cases and the counter wrap at 2^24. The new ops are
+  checked for routing and values on CPU, including partitioned generators,
+  and checked against the 8-bit kernels on the simulator (including
+  multi-chunk/multi-launch plans and 2^24 - 5 offsets). They are added to
+  the trn1/trn2 MLIR verifier check. `tests/test_nki_native.py` adds a
+  device bit-identity test for 16 and 32 against 8. The CPU tests check that
+  32 is the default and that the XLA path does not select the bulk kernels.
+
+#### Streaming output is in per-tile order (#58)
+
+**Reproducibility break.** For a given seed and counter, the streaming
+generators (`threefry_stream_normal`, `threefry_stream_uniform`, and
+everything built on them: `GeneratorProgram.stream_into`, the in-place
+`*_into` distributions on the NKI path, and the partitioned multi-chip
+paths) now return values in a different order than before. The values
+drawn are unchanged; only their order changes.
+
+- Streams now match the per-tile path (`threefry_normal_nki`,
+  `threefry_uniform_nki`) element for element for the same seed and
+  counter offset: all 128 lanes of counter batch 0, then batch 1, and so
+  on. Before, each 16,384-element launch was flattened lane-major
+  (`(P, tiles, 4)`) instead of tile-major (`(tiles, P, 4)`).
+- The fix is a host-side permute after each launch
+  (`_stream_tile_order` in `trnrand/nki/dispatch.py`). The kernels are
+  unchanged.
+- Partitioned streams still concatenate to the single-chip result.
+- Checked on the NKI simulator. The Trn2 run of
+  `TestHardwareBitExact` and the native-path program test is pending.
+
+### Fixed
+
+#### NKI kernels fail to compile on neuronxcc 2.26 / NKI 0.5+ (#56)
+
+Hardware compilation failed with `'nisa.tensor_scalar_arith' op 'operand0'
+must be float32, got 'ui32'` for the Philox, Threefry, Sobol and streaming
+kernels. `nl.add` / `nl.multiply` lower any `(P, 1)` operand (a Python
+scalar or a `(P, 1)` tile, which is every tile in these kernels) to
+`nisa.tensor_scalar`, whose arithmetic form now requires a float32
+operand. Integer adds and multiplies now call `nisa.tensor_tensor`
+directly. Bitwise ops and shifts lower to `tensor_scalar_bitvec`, which
+accepts integer operands, so they are unchanged. The arithmetic and
+outputs are unchanged.
+
+- Every kernel now generates MLIR that passes verification on CPU
+  (`nki.compiler.frontend.source_to_mlir`, trn1 and trn2 targets, NKI
+  0.5.0 / 0.6.0 / 0.7.0). Before the fix, 6 of 8 kernels failed
+  verification there with the same error as on hardware.
+- Tests: `tests/test_nki_compile.py` (`nki_simulator` marker) runs that
+  frontend check for every kernel on trn1 and trn2, so the simulator CI job
+  now catches MLIR verification failures that `nki.simulate` misses. It
+  does not run the backend compiler.
+- Full CPU compile to NEFF (frontend, then `neuronx-cc`, no device): all 8
+  kernels compile for trn1 and trn2 with `neuronx-cc` 2.28 / NKI 0.7.0. With
+  `neuronx-cc` 2.26 / NKI 0.5.0, 6 of 8 compile. The two streaming kernels
+  then fail with an unrelated SBUF out-of-memory error in NKI 0.5.0's pass
+  pipeline: 32 unrolled tiles leave too many allocations live at once
+  (2 tiles fit). That failure is not fixed here.
+- Not yet re-run on hardware.
+
+#### Philox output corrupted by saturating int32/uint32 casts (#56)
+
+On Trn2 hardware (Neuron SDK 2.33, NKI 0.7.0, `neuronx-cc` 2.28) every
+`philox4x32_kernel` output word was wrong: many were exactly `0x7FFFFFFF`
+and the uniform mean was about 0.33. The kernels crossed between int32 (the
+kernel input/output dtype) and uint32 (the arithmetic dtype) with
+`nl.copy(x, dtype=...)`, which is a value conversion, not a bit
+reinterpretation: uint32 values >= 2^31 saturate to `0x7FFFFFFF` and
+negative int32 values to 0. Every crossing now uses `tile.view(dtype)`, a
+bit reinterpretation with no data copied. The arithmetic is unchanged.
+
+- Philox: inputs are reinterpreted as uint32 after `nl.load`, the state and
+  key bump stay uint32 through all 10 rounds (`_mul32_hi_lo` now returns
+  uint32), and the outputs are reinterpreted as int32 at the store. This
+  removes 6 casts per round.
+- Threefry, Threefry-normal and both streaming kernels: the int32 -> uint32
+  cast in `_b_split` (counter and key words) is now a reinterpretation, so
+  words >= 2^31 are no longer read as 0. The host wrappers keep these words
+  below 2^24, so existing outputs are unchanged.
+- Streaming kernels: `nl.load(start_batch_ref, dtype=nl.uint32)` is now a
+  plain load followed by `.view(nl.uint32)`.
+- Sobol: the Gray-code load is reinterpreted rather than converted. Gray
+  codes are below 2^24, so outputs are unchanged.
+- The simulator (`nki.simulate`, NKI 0.7.0) saturated the same way, so the
+  Philox simulator tests that were xfailed as aws-neuron-sdk#1308 were in
+  fact failing on this bug. They now pass and are no longer xfailed. New
+  tests feed full-range counters and keys (top bit set) to Philox and
+  Threefry and require bit-exact output, with about half the Philox words
+  >= 2^31. They fail on the previous kernels.
+- Checked with `neuronx-cc` 2.28's BIR simulator (no device), trn2 target:
+  the previous Philox kernel matches 0 of 512 words against
+  `philox4x32_reference`, with 153 words equal to `0x7FFFFFFF` (the
+  hardware symptom), and the fixed kernel matches 512 of 512.
+- Not yet re-run on hardware.
+
+#### NKI Sobol differs from SobolEngine in dimensions 2-5 (#59)
+
+The unscrambled NKI Sobol output (`sobol_nki`, `sobol()` with the NKI
+backend) did not match `torch.quasirandom.SobolEngine` in dimension
+indices 2-5 (Joe-Kuo dimensions 3-6). The initial direction numbers
+`m_init` for those four rows of the table in `_init_sobol_directions` were
+wrong (for example `[1, 1]` instead of `[1, 3]` for index 2). The primitive
+polynomials and the Gray-code recurrence were correct. The rows now match
+Joe-Kuo `new-joe-kuo-6.21201`, the table SobolEngine uses, and all 10
+dimensions equal the top 24 bits of SobolEngine's output. Dimensions 0, 1
+and 6-9 are unchanged.
+
+- The CPU `sobol()` path was not affected: it calls SobolEngine.
+- The direction-vector table and a new CPU reference, `sobol_reference`,
+  are now at module level in `trnrand/nki/dispatch.py`, so CPU-only
+  installs can check them. `tests/test_quasi.py` compares the table with
+  `SobolEngine.sobolstate` and `sobol_reference` with SobolEngine (after
+  `fast_forward`) for every dimension. Both tests fail on the old table.
+- Simulator tests (`tests/test_nki_sim.py`) check the kernel against
+  `sobol_reference` and `sobol_nki` against SobolEngine for all 10
+  dimensions, including a nonzero `start_index`.
+- `TestSobolNKI.test_start_index_advances_sequence` called the public
+  `sobol()` with `start_index`, which `sobol()` has never accepted. It now
+  calls `sobol_nki`, which has the parameter. `test_conformance_vs_cpu` now
+  checks all 10 dimensions instead of 3.
+
 ## [0.7.1] - 2026-04-29
 
 ### Fixed
