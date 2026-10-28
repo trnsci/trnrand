@@ -7,9 +7,11 @@ that `fullgraph=True` compiles with zero graph breaks and that compiled output
 is bit-identical to eager for fixed seeds, on:
 
 - the PyTorch backend (`backend="eager"` stands in for `backend="neuron"`);
-- the native TorchNeuron NKI path, with the `trnrand::threefry_streaming_*`
-  kernels and host/device copies replaced by CPU stand-ins, so the
-  traced tensor-state setup is compared against the eager numpy setup;
+- the native TorchNeuron NKI path, with the `trnrand::threefry_bulk*_*`
+  kernels (#60; every limb variant and multi-launch plans), the streaming
+  kernels (`TRNRAND_BULK_KERNEL=0`) and host/device copies replaced by CPU
+  stand-ins, so the traced tensor-state setup is compared against the eager
+  numpy setup;
 - the non-native NKI path (XLA / per-tile), where the whole draw is one op.
 
 On-hardware confirmation (`backend="neuron"` on Trn2) is the `neuron`-marked
@@ -177,10 +179,55 @@ def _stream_normal(
 for _op in (_stream_uniform, _stream_normal):
     _op.register_fake(lambda c0, *a: c0.new_empty((c0.shape[0], 4 * TILES), dtype=torch.float32))
 
+
+def _fake_bulk(c0, start, k0, k1, k2, k3, bias):
+    # (P, C × 4 × F): chunk c, word w, column j at c·4F + w·F + j, like the kernels.
+    P, F = c0.shape
+    C = start.shape[1]
+    j = torch.arange(F, dtype=torch.int64).reshape(1, 1, 1, F)
+    w = torch.arange(4, dtype=torch.int64).reshape(1, 1, 4, 1)
+    v = (
+        c0.to(torch.int64).reshape(P, 1, 1, F) * 1009
+        + ((start.to(torch.int64).reshape(P, C, 1, 1) + j) & 0xFFFFFF) * 7919
+        + k0.to(torch.int64).reshape(P, 1, 1, 1) * 104729
+        + k1.to(torch.int64).reshape(P, 1, 1, 1) * 3
+        + (k2.to(torch.int64) + k3.to(torch.int64)).reshape(P, 1, 1, 1) * 5
+        + w
+    ) % 1_000_003
+    return (v.to(torch.float32) / 1_000_003.0 + bias).reshape(P, C * 4 * F)
+
+
+def _make_fake_bulk(name, bias):
+    def impl(
+        c0: torch.Tensor,
+        start: torch.Tensor,
+        k0: torch.Tensor,
+        k1: torch.Tensor,
+        k2: torch.Tensor,
+        k3: torch.Tensor,
+    ) -> torch.Tensor:
+        return _fake_bulk(c0, start, k0, k1, k2, k3, bias)
+
+    op = torch.library.custom_op(f"trnrand_test::{name}", impl, mutates_args=())
+    op.register_fake(
+        lambda c0, start, *a: c0.new_empty(
+            (c0.shape[0], start.shape[1] * 4 * c0.shape[1]), dtype=torch.float32
+        )
+    )
+    return op
+
+
+# Distinct biases per limb variant: a wrong variant in the graph shows up as a mismatch.
+_BULK_VARIANTS = {"bulk": 8, "bulk16": 16, "bulk32": 32}
 _FAKE_OPS = {
     "threefry_streaming_uniform": _stream_uniform,
     "threefry_streaming_normal": _stream_normal,
 }
+for _variant, _bits in _BULK_VARIANTS.items():
+    for _kind, _bias in (("uniform", 0.0), ("normal", -10.0)):
+        _FAKE_OPS[f"threefry_{_variant}_{_kind}"] = _make_fake_bulk(
+            f"{_variant}_{_kind}", _bias + _bits * 100.0
+        )
 
 
 def _partitioned(seed, rank=0, size=1, advance=0, key_mode="draw"):
@@ -217,6 +264,39 @@ def nki_native(monkeypatch):
     monkeypatch.setattr(dispatch, "_h2d", lambda t: t.clone())
     monkeypatch.setattr(dispatch, "_d2h", lambda t: t.clone())
     monkeypatch.delenv("TRNRAND_BULK_STREAMING", raising=False)
+    monkeypatch.delenv("TRNRAND_BULK_KERNEL", raising=False)
+    monkeypatch.delenv("TRNRAND_LIMB_BITS", raising=False)
+
+
+# Native-path kernel routes: (env, op-name fragment). Bulk limb variants (#60) and
+# the streaming opt-out. Values differ per route (distinct stand-ins).
+ROUTES = {
+    "bulk32": ({}, "bulk32"),
+    "bulk32-explicit": ({"TRNRAND_LIMB_BITS": "32"}, "bulk32"),
+    "bulk16": ({"TRNRAND_LIMB_BITS": "16"}, "bulk16"),
+    "bulk8": ({"TRNRAND_LIMB_BITS": "8"}, "bulk_"),
+    "streaming": ({"TRNRAND_BULK_KERNEL": "0"}, "stream_"),
+}
+
+
+@pytest.fixture
+def small_plan(monkeypatch):
+    """Tiny bulk caps so modest requests need several chunks and launches."""
+    monkeypatch.setattr(dispatch, "_BULK_COLS_MAX", 32)
+    monkeypatch.setattr(dispatch, "_BULK_CHUNKS_MAX", 4)
+
+
+def _launch_targets(fn):
+    seen = []
+
+    def backend(gm, example_inputs):
+        seen.extend(
+            str(n.target) for n in gm.graph.nodes if n.op in ("call_function", "call_method")
+        )
+        return gm
+
+    torch.compile(fn, backend=backend, fullgraph=True)()
+    return seen
 
 
 class TestNativeNkiPath:
@@ -236,12 +316,56 @@ class TestNativeNkiPath:
         want = np.broadcast_to(starts.astype(np.int32).reshape(-1, 1, 1), (n_launches, LANES, 1))
         assert sb.dtype == torch.int32 and torch.equal(sb, torch.from_numpy(want.copy()))
 
+    @pytest.mark.parametrize("seed", [0, 5, 2**24 - 1, 2**24, 2**31 + 17])
+    @pytest.mark.parametrize("offset", [0, 7, 2**24 - 5, 2**40 + 3])
+    @pytest.mark.parametrize("n", [1, 513, 300_000, 5_000_000, 40_000_000])
+    def test_bulk_inputs_match_numpy_setup(self, seed, offset, n):
+        """`_bulk_inputs` equals the numpy setup in `_bulk_launches` for the request's plan."""
+        F, C, n_launches = dispatch._bulk_plan(n)
+        c0, sb, k = dispatch._bulk_inputs(
+            *dispatch._key_offset_from_state(torch.tensor([seed, offset], dtype=torch.int64)),
+            F,
+            C,
+            n_launches,
+        )
+        want_c0 = np.broadcast_to(np.arange(LANES, dtype=np.int32).reshape(-1, 1), (LANES, F))
+        assert c0.dtype == torch.int32 and torch.equal(c0, torch.from_numpy(want_c0.copy()))
+        k_np = [(seed & 0xFFFFFF), ((seed >> 24) & 0xFFFFFF), 0, 0]
+        for kw, v in zip(k, k_np, strict=True):
+            assert kw.shape == (LANES, 1) and kw.dtype == torch.int32
+            assert torch.equal(kw, torch.full((LANES, 1), v, dtype=torch.int32))
+        starts = (offset + np.arange(n_launches * C, dtype=np.int64) * F) & 0xFFFFFF
+        want = np.broadcast_to(
+            starts.astype(np.int32).reshape(n_launches, 1, C), (n_launches, LANES, C)
+        )
+        assert sb.dtype == torch.int32 and torch.equal(sb, torch.from_numpy(want.copy()))
+
     @pytest.mark.parametrize("name", list(FNS))
     @pytest.mark.parametrize("make_gen", GENS)
     @pytest.mark.parametrize("n", [1, 513, 16_385, 50_000])
     def test_matches_eager(self, nki_native, name, make_gen, n):
         fn = FNS[name]
         _assert_compiles_like_eager(make_gen, lambda g: fn(g, n))
+
+    @pytest.mark.parametrize("route", list(ROUTES))
+    @pytest.mark.parametrize("name", ["normal", "uniform"])
+    @pytest.mark.parametrize("make_gen", [GENS[2], GENS[3]])
+    def test_routes_match_eager(self, nki_native, monkeypatch, route, name, make_gen):
+        """Every native route (limb variants, streaming opt-out) compiles like eager."""
+        env, frag = ROUTES[route]
+        for key, val in env.items():
+            monkeypatch.setenv(key, val)
+        _assert_compiles_like_eager(make_gen, lambda g: FNS[name](g, 50_000))
+        g = make_gen()
+        targets = _launch_targets(lambda: FNS[name](g, 50_000))
+        assert any(frag in t and name in t for t in targets), targets
+
+    @pytest.mark.parametrize("name", ["normal", "uniform"])
+    @pytest.mark.parametrize("make_gen", GENS)
+    @pytest.mark.parametrize("n", [1, 16_385, 70_000, 300_000])
+    def test_multi_launch_plan_matches_eager(self, nki_native, small_plan, name, make_gen, n):
+        """Plan buckets: multi-chunk, multi-launch bulk plans trace like eager."""
+        _assert_compiles_like_eager(make_gen, lambda g: FNS[name](g, n))
 
     def test_eager_path_unchanged(self, nki_native):
         # The eager route still goes through the numpy host setup.
@@ -257,19 +381,22 @@ class TestNativeNkiPath:
         assert (graphs, breaks) == (1, 0), reasons
 
     def test_kernel_launch_stays_in_graph(self, nki_native):
-        seen = []
-
-        def backend(gm, example_inputs):
-            seen.extend(str(n.target) for n in gm.graph.nodes if n.op == "call_function")
-            return gm
-
         g = trnrand.Generator(seed=1)
-        torch.compile(
-            lambda: trnrand.normal(40_000, generator=g), backend=backend, fullgraph=True
-        )()
+        seen = _launch_targets(lambda: trnrand.normal(40_000, generator=g))
         assert any("gen_nki_state" in t for t in seen)
-        assert sum("trnrand_test.stream_normal" in t for t in seen) == 3
+        # 40,000 values = 79 batches: one bulk launch, F = 128, C = 1 (#60).
+        assert dispatch._bulk_plan(40_000) == (128, 1, 1)
+        assert sum("trnrand_test.bulk32_normal" in t for t in seen) == 1
+        assert not any("stream_" in t for t in seen)
         assert not any("gen_nki_draw" in t for t in seen)
+
+    def test_multi_launch_stays_in_graph(self, nki_native, small_plan):
+        # 300,000 values = 586 batches; caps F = 32, C <= 4 -> 19 chunks in 5 launches.
+        F, C, n_launches = dispatch._bulk_plan(300_000)
+        assert (F, n_launches) == (32, 5) and C * n_launches >= 19
+        g = trnrand.Generator(seed=1)
+        seen = _launch_targets(lambda: trnrand.normal(300_000, generator=g))
+        assert sum("trnrand_test.bulk32_normal" in t for t in seen) == n_launches
 
 
 class TestNonNativeNkiPath:
@@ -339,6 +466,31 @@ class TestCounterKeyMode:
     def test_matches_eager(self, nki_native, name, make_gen, n):
         _assert_compiles_like_eager(make_gen, lambda g: FNS[name](g, n))
 
+    @pytest.mark.parametrize("route", list(ROUTES))
+    @pytest.mark.parametrize("name", ["normal", "uniform"])
+    @pytest.mark.parametrize("make_gen", [COUNTER_GENS[2], COUNTER_GENS[3]])
+    def test_routes_match_eager(self, nki_native, monkeypatch, route, name, make_gen):
+        env, frag = ROUTES[route]
+        for key, val in env.items():
+            monkeypatch.setenv(key, val)
+        _assert_compiles_like_eager(make_gen, lambda g: FNS[name](g, 50_000))
+        g = make_gen()
+        targets = _launch_targets(lambda: FNS[name](g, 50_000))
+        assert any(frag in t and name in t for t in targets), targets
+        assert not any("gen_nki" in t for t in targets)
+
+    @pytest.mark.parametrize("name", ["normal", "uniform"])
+    @pytest.mark.parametrize("make_gen", COUNTER_GENS)
+    @pytest.mark.parametrize("n", [1, 70_000, 300_000])
+    def test_multi_launch_plan_matches_eager(self, nki_native, small_plan, name, make_gen, n):
+        _assert_compiles_like_eager(make_gen, lambda g: FNS[name](g, n))
+
+    def test_counter_advance_stays_in_graph(self, nki_native):
+        g = trnrand.Generator(seed=3, key_mode="counter")
+        targets = _launch_targets(lambda: trnrand.normal(40_000, generator=g))
+        assert "add_" in targets, targets  # the in-place counter advance
+        assert g.position() == 79 * 512
+
     @pytest.mark.parametrize("name", ["normal", "uniform"])
     def test_zero_graph_breaks(self, nki_native, name):
         g = trnrand.Generator(seed=0, key_mode="counter")
@@ -365,7 +517,7 @@ class TestCounterKeyMode:
         got = torch.compile(fn, backend=aot_autograd(fw_compiler=fw), fullgraph=True)()
         assert torch.equal(got, ref) and g.position() == ref_g.position()
 
-        kernels = {"stream_normal", "stream_uniform"}
+        kernels = {"bulk32_normal", "bulk32_uniform"}
         bad = []
         for t in targets:
             ns = getattr(t, "namespace", None)
@@ -375,7 +527,8 @@ class TestCounterKeyMode:
                 continue
             bad.append(str(t))
         assert not bad, bad
-        assert sum(getattr(t, "namespace", None) == "trnrand_test" for t in targets) == 6
+        # One bulk launch per 40,000-value draw (#60; was 3 streaming launches each).
+        assert sum(getattr(t, "namespace", None) == "trnrand_test" for t in targets) == 2
 
     @pytest.mark.parametrize("be", ["aot_eager", "inductor"])
     def test_unused_draw_still_advances(self, nki_native, be):

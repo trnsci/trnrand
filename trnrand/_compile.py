@@ -20,7 +20,11 @@ output is unused (which would skip a state advance) nor reorder or CSE draws.
 - ``trnrand::gen_nki_state``  NKI path: draw the 24-bit kernel seed, compute the
   partition counter offset, advance the counter; returns int64 (seed, offset).
   The kernel launches that consume it stay in the graph
-  (``dispatch.threefry_stream_from_state``).
+  (``dispatch.threefry_stream_from_state``): on the native path these are the
+  bulk Threefry kernels (#60), with the same ``_bulk_plan`` launches and limb
+  variant (``TRNRAND_LIMB_BITS``) as eager, or the streaming kernels under
+  ``TRNRAND_BULK_KERNEL=0``. The plan and the limb variant are fixed when the
+  graph is traced (they depend only on the static request size and the env).
 - ``trnrand::gen_nki_draw``   NKI path where the launches are not traceable
   (XLA lineage, simulator, per-tile kernels): the whole eager draw, opaque.
 
@@ -31,9 +35,10 @@ serve the CPU compile backends (eager / aot_eager / inductor). For
 ``backend="neuron"``, use a ``Generator(key_mode="counter")`` (or
 ``TRNRAND_KEY_MODE=counter``): the Threefry key is fixed by the seed and only
 the counter advances, held as tensors on the Generator (``_key_words``,
-``_ctr``), so the native draw is plain aten ops plus the nki_op launches, with
-the counter advanced by an in-place ``add_`` (functionalized as an input
-mutation). The default ``key_mode="draw"`` derives each call's key from a
+``_ctr``), so the native draw is plain aten ops building the bulk-kernel
+inputs (key words from the seed, start tiles from ``_ctr``) plus the nki_op
+launches, with the counter advanced by an in-place ``add_`` (functionalized
+as an input mutation). The default ``key_mode="draw"`` derives each call's key from a
 ``torch.randint`` on the Generator's Mersenne Twister, which has no aten-op
 equivalent in a graph, so it cannot lower on neuron without changing the
 stream. The PyTorch-backend path (``set_backend("pytorch")``) is likewise not
