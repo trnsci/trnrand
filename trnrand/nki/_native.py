@@ -142,6 +142,106 @@ def threefry_streaming_uniform(
     return _d.threefry_streaming_uniform_kernel(c0, start_batch, k0, k1, k2, k3)
 
 
+def _fake_bulk(c0, start):
+    return c0.new_empty((c0.shape[0], start.shape[1] * 4 * c0.shape[1]), dtype=torch.float32)
+
+
+@nki_op(
+    "trnrand::threefry_bulk_normal",
+    mutates_args={},
+    fake_fn=lambda c0, start, k0, k1, k2, k3: _fake_bulk(c0, start),
+)
+def threefry_bulk_normal(
+    c0: torch.Tensor,
+    start: torch.Tensor,
+    k0: torch.Tensor,
+    k1: torch.Tensor,
+    k2: torch.Tensor,
+    k3: torch.Tensor,
+) -> torch.Tensor:
+    return _d.threefry_bulk_normal_kernel(c0, start, k0, k1, k2, k3)
+
+
+@nki_op(
+    "trnrand::threefry_bulk_uniform",
+    mutates_args={},
+    fake_fn=lambda c0, start, k0, k1, k2, k3: _fake_bulk(c0, start),
+)
+def threefry_bulk_uniform(
+    c0: torch.Tensor,
+    start: torch.Tensor,
+    k0: torch.Tensor,
+    k1: torch.Tensor,
+    k2: torch.Tensor,
+    k3: torch.Tensor,
+) -> torch.Tensor:
+    return _d.threefry_bulk_uniform_kernel(c0, start, k0, k1, k2, k3)
+
+
+@nki_op(
+    "trnrand::threefry_bulk16_normal",
+    mutates_args={},
+    fake_fn=lambda c0, start, k0, k1, k2, k3: _fake_bulk(c0, start),
+)
+def threefry_bulk16_normal(
+    c0: torch.Tensor,
+    start: torch.Tensor,
+    k0: torch.Tensor,
+    k1: torch.Tensor,
+    k2: torch.Tensor,
+    k3: torch.Tensor,
+) -> torch.Tensor:
+    return _d.threefry_bulk16_normal_kernel(c0, start, k0, k1, k2, k3)
+
+
+@nki_op(
+    "trnrand::threefry_bulk16_uniform",
+    mutates_args={},
+    fake_fn=lambda c0, start, k0, k1, k2, k3: _fake_bulk(c0, start),
+)
+def threefry_bulk16_uniform(
+    c0: torch.Tensor,
+    start: torch.Tensor,
+    k0: torch.Tensor,
+    k1: torch.Tensor,
+    k2: torch.Tensor,
+    k3: torch.Tensor,
+) -> torch.Tensor:
+    return _d.threefry_bulk16_uniform_kernel(c0, start, k0, k1, k2, k3)
+
+
+@nki_op(
+    "trnrand::threefry_bulk32_normal",
+    mutates_args={},
+    fake_fn=lambda c0, start, k0, k1, k2, k3: _fake_bulk(c0, start),
+)
+def threefry_bulk32_normal(
+    c0: torch.Tensor,
+    start: torch.Tensor,
+    k0: torch.Tensor,
+    k1: torch.Tensor,
+    k2: torch.Tensor,
+    k3: torch.Tensor,
+) -> torch.Tensor:
+    return _d.threefry_bulk32_normal_kernel(c0, start, k0, k1, k2, k3)
+
+
+@nki_op(
+    "trnrand::threefry_bulk32_uniform",
+    mutates_args={},
+    fake_fn=lambda c0, start, k0, k1, k2, k3: _fake_bulk(c0, start),
+)
+def threefry_bulk32_uniform(
+    c0: torch.Tensor,
+    start: torch.Tensor,
+    k0: torch.Tensor,
+    k1: torch.Tensor,
+    k2: torch.Tensor,
+    k3: torch.Tensor,
+) -> torch.Tensor:
+    return _d.threefry_bulk32_uniform_kernel(c0, start, k0, k1, k2, k3)
+
+
 # Keyed by the short op name used in `dispatch._launch`.
 OPS = {
     "philox4x32": philox4x32,
@@ -152,4 +252,10 @@ OPS = {
     "halton": halton,
     "threefry_streaming_normal": threefry_streaming_normal,
     "threefry_streaming_uniform": threefry_streaming_uniform,
+    "threefry_bulk_normal": threefry_bulk_normal,
+    "threefry_bulk_uniform": threefry_bulk_uniform,
+    "threefry_bulk16_normal": threefry_bulk16_normal,
+    "threefry_bulk16_uniform": threefry_bulk16_uniform,
+    "threefry_bulk32_normal": threefry_bulk32_normal,
+    "threefry_bulk32_uniform": threefry_bulk32_uniform,
 }

@@ -137,6 +137,26 @@ class TestNativeDispatch:
         u = threefry_uniform_nki(n, seed=seed, counter_offset=offset)
         assert torch.equal(u, _threefry_uniform_per_tile(n, seed=seed, counter_offset=offset))
 
+    @pytest.mark.parametrize("bits", ["16", "32"])
+    @pytest.mark.parametrize(
+        "n,seed,offset",
+        [
+            (1, 0, 0),
+            (16_385, 12345, 2**24 - 5),
+            (1_048_577, 2**40 + 3, 7),
+            (4_194_305, 9, 2**24 - 40),
+        ],
+    )
+    def test_limb_variants_bit_identical(self, monkeypatch, bits, n, seed, offset):
+        # TRNRAND_LIMB_BITS=16|32 (#60) must reproduce the 8-bit bulk kernels exactly.
+        from trnrand.nki.dispatch import threefry_normal_nki, threefry_uniform_nki
+
+        for fn in (threefry_normal_nki, threefry_uniform_nki):
+            monkeypatch.setenv("TRNRAND_LIMB_BITS", "8")
+            want = fn(n, seed=seed, counter_offset=offset)
+            monkeypatch.setenv("TRNRAND_LIMB_BITS", bits)
+            assert torch.equal(fn(n, seed=seed, counter_offset=offset), want)
+
     def test_partitioned_program_concatenates_to_single_chip(self):
         import trnrand
 

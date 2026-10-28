@@ -74,6 +74,88 @@ simulator bit-identity against the per-tile path.
   `trnrand/nki/dispatch.py`, outside `if HAS_NKI:`, so they import and can
   be tested on hosts without NKI.
 
+#### Bulk `uniform`/`normal` run as one wide-tile kernel launch (#60)
+
+The streaming kernels held every byte of every Threefry word as a `(128, 1)`
+tile, so each NKI instruction did 128 elements of work and a 16,384-value
+launch was about 55k instructions. On Trn2 that made `normal()` linear at
+about 0.23 ms per 1k values (934 ms for 4M) no matter how launches were
+grouped. On the native path and the simulator, `threefry_stream_*` (and so
+`trnrand.uniform`, `normal` and the distributions built on them) now use
+new bulk kernels, `threefry_bulk_normal_kernel` and
+`threefry_bulk_uniform_kernel` (ops `trnrand::threefry_bulk_normal` and
+`trnrand::threefry_bulk_uniform`). They run the same byte-tile arithmetic on
+`(128, F)` tiles, with F up to 512 Threefry batches per chunk and up to 16
+unrolled chunks per launch. One launch covers up to 4,194,304 values.
+
+- Counters are built in SBUF: the column index comes from `nisa.iota` and is
+  added byte-wise to each chunk's start batch. Key words are added as float32
+  `(128, 1)` `tensor_scalar` operands (byte plus byte is at most 510, exact),
+  so the key schedule is never broadcast to `(128, F)`. Box-Muller runs in
+  the same kernel, and each chunk's four output words leave in one DMA.
+- Values and order are bit-identical to the streaming and per-tile kernels
+  for every seed, `counter_offset` and size. The counter for each element is
+  unchanged, including the 24-bit batch wrap. F and C are rounded up to
+  powers of two (F from 32 to 512, C from 1 to 16), so at most 9 NEFF shapes
+  are compiled.
+- `TRNRAND_BULK_COLS` lowers the column cap if a compiler reports SBUF
+  pressure. `TRNRAND_BULK_KERNEL=0` goes back to the 16,384-value streaming
+  kernels. The XLA path (Trn1) still uses the streaming kernels.
+- Tests: `tests/test_bulk_kernel.py` checks the wrapper against an
+  independent numpy Threefry4x32-20 plus Box-Muller reference on CPU for
+  sizes that are and aren't multiples of the tile, for multi-chunk and
+  multi-launch plans, and for partitioned generators. On the simulator it
+  checks the real kernels against the streaming kernels. Both bulk kernels
+  are added to the MLIR verifier check for trn1 and trn2
+  (`tests/test_nki_compile.py`).
+
+#### Bulk kernels run on full uint32 words by default (#60)
+
+On the native TorchNeuron path (Trn2+), the bulk Threefry kernels now hold
+each word as one uint32 tile instead of four byte tiles. `TRNRAND_LIMB_BITS`
+selects the width: `32` (default), or `8` for the byte-limb kernels as a
+fallback. Values are bit-identical for every width. The XLA/Trn1 path never
+uses the bulk kernels (it streams on the byte kernels), so it is unchanged.
+
+- Bytes were used because integer `nl.add` / `tensor_scalar` arithmetic runs
+  in float32 (exact only below 2^24, aws-neuron-sdk#1308), and the byte
+  form was carried over from the Philox multiply, which needs 8-bit
+  sub-products. NKI 0.7 documents `nisa.tensor_tensor` with all-int32/uint32
+  operands as native integer arithmetic on GpSimd. The full-word kernels
+  (`threefry_bulk32_{normal,uniform}_kernel`, ops
+  `trnrand::threefry_bulk32_*`) pin their adds there and do xor/rotate as
+  bitvec ops. That is about 510 compute instructions per (128, 512) chunk
+  in trn2 MLIR, against about 1,950 for bytes. On Trn2 (SDK 2.33.0) the add
+  wraps mod 2^32: results matched the 8-bit kernels exactly in
+  `test_limb_variants_bit_identical` (all 4 cases), the full `-m neuron`
+  suite (88 passed, 1 xpassed) and the 17-case edge sweep.
+- `normal` latency on Trn2, 32-bit vs 8-bit:
+
+  | n | 32-bit | 8-bit |
+  |---|---|---|
+  | 16k | 0.78 ms | 0.90 ms |
+  | 262k | 1.25 ms | 2.46 ms |
+  | 1M | 5.0 ms | 10.6 ms |
+  | 4M | 15.9 ms | 37.1 ms |
+
+- `TRNRAND_LIMB_BITS=16` (two 16-bit limbs, every add below 2^17) is kept
+  for diagnostics only. It is also bit-identical, but slower than 32 at
+  every size.
+- Plan buckets: the chunk count C no longer rounds up to a power of two.
+  Launches split the chunks evenly, and C rounds up to one of
+  1-8, 10, 12, 14 or 16, so a request computes at most about 25% more than it
+  needs. Before, 2^20 + 1 values ran 8 chunks (1.7x the 2^20 latency); now
+  they run 5. That makes at most 12 C shapes.
+- Tests: a numpy port of the 16-bit limb kernel that does every add in
+  float32 is checked against the full-word reference, including all
+  rotations, carry edge cases and the counter wrap at 2^24. The new ops are
+  checked for routing and values on CPU, including partitioned generators,
+  and checked against the 8-bit kernels on the simulator (including
+  multi-chunk/multi-launch plans and 2^24 - 5 offsets). They are added to
+  the trn1/trn2 MLIR verifier check. `tests/test_nki_native.py` adds a
+  device bit-identity test for 16 and 32 against 8. The CPU tests check that
+  32 is the default and that the XLA path does not select the bulk kernels.
+
 #### Streaming output is in per-tile order (#58)
 
 **Reproducibility break.** For a given seed and counter, the streaming

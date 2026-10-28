@@ -31,6 +31,13 @@ def _i32(n_args):
     return tuple(np.zeros((_P, 1), dtype=np.int32) for _ in range(n_args))
 
 
+def _bulk(cols, chunks):
+    return (
+        np.zeros((_P, cols), dtype=np.int32),
+        np.zeros((_P, chunks), dtype=np.int32),
+    ) + _i32(4)
+
+
 # kernel name -> example inputs (shapes/dtypes match the host wrappers)
 _KERNEL_INPUTS = {
     "philox4x32_kernel": lambda: _i32(3),
@@ -41,6 +48,15 @@ _KERNEL_INPUTS = {
     "halton_kernel": lambda: (np.ones((_P, 1), dtype=np.int32),),
     "threefry_streaming_normal_kernel": lambda: _i32(6),
     "threefry_streaming_uniform_kernel": lambda: _i32(6),
+    # Bulk kernels (#60): (P, F) lanes, (P, C) chunk starts, 4 × (P, 1) key words.
+    # The largest default shape, F = 512 columns × C = 16 chunks.
+    "threefry_bulk_normal_kernel": lambda: _bulk(512, 16),
+    "threefry_bulk_uniform_kernel": lambda: _bulk(512, 16),
+    # Same kernels on 16-bit limbs / full words (TRNRAND_LIMB_BITS=16|32).
+    "threefry_bulk16_normal_kernel": lambda: _bulk(512, 16),
+    "threefry_bulk16_uniform_kernel": lambda: _bulk(512, 16),
+    "threefry_bulk32_normal_kernel": lambda: _bulk(512, 16),
+    "threefry_bulk32_uniform_kernel": lambda: _bulk(512, 16),
 }
 
 

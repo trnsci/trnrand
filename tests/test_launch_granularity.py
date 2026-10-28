@@ -168,6 +168,9 @@ def fake_native(monkeypatch):
     monkeypatch.setattr(dispatch, "_d2h", nat.to_host)
     monkeypatch.setattr(dispatch, "_launch", _unexpected_launch)
     monkeypatch.delenv("TRNRAND_BULK_STREAMING", raising=False)
+    # The native path now defaults to the bulk kernels (tests/test_bulk_kernel.py);
+    # this class covers the streaming-kernel fallback behind TRNRAND_BULK_KERNEL=0.
+    monkeypatch.setenv("TRNRAND_BULK_KERNEL", "0")
     return nat
 
 
