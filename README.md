@@ -32,9 +32,28 @@ Suite-wide tracker: [trnsci/trnsci#1](https://github.com/trnsci/trnsci/issues/1)
 ```bash
 pip install trnrand
 
-# With Neuron hardware support
-pip install trnrand[neuron]
+# Trn2/Trn3 with TorchNeuron (native PyTorch, Neuron SDK 2.33+)
+pip install "trnrand[torchneuron]" --extra-index-url https://pip.repos.neuron.amazonaws.com
+
+# Trn1 / PyTorch-XLA lineage
+pip install "trnrand[neuron]" --extra-index-url https://pip.repos.neuron.amazonaws.com
 ```
+
+Kernels dispatch on whichever Neuron PyTorch lineage is installed:
+
+- **TorchNeuron (native)** — Trn2/Trn3, Neuron SDK 2.33+, Python ≥ 3.12,
+  `torch` 2.14, `torch-neuronx` 2.14.*. Each kernel is a PyTorch custom op
+  (`torch.ops.trnrand.*`) on the `neuron` device; no `torch_xla`.
+- **PyTorch/XLA** — Trn1 (and any host on the `torch-neuronx` 2.9 lineage).
+  Kernels dispatch through `torch_xla`, unchanged.
+
+trnrand picks the native path when the native `torch_neuronx` and a `neuron`
+device are present, and the XLA path when `torch_xla` is installed; without
+`nki` it uses `torch.Generator`. Set `TRNSCI_NKI_DISPATCH=native` or `xla`
+(shared by all trnsci libraries) to force a path. With an editable install
+(`pip install -e`), set `NKI_ENABLE_TRACE_CACHE=0`: the NKI kernel cache only
+versions installed wheels and can serve stale kernels. See
+[installation](docs/installation.md).
 
 ## Usage
 

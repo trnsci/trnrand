@@ -23,6 +23,23 @@ trnrand.set_backend("nki")      # force NKI (requires neuronxcc)
 | `TRNRAND_USE_SIMULATOR=1` | Dispatch routes kernels through `nki.simulate(kernel)(numpy_args)` on CPU — bypasses `torch_xla` and hardware. Use for fast correctness iteration; no NEFF compile. |
 | `TRNRAND_REQUIRE_NKI=1` | Kernel-path failures re-raise instead of silently falling back to PyTorch. Used by the validation suite to catch silent kernel breakage. |
 
+## Dispatch path
+
+On Neuron hardware, kernels run on one of two `torch-neuronx` lineages,
+detected on the first kernel launch:
+
+- **Native (TorchNeuron, Trn2/Trn3)** — each kernel is a PyTorch custom op
+  on `device="neuron"`, also callable directly and inside
+  `torch.compile(backend="neuron")`:
+  `torch.ops.trnrand.philox4x32`, `box_muller`, `threefry4x32`,
+  `threefry_normal`, `sobol_gray_code`, `halton`,
+  `threefry_streaming_normal`, `threefry_streaming_uniform`. The ops are
+  registered only once this path is selected.
+- **XLA (Trn1)** — kernels run on the `torch_xla` device, as before.
+
+`set_backend` is unaffected: it still chooses NKI vs `torch.Generator`.
+See [Installation](../installation.md#two-neuron-pytorch-lineages).
+
 See [Developing NKI kernels](../developing_kernels.md) for the simulator
 vs hardware workflow.
 

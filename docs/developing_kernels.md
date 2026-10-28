@@ -11,12 +11,13 @@ That guide covers the NKI 0.3.0 migration, simulator workflow, and
 architectural-exploitation design discipline. This page adds only
 what's trnrand-specific.
 
-## Three dispatch modes
+## Dispatch modes
 
 | Mode | Trigger | When to use |
 |------|---------|-------------|
 | **PyTorch fallback** | `HAS_NKI = False` (e.g. macOS), or an `_nki_*` exception caught by the wrapper | Laptops, CI's `ubuntu-latest` main `test` job — the default for anyone who doesn't have `nki>=0.3.0` installed. |
-| **NKI hardware** | `HAS_NKI = True` + default env. Kernel runs through `torch_xla` → NEFF compile → Trainium dispatch | Real perf numbers, final validation (`AWS_PROFILE=aws ./scripts/run_neuron_tests.sh trn1`). |
+| **NKI hardware, native** | `HAS_NKI = True` + TorchNeuron `torch_neuronx` (has `nki_op`) + a `neuron` device. Kernel runs as a `trnrand::` custom op on `device="neuron"` | Trn2/Trn3 on Neuron SDK 2.33+. Set `NKI_ENABLE_TRACE_CACHE=0` with an editable install. |
+| **NKI hardware, XLA** | `HAS_NKI = True` + `torch_xla` installed (and the native path unavailable). Kernel runs through `torch_xla` → NEFF compile → Trainium dispatch | Trn1; real perf numbers, final validation (`AWS_PROFILE=aws ./scripts/run_neuron_tests.sh trn1`). |
 | **NKI simulator** | `TRNRAND_USE_SIMULATOR=1` + `HAS_NKI = True`. Kernel runs through `nki.simulate(kernel)(numpy_args)` on CPU | Fast correctness iteration during kernel design — seconds per cycle vs minutes on hardware. |
 
 ## Environment variables
@@ -25,6 +26,13 @@ what's trnrand-specific.
 |---|---|
 | `TRNRAND_USE_SIMULATOR=1` | Dispatch bypasses `torch_xla` and runs kernels through `nki.simulate(kernel)(numpy_args)` on CPU. |
 | `TRNRAND_REQUIRE_NKI=1` | Kernel-path failures re-raise instead of silently falling back to the PyTorch reference. Used by the validation suite to catch silent kernel breakage during iteration. |
+| `TRNSCI_NKI_DISPATCH=auto\|native\|xla` | Suite-wide. Forces the native or XLA dispatch path; `auto` (default) detects. Forcing an unavailable path raises. |
+| `NKI_ENABLE_TRACE_CACHE=0` | TorchNeuron (not trnrand) setting. Turns off the cross-process NKI kernel cache, which cannot version editable installs and may serve a stale kernel after a source edit. |
+
+Each host-side wrapper hands its tiles to `_launch(kernel, op_name, *tiles)`
+in `dispatch.py`, which picks the native custom op or the `_to_xla()` path.
+A new kernel needs a matching annotated wrapper in `trnrand/nki/_native.py`
+and an entry in its `OPS` table.
 
 ## Simulator workflow
 

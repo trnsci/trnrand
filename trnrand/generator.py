@@ -42,6 +42,11 @@ class Generator:
         # Each chip draws from a disjoint subrange of the same logical stream.
         # Concatenating in rank order reproduces the single-chip output exactly.
 
+    On the native TorchNeuron path (no torch_xla), take the rank and world
+    size from ``torch.distributed.get_rank()`` / ``get_world_size()``
+    instead. The partition arithmetic is host-side and identical on both
+    dispatch paths.
+
     Single-chip defaults (``partition_rank=0, partition_size=1``) preserve
     all existing behaviour identically.
     """
