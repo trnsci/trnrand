@@ -179,6 +179,63 @@ drawn are unchanged; only their order changes.
 
 ### Fixed
 
+#### `torch.compile(fullgraph=True)` graph-breaks on `normal()` / `uniform()` (#61)
+
+`torch.compile(lambda: trnrand.normal(n), fullgraph=True)` (and `uniform`,
+`standard_normal`) failed with `Unsupported: Failed to convert args/kwargs to
+proxy` on every backend (`neuron` on Trn2, `eager` on CPU). Root cause: the
+draw passed a `torch.Generator` to a traced call (`Tensor.normal_` /
+`uniform_(generator=...)` on the PyTorch path, `torch.randint(generator=...)`
+for the 24-bit kernel seed on the NKI path), and Dynamo cannot proxy a
+Generator. `torch.compiler.disable` is not a fix under `fullgraph=True`.
+
+- While compiling, the generator-state step runs in opaque custom ops that
+  take the generator's integer handle (new `trnrand/_compile.py`):
+  `trnrand::gen_fill` (PyTorch-path fill), `trnrand::gen_nki_state` (seed
+  draw + partition counter offset + advance, returned as an int64 tensor) and
+  `trnrand::gen_nki_draw` (whole draw, for the XLA / simulator / per-tile
+  routes). Each declares a mutation of a per-generator token tensor so
+  AOT/Inductor keep every draw, in order, even if its output is unused.
+- On the native TorchNeuron path the kernel launches stay in the graph:
+  `dispatch.threefry_stream_from_state` builds the kernel inputs with torch
+  ops from the state tensor (seed and offset are not baked in as constants,
+  so repeated calls neither recompile nor repeat values) and shares the
+  launch/copy code (`_native_launches`) with the eager wrapper. It takes the
+  eager route: the bulk Threefry kernels (#60) with the same `_bulk_plan`
+  launches and `TRNRAND_LIMB_BITS` variant, or the streaming kernels under
+  `TRNRAND_BULK_KERNEL=0`. The plan and variant are fixed at trace time.
+- Eager calls are unchanged. Compiled output is bit-identical to eager for
+  every seed, and the generator ends in the same state.
+- `backend="neuron"` lowers the whole graph to StableHLO and rejects any
+  custom op that is not an `nki_op` kernel, so the `gen_*` ops only serve the
+  CPU compile backends (eager / aot_eager / inductor). The default per-call
+  NKI key is a `torch.randint` on the Generator's Mersenne Twister, which has
+  no in-graph aten equivalent, so it cannot lower without changing the stream.
+  New opt-in `Generator(key_mode="counter")` (or `TRNRAND_KEY_MODE=counter`):
+  the Threefry key is fixed by the seed (64-bit seed folded to 48 bits,
+  k0/k1) and only the counter advances between calls. The counter is now a
+  0-d tensor on the Generator (`_counter` stays as the int view), so on the
+  native path the compiled draw is plain aten ops (the bulk-kernel lane,
+  key and start tiles built from the seed's key words and the `_ctr` tensor)
+  plus the `nki_op` launches (`dispatch.threefry_stream_from_key`),
+  advancing the counter with an
+  in-place `add_`. **`key_mode="counter"` gives a different stream from the
+  default `"draw"`** (same seed, different values) and does not consume the
+  host `torch.Generator`; the default is unchanged. It applies to
+  `uniform` / `normal` / `standard_normal`; other distributions still draw
+  their key. The PyTorch-backend path (`set_backend("pytorch")`) remains
+  non-lowerable on `neuron`.
+- `Generator` gains a public `key_mode` and private `_handle` (registry
+  lookup), `_compile_token`, `_ctr` and `_key_words`. Needs PyTorch 2.4+
+  (`torch.library.custom_op`); older PyTorch keeps the previous behaviour.
+- Tests: `tests/test_torch_compile.py` (CPU: `backend="eager"`, zero graph
+  breaks via `torch._dynamo.explain`, compiled == eager for fixed seeds on the
+  PyTorch, native-NKI (CPU stand-in kernels: every bulk limb variant,
+  multi-chunk / multi-launch plans and the streaming opt-out) and per-tile
+  NKI paths, in both key modes; the AOT ATen graph in counter mode contains only aten ops and
+  the kernel ops; plus a `neuron`-marked `backend="neuron"` check using
+  `key_mode="counter"`).
+
 #### NKI kernels fail to compile on neuronxcc 2.26 / NKI 0.5+ (#56)
 
 Hardware compilation failed with `'nisa.tensor_scalar_arith' op 'operand0'

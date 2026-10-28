@@ -45,6 +45,47 @@ def _nki_seed(gen_obj: Generator) -> int:
     return int(torch.randint(0, 2**24, (1,), generator=gen_obj.torch_generator).item())
 
 
+def _compiling() -> bool:
+    """True while Dynamo traces and the custom-op route of #61 is available."""
+    if not torch.compiler.is_compiling():
+        return False
+    from . import _compile
+
+    return _compile.AVAILABLE
+
+
+def _nki_draw_eager(kind: str, gen: Generator, n: int) -> torch.Tensor:
+    """Eager NKI draw: seed + counter step, kernel launches, counter advance."""
+    from .nki.dispatch import threefry_normal_nki, threefry_uniform_nki
+
+    fn = threefry_uniform_nki if kind == "uniform" else threefry_normal_nki
+    # key_mode="counter": fixed key from the seed, only the counter moves (#61).
+    seed = gen._key48 if gen._key_mode == "counter" else _nki_seed(gen)
+    out = fn(n, seed=seed, counter_offset=gen._chip_counter_offset(n))
+    gen._advance_by_elements(n)
+    return out
+
+
+def _nki_draw(kind: str, gen: Generator, n: int) -> torch.Tensor:
+    if _compiling():
+        from . import _compile
+
+        return _compile.nki_draw(gen, kind, n)
+    return _nki_draw_eager(kind, gen, n)
+
+
+def _torch_fill(kind, size, a, b, dtype, generator):
+    gen = generator or get_default_generator()
+    if _compiling():
+        from . import _compile
+
+        return _compile.fill(gen, size, kind, a, b, dtype)
+    out = torch.empty(*size, dtype=dtype)
+    if kind == "uniform":
+        return out.uniform_(a, b, generator=gen.torch_generator)
+    return out.normal_(a, b, generator=gen.torch_generator)
+
+
 def uniform(
     *size: int,
     low: float = 0.0,
@@ -54,16 +95,10 @@ def uniform(
 ) -> torch.Tensor:
     """Uniform distribution on [low, high)."""
     if _nki_active():
-        from .nki.dispatch import threefry_uniform_nki
-
         gen = generator or get_default_generator()
-        seed = _nki_seed(gen)
-        n = math.prod(size)
-        out = threefry_uniform_nki(n, seed=seed, counter_offset=gen._chip_counter_offset(n))
-        gen._advance_by_elements(n)
+        out = _nki_draw("uniform", gen, math.prod(size))
         return (out * (high - low) + low).to(dtype).reshape(size)
-    gen = (generator or get_default_generator()).torch_generator
-    return torch.empty(*size, dtype=dtype).uniform_(low, high, generator=gen)
+    return _torch_fill("uniform", size, low, high, dtype, generator)
 
 
 def normal(
@@ -75,16 +110,10 @@ def normal(
 ) -> torch.Tensor:
     """Normal (Gaussian) distribution."""
     if _nki_active():
-        from .nki.dispatch import threefry_normal_nki
-
         gen = generator or get_default_generator()
-        seed = _nki_seed(gen)
-        n = math.prod(size)
-        out = threefry_normal_nki(n, seed=seed, counter_offset=gen._chip_counter_offset(n))
-        gen._advance_by_elements(n)
+        out = _nki_draw("normal", gen, math.prod(size))
         return (out * std + mean).to(dtype).reshape(size)
-    gen = (generator or get_default_generator()).torch_generator
-    return torch.empty(*size, dtype=dtype).normal_(mean, std, generator=gen)
+    return _torch_fill("normal", size, mean, std, dtype, generator)
 
 
 def standard_normal(

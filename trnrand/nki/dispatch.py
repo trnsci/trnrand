@@ -3205,12 +3205,7 @@ def _bulk_launches(normal: bool, n_elements, seed, counter_offset):
     """
     LANES = _THREEFRY_LANES
     F, C, n_launches = _bulk_plan(n_elements)
-    # Full-word (32) kernels only on the native TorchNeuron (Trn2+) path and the
-    # simulator; anything else keeps the 8-bit kernels (aws-neuron-sdk#1308).
-    native = _use_simulator() or _get_dispatch_path() == "native"
-    bits = _limb_bits() if native else 8
-    variant = {8: "bulk", 16: "bulk16", 32: "bulk32"}[bits]
-    op_name = f"threefry_{variant}_{'normal' if normal else 'uniform'}"
+    op_name = _bulk_op_name(normal)
     kernel_name = op_name + "_kernel"
 
     k0_val = seed & 0xFFFFFF
@@ -3235,15 +3230,31 @@ def _bulk_launches(normal: bool, n_elements, seed, counter_offset):
             torch.from_numpy(np.asarray(sim(c0_np, sb_np[i], *k_np))) for i in range(n_launches)
         ]
     else:
-        op = _get_native_ops()[op_name]
-        c0_d = _h2d(torch.from_numpy(c0_np))
-        k_d = [_h2d(torch.from_numpy(a)) for a in k_np]
-        sb_d = _h2d(torch.from_numpy(sb_np))
-        outs_d = [op(c0_d, sb_d[i], *k_d) for i in range(n_launches)]
-        stacked = outs_d[0].unsqueeze(0) if n_launches == 1 else torch.stack(outs_d)
-        outs = list(_d2h(stacked).unbind(0))
+        outs = _native_launches(
+            op_name,
+            n_launches,
+            torch.from_numpy(c0_np),
+            torch.from_numpy(sb_np),
+            [torch.from_numpy(a) for a in k_np],
+        )
 
-    chunks = [_bulk_tile_order(o, F) for o in outs]
+    return _bulk_result(outs, F, n_elements)
+
+
+def _bulk_op_name(normal: bool) -> str:
+    """Bulk kernel op name for the active limb width, e.g. ``threefry_bulk32_normal``.
+
+    Full-word (32) kernels only on the native TorchNeuron (Trn2+) path and the
+    simulator; anything else keeps the 8-bit kernels (aws-neuron-sdk#1308).
+    """
+    native = _use_simulator() or _get_dispatch_path() == "native"
+    bits = _limb_bits() if native else 8
+    variant = {8: "bulk", 16: "bulk16", 32: "bulk32"}[bits]
+    return f"threefry_{variant}_{'normal' if normal else 'uniform'}"
+
+
+def _bulk_result(outs, cols: int, n_elements: int) -> torch.Tensor:
+    chunks = [_bulk_tile_order(o, cols) for o in outs]
     result = torch.cat(chunks) if len(chunks) > 1 else chunks[0]
     return result.float()[:n_elements]
 
@@ -3310,13 +3321,13 @@ def _stream_launches(kernel_name: str, op_name: str, n_elements, seed, counter_o
             torch.from_numpy(np.asarray(sim(c0_np, sb_np[i], *k_np))) for i in range(n_launches)
         ]
     elif _get_dispatch_path() == "native":
-        op = _get_native_ops()[op_name]
-        c0_d = _h2d(torch.from_numpy(c0_np))
-        k_d = [_h2d(torch.from_numpy(a)) for a in k_np]
-        sb_d = _h2d(torch.from_numpy(sb_np))
-        outs_d = [op(c0_d, sb_d[i], *k_d) for i in range(n_launches)]
-        stacked = outs_d[0].unsqueeze(0) if n_launches == 1 else torch.stack(outs_d)
-        outs = list(_d2h(stacked).unbind(0))
+        outs = _native_launches(
+            op_name,
+            n_launches,
+            torch.from_numpy(c0_np),
+            torch.from_numpy(sb_np),
+            [torch.from_numpy(a) for a in k_np],
+        )
     else:
         kernel = _kernel(kernel_name)
         outs = [
@@ -3330,9 +3341,129 @@ def _stream_launches(kernel_name: str, op_name: str, n_elements, seed, counter_o
             for i in range(n_launches)
         ]
 
+    return _stream_result(outs, n_elements)
+
+
+def _native_launches(op_name, n_launches, c0, sb, k):
+    """Native path: copy the inputs to the device once, launch, copy back once (#60).
+
+    `c0` is the (P, cols) lane tile, the four `k` words are (P, 1) int32, and
+    `sb` is the (n_launches, P, starts) int32 start tile of every launch. Returns
+    the per-launch host outputs. Shared by the eager bulk and streaming
+    wrappers and the torch.compile path (#61), so all of them launch identically.
+    """
+    op = _get_native_ops()[op_name]
+    c0_d = _h2d(c0)
+    k_d = [_h2d(t) for t in k]
+    sb_d = _h2d(sb)
+    outs_d = [op(c0_d, sb_d[i], *k_d) for i in range(n_launches)]
+    stacked = outs_d[0].unsqueeze(0) if n_launches == 1 else torch.stack(outs_d)
+    return list(_d2h(stacked).unbind(0))
+
+
+def _stream_result(outs, n_elements):
     chunks = [_stream_tile_order(o) for o in outs]
     result = torch.cat(chunks) if len(chunks) > 1 else chunks[0]
     return result.float()[:n_elements]
+
+
+def _kernel_inputs(
+    key_words: torch.Tensor,
+    offset: torch.Tensor,
+    n_launches: int,
+    starts_per_launch: int,
+    stride: int,
+    cols: int,
+):
+    """Native kernel inputs built with torch ops from a tensor key and counter (#61).
+
+    Tensor-valued twin of the numpy setup in `_bulk_launches` / `_stream_launches`,
+    value for value: c0 = lane index broadcast to (P, cols), (k0, k1) = `key_words`
+    (int32, each < 2^24), k2 = k3 = 0, and start i of launch L is
+    (offset + (L × starts_per_launch + i) × stride) & 0xFFFFFF, laid out as
+    (n_launches, P, starts_per_launch). `offset` is a 0-d integer tensor. Only
+    plain aten ops, so the neuron backend can lower them, and the key and offset
+    stay graph inputs rather than baked-in constants. Arithmetic after the first
+    mask is int32 (the offset is < 2^24, the added span is one request's batches).
+    """
+    LANES = _THREEFRY_LANES
+    c0 = torch.arange(LANES, dtype=torch.int32).reshape(-1, 1)
+    if cols > 1:
+        c0 = c0.expand(LANES, cols).contiguous()
+    kw = key_words.to(torch.int32).reshape(1, 2).expand(LANES, 2)
+    zero = torch.zeros(LANES, 1, dtype=torch.int32)
+    k = [kw[:, 0:1].contiguous(), kw[:, 1:2].contiguous(), zero, zero.clone()]
+    base = (offset & 0xFFFFFF).to(torch.int32)
+    idx = torch.arange(n_launches * starts_per_launch, dtype=torch.int32)
+    starts = (base + idx * stride) & 0xFFFFFF
+    sb = (
+        starts.reshape(n_launches, 1, starts_per_launch)
+        .expand(n_launches, LANES, starts_per_launch)
+        .contiguous()
+    )
+    return c0, sb, k
+
+
+def _stream_inputs(key_words: torch.Tensor, offset: torch.Tensor, n_launches: int):
+    """Streaming-kernel inputs: (P, 1) lanes, start_batch[L] = offset + L × _PROGRAM_TILES."""
+    return _kernel_inputs(key_words, offset, n_launches, 1, _PROGRAM_TILES, 1)
+
+
+def _bulk_inputs(
+    key_words: torch.Tensor, offset: torch.Tensor, cols: int, chunks: int, n_launches: int
+):
+    """Bulk-kernel inputs for a `_bulk_plan` (cols F, chunks C, launches):
+    (P, F) lanes, chunk c of launch L starts at offset + (L × C + c) × F."""
+    return _kernel_inputs(key_words, offset, n_launches, chunks, cols, cols)
+
+
+def _key_offset_from_state(state: torch.Tensor):
+    """(key_words, offset) tensors from an int64 (seed, counter_offset) tensor (key_mode="draw")."""
+    state = state.to(torch.int64)
+    seed = state[0]
+    return torch.stack([seed & 0xFFFFFF, (seed >> 24) & 0xFFFFFF]), state[1]
+
+
+def _stream_inputs_from_state(state: torch.Tensor, n_launches: int):
+    """`_stream_inputs` from an int64 (seed, counter_offset) tensor (key_mode="draw")."""
+    return _stream_inputs(*_key_offset_from_state(state), n_launches)
+
+
+def _n_stream_launches(n_elements: int) -> int:
+    per_launch = _PROGRAM_TILES * _THREEFRY_LANES * 4
+    return max(1, (n_elements + per_launch - 1) // per_launch)
+
+
+def threefry_stream_from_key(
+    kind: str, n_elements: int, key_words: torch.Tensor, offset: torch.Tensor
+) -> torch.Tensor:
+    """Native draw from tensor key words and counter offset (#61).
+
+    Pure aten ops plus the nki_op launches, so it lowers on
+    `torch.compile(backend="neuron")`. Takes the same route as the eager
+    `threefry_stream_{kind}` on the native path: the bulk kernels (`_bulk_plan`
+    launches, `_bulk_op_name` limb variant) unless TRNRAND_BULK_KERNEL=0, else
+    the streaming kernels. Same values as `threefry_stream_{kind}(n_elements,
+    seed=k0 | k1 << 24, counter_offset=offset)`.
+    """
+    if _use_bulk():
+        F, C, n_launches = _bulk_plan(n_elements)
+        c0, sb, k = _bulk_inputs(key_words, offset, F, C, n_launches)
+        outs = _native_launches(_bulk_op_name(kind == "normal"), n_launches, c0, sb, k)
+        return _bulk_result(outs, F, n_elements)
+    n_launches = _n_stream_launches(n_elements)
+    c0, sb, k = _stream_inputs(key_words, offset, n_launches)
+    outs = _native_launches(f"threefry_streaming_{kind}", n_launches, c0, sb, k)
+    return _stream_result(outs, n_elements)
+
+
+def threefry_stream_from_state(kind: str, n_elements: int, state: torch.Tensor) -> torch.Tensor:
+    """`threefry_stream_from_key` from a (seed, offset) tensor (#61).
+
+    `state` is the int64 tensor produced by the `trnrand::gen_nki_state` op
+    (key_mode="draw"; CPU compile backends only, see `trnrand/_compile.py`).
+    """
+    return threefry_stream_from_key(kind, n_elements, *_key_offset_from_state(state))
 
 
 def threefry_stream_normal(
