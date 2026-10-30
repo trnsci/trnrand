@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.9.0] - 2026-10-30
+
+Native TorchNeuron dispatch (Trn2/Trn3) alongside the PyTorch/XLA path (Trn1, maintenance); validated on Trn2 (trn2.3xlarge, Neuron SDK 2.33.0) — see trnsci/trnsci#35.
+
+Headline performance: the full-word bulk Threefry kernel drops from 5.0 to 2.5 ms at 4M samples on Trn2, and `trnrand.normal` end to end (5.5–8.1 ms) now beats CPU `randn` (11.5–15.6 ms) (#66).
+
 ### Changed
 
 #### Faster full-word bulk Threefry kernels and host path on Trn2 (#60)
