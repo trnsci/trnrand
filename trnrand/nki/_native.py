@@ -146,6 +146,11 @@ def _fake_bulk(c0, start):
     return c0.new_empty((c0.shape[0], start.shape[1] * 4 * c0.shape[1]), dtype=torch.float32)
 
 
+def _fake_bulk32(c0, start):
+    # Full-word kernels write (C × P, F, 4) in per-tile order (#60).
+    return c0.new_empty((start.shape[1] * c0.shape[0], c0.shape[1], 4), dtype=torch.float32)
+
+
 @nki_op(
     "trnrand::threefry_bulk_normal",
     mutates_args={},
@@ -213,7 +218,7 @@ def threefry_bulk16_uniform(
 @nki_op(
     "trnrand::threefry_bulk32_normal",
     mutates_args={},
-    fake_fn=lambda c0, start, k0, k1, k2, k3: _fake_bulk(c0, start),
+    fake_fn=lambda c0, start, k0, k1, k2, k3: _fake_bulk32(c0, start),
 )
 def threefry_bulk32_normal(
     c0: torch.Tensor,
@@ -229,7 +234,7 @@ def threefry_bulk32_normal(
 @nki_op(
     "trnrand::threefry_bulk32_uniform",
     mutates_args={},
-    fake_fn=lambda c0, start, k0, k1, k2, k3: _fake_bulk(c0, start),
+    fake_fn=lambda c0, start, k0, k1, k2, k3: _fake_bulk32(c0, start),
 )
 def threefry_bulk32_uniform(
     c0: torch.Tensor,

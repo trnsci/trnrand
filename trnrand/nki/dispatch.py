@@ -455,6 +455,26 @@ def _bulk_plan(n_elements: int) -> tuple[int, int, int]:
     return F, C, -(-chunks // C)
 
 
+def _bulk_final_order(op_name: str) -> bool:
+    """True for the bulk kernels that write per-tile order themselves (the full-word ones)."""
+    return "bulk32" in op_name
+
+
+def _bulk_lane_tile(cols: int, final_order: bool) -> np.ndarray:
+    """The (P, cols) int32 lane input `c0` of the bulk kernels.
+
+    Old layout (8/16-bit kernels): lane p in every column. Final-order layout
+    (full-word kernels): element (p, j) is pair t = p·cols + j, lane t & 127.
+    """
+    lanes = _THREEFRY_LANES
+    if final_order:
+        t = np.arange(lanes * cols, dtype=np.int32).reshape(lanes, cols)
+        return np.ascontiguousarray(t & (lanes - 1))
+    return np.ascontiguousarray(
+        np.broadcast_to(np.arange(lanes, dtype=np.int32).reshape(-1, 1), (lanes, cols))
+    )
+
+
 def _bulk_tile_order(out: torch.Tensor, cols: int) -> torch.Tensor:
     """Flatten one bulk launch's (P, C × 4 × F) output in per-tile (batch, lane, word) order.
 
@@ -2872,14 +2892,54 @@ if HAS_NKI:
             _add32_w(x[3], ksp_w[step]),
         ]
 
-    def _u24_f32_w(w):
-        return nl.copy(nl.bitwise_and(w, 0xFFFFFF, dtype=nl.uint32), dtype=nl.float32)
+    # Layout and engine plan of the full-word kernels (#60 follow-up):
+    #
+    # * Output in final order. Partition q of chunk c holds the F consecutive
+    #   (batch, lane) pairs t = q·F + f (lane = t & 127, batch = start[c] +
+    #   (t >> 7)), and each pair's four words sit next to each other, so the
+    #   (C·P, F, 4) output flattens straight to per-tile (batch, lane, word)
+    #   order. The host does no reorder, and every partition leaves in one
+    #   contiguous DMA. A chunk still covers batches start[c] .. start[c] + F - 1
+    #   on all 128 lanes, so the values are the same as the 8-bit kernels.
+    # * Both physical cores of a logical core (LNC=2, the Trn2 default). NKI
+    #   traces the kernel once per core (`program_id`); core k computes chunks
+    #   [k·C/2, (k+1)·C/2) when C is even, else columns [k·F/2, (k+1)·F/2) of
+    #   every chunk. A gridless kernel that ignores `program_id` runs the whole
+    #   kernel on both cores and writes it twice (what the 8/16-bit ones do).
+    #   Per-core tiles are never wider than F, so SBUF use is as before.
+    # * GpSimd integer adds are ~2/3 of the time and do not overlap the Vector
+    #   bit ops: the two engines share the SBUF port, and a Vector instruction
+    #   issued during a GpSimd add stretches to the add's length (Trn2 profile
+    #   on #60). So the levers are fewer adds, fewer Vector instructions, and
+    #   both cores; double-buffering the two engines buys nothing.
+    #   Chunk-invariant work is hoisted: x0 = lane + ks0 is the same for every
+    #   chunk, and x2 = 0 + ks2, x3 = 0 + ks3 are the key words themselves.
+    # * Box-Muller: (x & 0xFFFFFF) feeds one arithmetic `tensor_scalar`
+    #   (multiply by 2^-24, then max with 1e-7); its implicit uint32 -> float32
+    #   cast is exact below 2^24, so it equals copy + multiply + maximum.
 
     def _threefry_bulk32_body(c0_ref, start_ref, k0_ref, k1_ref, k2_ref, k3_ref, normal):
         P = c0_ref.shape[0]
         F = c0_ref.shape[1]
         C = start_ref.shape[1]
-        zero = nl.full((P, F), 0, dtype=nl.uint32)
+        n_prog = nl.num_programs() if nl.program_ndim() > 0 else 1
+        pid = nl.program_id(0) if n_prog > 1 else 0
+        if C % n_prog == 0:  # whole chunks per core: full-width instructions
+            W = F
+            c_lo = pid * (C // n_prog)
+            c_hi = c_lo + C // n_prog
+        elif F % n_prog == 0:  # e.g. C = 1: split every chunk's columns
+            W = F // n_prog
+            c_lo = 0
+            c_hi = C
+        else:
+            n_prog = 1
+            pid = 0
+            W = F
+            c_lo = 0
+            c_hi = C
+        j0 = 0 if W == F else pid * W
+        zero = nl.full((P, W), 0, dtype=nl.uint32)
 
         k0_b = _b_split(k0_ref)
         k1_b = _b_split(k1_ref)
@@ -2904,26 +2964,29 @@ if HAS_NKI:
             _pack_bytes_wide(_add32_b(ks_b[3], _b_from_scalar(P, 5)), zero),
         ]
 
-        c0_w = _as_u32(nl.load(c0_ref))
-        col = nl.ndarray((P, F), dtype=nl.uint32, buffer=nl.sbuf)
-        nisa.iota(col, [[1, F]], offset=0, channel_multiplier=0)
+        # Lane of pair t = q·F + f comes in as c0; its batch within the chunk is t >> 7.
+        lane = _as_u32(nl.load(c0_ref[:, j0 : j0 + W]))
+        t_idx = nl.ndarray((P, W), dtype=nl.uint32, buffer=nl.sbuf)
+        nisa.iota(t_idx, [[1, W]], offset=j0, channel_multiplier=F)
+        b_local = nl.right_shift(t_idx, 7, dtype=nl.uint32)
+        x0_init = _add32_w(lane, ks_w[0])
 
         inv24 = nl.full((P, 1), 1.0 / 16777216.0, dtype=nl.float32)
         clamp_eps = nl.full((P, 1), 1e-7, dtype=nl.float32)
         neg_two = nl.full((P, 1), -2.0, dtype=nl.float32)
         two_pi = nl.full((P, 1), TWO_PI, dtype=nl.float32)
 
-        out = nl.ndarray((P, C * 4 * F), dtype=nl.float32, buffer=nl.shared_hbm)
+        out = nl.ndarray((C * P, F, 4), dtype=nl.float32, buffer=nl.shared_hbm)
 
-        for c in nl.static_range(C):
+        for c in nl.static_range(c_lo, c_hi):
             start_w = _pack_bytes_wide(_b_split(start_ref[:, c : c + 1]), zero)
-            c1_w = nl.bitwise_and(_add32_w(col, start_w), 0xFFFFFF, dtype=nl.uint32)
+            c1_w = nl.bitwise_and(_add32_w(b_local, start_w), 0xFFFFFF, dtype=nl.uint32)
 
-            _ki = _key_inject_w([c0_w, c1_w, zero, zero], ks_w, ksp_w, 0)
-            x0 = _ki[0]
-            x1 = _ki[1]
-            x2 = _ki[2]
-            x3 = _ki[3]
+            # Key injection 0 on counters (lane, c1, 0, 0).
+            x0 = x0_init
+            x1 = _add32_w(c1_w, ks_w[1])
+            x2 = ks_w[2]
+            x3 = ksp_w[0]
 
             for round_num in nl.static_range(THREEFRY_ROUNDS):
                 rot0, rot1 = THREEFRY_ROTATIONS[round_num % 4]
@@ -2940,45 +3003,59 @@ if HAS_NKI:
                     x2 = _ki[2]
                     x3 = _ki[3]
 
-            res = nl.ndarray((P, 4 * F), dtype=nl.float32, buffer=nl.sbuf)
+            m0 = nl.bitwise_and(x0, 0xFFFFFF, dtype=nl.uint32)
+            m1 = nl.bitwise_and(x1, 0xFFFFFF, dtype=nl.uint32)
+            m2 = nl.bitwise_and(x2, 0xFFFFFF, dtype=nl.uint32)
+            m3 = nl.bitwise_and(x3, 0xFFFFFF, dtype=nl.uint32)
+            res = nl.ndarray((P, W, 4), dtype=nl.float32, buffer=nl.sbuf)
             if normal:
-                u0 = nl.maximum(nl.multiply(_u24_f32_w(x0), inv24, dtype=nl.float32), clamp_eps)
-                u1 = nl.maximum(nl.multiply(_u24_f32_w(x1), inv24, dtype=nl.float32), clamp_eps)
-                u2 = nl.maximum(nl.multiply(_u24_f32_w(x2), inv24, dtype=nl.float32), clamp_eps)
-                u3 = nl.maximum(nl.multiply(_u24_f32_w(x3), inv24, dtype=nl.float32), clamp_eps)
+                u0 = nl.ndarray((P, W), dtype=nl.float32, buffer=nl.sbuf)
+                u1 = nl.ndarray((P, W), dtype=nl.float32, buffer=nl.sbuf)
+                u2 = nl.ndarray((P, W), dtype=nl.float32, buffer=nl.sbuf)
+                u3 = nl.ndarray((P, W), dtype=nl.float32, buffer=nl.sbuf)
+                nisa.tensor_scalar(
+                    u0, m0, op0=nl.multiply, operand0=inv24, op1=nl.maximum, operand1=clamp_eps
+                )
+                nisa.tensor_scalar(
+                    u1, m1, op0=nl.multiply, operand0=inv24, op1=nl.maximum, operand1=clamp_eps
+                )
+                nisa.tensor_scalar(
+                    u2, m2, op0=nl.multiply, operand0=inv24, op1=nl.maximum, operand1=clamp_eps
+                )
+                nisa.tensor_scalar(
+                    u3, m3, op0=nl.multiply, operand0=inv24, op1=nl.maximum, operand1=clamp_eps
+                )
                 bm_r0 = nl.sqrt(nl.multiply(nl.log(u0), neg_two))
                 bm_theta0 = nl.multiply(u1, two_pi)
                 bm_r1 = nl.sqrt(nl.multiply(nl.log(u2), neg_two))
                 bm_theta1 = nl.multiply(u3, two_pi)
-                nisa.tensor_tensor(res[:, 0:F], bm_r0, nl.cos(bm_theta0), op=nl.multiply)
-                nisa.tensor_tensor(res[:, F : 2 * F], bm_r0, nl.sin(bm_theta0), op=nl.multiply)
-                nisa.tensor_tensor(res[:, 2 * F : 3 * F], bm_r1, nl.cos(bm_theta1), op=nl.multiply)
-                nisa.tensor_tensor(res[:, 3 * F : 4 * F], bm_r1, nl.sin(bm_theta1), op=nl.multiply)
+                nisa.tensor_tensor(res[:, :, 0], bm_r0, nl.cos(bm_theta0), op=nl.multiply)
+                nisa.tensor_tensor(res[:, :, 1], bm_r0, nl.sin(bm_theta0), op=nl.multiply)
+                nisa.tensor_tensor(res[:, :, 2], bm_r1, nl.cos(bm_theta1), op=nl.multiply)
+                nisa.tensor_tensor(res[:, :, 3], bm_r1, nl.sin(bm_theta1), op=nl.multiply)
             else:
-                nisa.tensor_scalar(res[:, 0:F], _u24_f32_w(x0), op0=nl.multiply, operand0=inv24)
-                nisa.tensor_scalar(
-                    res[:, F : 2 * F], _u24_f32_w(x1), op0=nl.multiply, operand0=inv24
-                )
-                nisa.tensor_scalar(
-                    res[:, 2 * F : 3 * F], _u24_f32_w(x2), op0=nl.multiply, operand0=inv24
-                )
-                nisa.tensor_scalar(
-                    res[:, 3 * F : 4 * F], _u24_f32_w(x3), op0=nl.multiply, operand0=inv24
-                )
+                nisa.tensor_scalar(res[:, :, 0], m0, op0=nl.multiply, operand0=inv24)
+                nisa.tensor_scalar(res[:, :, 1], m1, op0=nl.multiply, operand0=inv24)
+                nisa.tensor_scalar(res[:, :, 2], m2, op0=nl.multiply, operand0=inv24)
+                nisa.tensor_scalar(res[:, :, 3], m3, op0=nl.multiply, operand0=inv24)
 
-            base = c * 4 * F
-            nl.store(out[:, base : base + 4 * F], res)
+            nl.store(out[c * P : (c + 1) * P, j0 : j0 + W, :], res)
 
         return out
 
     @nki.jit
     def threefry_bulk32_normal_kernel(c0_ref, start_ref, k0_ref, k1_ref, k2_ref, k3_ref):
-        """`threefry_bulk_normal_kernel` on full uint32 words (GpSimd integer adds)."""
+        """`threefry_bulk_normal_kernel` on full uint32 words (GpSimd integer adds).
+
+        Inputs as `threefry_bulk_normal_kernel`, except c0 is the lane of pair
+        t = p·F + j, i.e. (p·F + j) & 127 (`_bulk_lane_tile`). Output:
+        (C × P, F, 4) float32 in per-tile (batch, lane, word) order (#60).
+        """
         return _threefry_bulk32_body(c0_ref, start_ref, k0_ref, k1_ref, k2_ref, k3_ref, True)
 
     @nki.jit
     def threefry_bulk32_uniform_kernel(c0_ref, start_ref, k0_ref, k1_ref, k2_ref, k3_ref):
-        """`threefry_bulk_uniform_kernel` on full uint32 words (GpSimd integer adds)."""
+        """Uniform twin of `threefry_bulk32_normal_kernel`: float32 in [0, 1), same layout."""
         return _threefry_bulk32_body(c0_ref, start_ref, k0_ref, k1_ref, k2_ref, k3_ref, False)
 
 
@@ -3199,9 +3276,11 @@ def _bulk_launches(normal: bool, n_elements, seed, counter_offset):
     (start + j) & 0xFFFFFF: the same counter for every element as the
     per-tile and streaming paths, so the values are bit-identical.
 
-    Native path: the (P, F) lane tile and key words are copied to the device
-    once, every launch's (P, C) start tile goes over as one (L, P, C) tensor,
-    and the outputs come back in one device→host copy.
+    Native path: the (P, F) lane tile, key words and every launch's (P, C)
+    start tile go to the device in one packed copy, and the outputs come back
+    in one device→host copy. The full-word kernels write per-tile order
+    themselves, so their output is only flattened; the 8/16-bit kernels'
+    output is reordered on the host (`_bulk_tile_order`).
     """
     LANES = _THREEFRY_LANES
     F, C, n_launches = _bulk_plan(n_elements)
@@ -3210,9 +3289,8 @@ def _bulk_launches(normal: bool, n_elements, seed, counter_offset):
 
     k0_val = seed & 0xFFFFFF
     k1_val = (seed >> 24) & 0xFFFFFF
-    c0_np = np.ascontiguousarray(
-        np.broadcast_to(np.arange(LANES, dtype=np.int32).reshape(-1, 1), (LANES, F))
-    )
+    final = _bulk_final_order(op_name)
+    c0_np = _bulk_lane_tile(F, final)
     k_np = [
         np.full((LANES, 1), k0_val, dtype=np.int32),
         np.full((LANES, 1), k1_val, dtype=np.int32),
@@ -3236,9 +3314,10 @@ def _bulk_launches(normal: bool, n_elements, seed, counter_offset):
             torch.from_numpy(c0_np),
             torch.from_numpy(sb_np),
             [torch.from_numpy(a) for a in k_np],
+            c0_key=(F, final),
         )
 
-    return _bulk_result(outs, F, n_elements)
+    return _bulk_result(outs, F, n_elements, final)
 
 
 def _bulk_op_name(normal: bool) -> str:
@@ -3253,7 +3332,11 @@ def _bulk_op_name(normal: bool) -> str:
     return f"threefry_{variant}_{'normal' if normal else 'uniform'}"
 
 
-def _bulk_result(outs, cols: int, n_elements: int) -> torch.Tensor:
+def _bulk_result(outs, cols: int, n_elements: int, final_order: bool = False) -> torch.Tensor:
+    if final_order:  # already per-tile order: flatten, no host reorder
+        flat = [o.reshape(-1) for o in outs]
+        result = torch.cat(flat) if len(flat) > 1 else flat[0]
+        return result.float()[:n_elements]
     chunks = [_bulk_tile_order(o, cols) for o in outs]
     result = torch.cat(chunks) if len(chunks) > 1 else chunks[0]
     return result.float()[:n_elements]
@@ -3288,12 +3371,11 @@ def _stream_launches(kernel_name: str, op_name: str, n_elements, seed, counter_o
 
     Launch L uses start_batch = (counter_offset + L × _PROGRAM_TILES) & 0xFFFFFF.
 
-    Native path (#60): the constant (P, 1) inputs (lane index, key words) are
-    copied to the device once, and the start_batch inputs for all launches are
-    copied once as one (L, P, 1) tensor and indexed per launch. Each launch's
-    (P, 4 × tiles) output stays on the device; they are stacked there and
-    copied back in one transfer. That is 6 host→device copies and 1
-    device→host copy per call, instead of 6 and 1 per launch.
+    Native path (#60): the constant (P, 1) inputs (lane index, key words) and
+    the start_batch inputs of all launches, as one (L, P, 1) tensor indexed per
+    launch, go to the device in one packed copy. Each launch's (P, 4 × tiles)
+    output stays on the device; they are stacked there and copied back in one
+    transfer. That is 1 host→device copy and 1 device→host copy per call.
 
     XLA path and simulator: one `_launch` / `nki.simulate` per launch, unchanged.
     """
@@ -3344,18 +3426,47 @@ def _stream_launches(kernel_name: str, op_name: str, n_elements, seed, counter_o
     return _stream_result(outs, n_elements)
 
 
-def _native_launches(op_name, n_launches, c0, sb, k):
+# Device copies of the (P, cols) lane tiles, keyed by (cols, final_order). The
+# lane tile depends only on the plan, so the eager bulk path copies it once per
+# process instead of once per call (~0.5 ms of a 4M draw on Trn2, #60).
+_device_lane_tiles: dict = {}
+
+
+def _h2d_packed(c0, sb, k, c0_key=None):
+    """Copy the kernel inputs to the device in ONE transfer.
+
+    Each host→device copy has a fixed cost on Trn2 (0.05-0.2 ms measured for
+    tensors up to 256 KB, #60), so the four
+    key words, the start tiles and (unless cached under `c0_key`) the lane tile
+    go over as one flat int32 buffer, and the kernel inputs are contiguous views
+    into it (#60 follow-up).
+    """
+    cached = _device_lane_tiles.get(c0_key) if c0_key is not None else None
+    parts = [*k, sb] if cached is not None else [*k, sb, c0]
+    flat_d = _h2d(torch.cat([t.reshape(-1).to(torch.int32) for t in parts]))
+    views, off = [], 0
+    for t in parts:
+        views.append(flat_d[off : off + t.numel()].view(t.shape))
+        off += t.numel()
+    if cached is None:
+        cached = views[5]
+        if c0_key is not None:
+            _device_lane_tiles[c0_key] = cached
+    return cached, views[4], views[0:4]
+
+
+def _native_launches(op_name, n_launches, c0, sb, k, c0_key=None):
     """Native path: copy the inputs to the device once, launch, copy back once (#60).
 
     `c0` is the (P, cols) lane tile, the four `k` words are (P, 1) int32, and
-    `sb` is the (n_launches, P, starts) int32 start tile of every launch. Returns
-    the per-launch host outputs. Shared by the eager bulk and streaming
-    wrappers and the torch.compile path (#61), so all of them launch identically.
+    `sb` is the (n_launches, P, starts) int32 start tile of every launch; all of
+    them go over in one packed copy (`_h2d_packed`), and `c0_key` (eager bulk
+    path only) reuses a cached device lane tile. Returns the per-launch host
+    outputs. Shared by the eager bulk and streaming wrappers and the
+    torch.compile path (#61), so all of them launch identically.
     """
     op = _get_native_ops()[op_name]
-    c0_d = _h2d(c0)
-    k_d = [_h2d(t) for t in k]
-    sb_d = _h2d(sb)
+    c0_d, sb_d, k_d = _h2d_packed(c0, sb, k, c0_key)
     outs_d = [op(c0_d, sb_d[i], *k_d) for i in range(n_launches)]
     stacked = outs_d[0].unsqueeze(0) if n_launches == 1 else torch.stack(outs_d)
     return list(_d2h(stacked).unbind(0))
@@ -3374,11 +3485,12 @@ def _kernel_inputs(
     starts_per_launch: int,
     stride: int,
     cols: int,
+    final_order: bool = False,
 ):
     """Native kernel inputs built with torch ops from a tensor key and counter (#61).
 
     Tensor-valued twin of the numpy setup in `_bulk_launches` / `_stream_launches`,
-    value for value: c0 = lane index broadcast to (P, cols), (k0, k1) = `key_words`
+    value for value: c0 = `_bulk_lane_tile(cols, final_order)`, (k0, k1) = `key_words`
     (int32, each < 2^24), k2 = k3 = 0, and start i of launch L is
     (offset + (L × starts_per_launch + i) × stride) & 0xFFFFFF, laid out as
     (n_launches, P, starts_per_launch). `offset` is a 0-d integer tensor. Only
@@ -3387,9 +3499,12 @@ def _kernel_inputs(
     mask is int32 (the offset is < 2^24, the added span is one request's batches).
     """
     LANES = _THREEFRY_LANES
-    c0 = torch.arange(LANES, dtype=torch.int32).reshape(-1, 1)
-    if cols > 1:
-        c0 = c0.expand(LANES, cols).contiguous()
+    if final_order:
+        c0 = torch.arange(LANES * cols, dtype=torch.int32).reshape(LANES, cols) & (LANES - 1)
+    else:
+        c0 = torch.arange(LANES, dtype=torch.int32).reshape(-1, 1)
+        if cols > 1:
+            c0 = c0.expand(LANES, cols).contiguous()
     kw = key_words.to(torch.int32).reshape(1, 2).expand(LANES, 2)
     zero = torch.zeros(LANES, 1, dtype=torch.int32)
     k = [kw[:, 0:1].contiguous(), kw[:, 1:2].contiguous(), zero, zero.clone()]
@@ -3410,11 +3525,16 @@ def _stream_inputs(key_words: torch.Tensor, offset: torch.Tensor, n_launches: in
 
 
 def _bulk_inputs(
-    key_words: torch.Tensor, offset: torch.Tensor, cols: int, chunks: int, n_launches: int
+    key_words: torch.Tensor,
+    offset: torch.Tensor,
+    cols: int,
+    chunks: int,
+    n_launches: int,
+    final_order: bool = False,
 ):
     """Bulk-kernel inputs for a `_bulk_plan` (cols F, chunks C, launches):
     (P, F) lanes, chunk c of launch L starts at offset + (L × C + c) × F."""
-    return _kernel_inputs(key_words, offset, n_launches, chunks, cols, cols)
+    return _kernel_inputs(key_words, offset, n_launches, chunks, cols, cols, final_order)
 
 
 def _key_offset_from_state(state: torch.Tensor):
@@ -3448,9 +3568,11 @@ def threefry_stream_from_key(
     """
     if _use_bulk():
         F, C, n_launches = _bulk_plan(n_elements)
-        c0, sb, k = _bulk_inputs(key_words, offset, F, C, n_launches)
-        outs = _native_launches(_bulk_op_name(kind == "normal"), n_launches, c0, sb, k)
-        return _bulk_result(outs, F, n_elements)
+        op_name = _bulk_op_name(kind == "normal")
+        final = _bulk_final_order(op_name)
+        c0, sb, k = _bulk_inputs(key_words, offset, F, C, n_launches, final)
+        outs = _native_launches(op_name, n_launches, c0, sb, k)
+        return _bulk_result(outs, F, n_elements, final)
     n_launches = _n_stream_launches(n_elements)
     c0, sb, k = _stream_inputs(key_words, offset, n_launches)
     outs = _native_launches(f"threefry_streaming_{kind}", n_launches, c0, sb, k)

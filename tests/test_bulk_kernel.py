@@ -4,8 +4,10 @@ Bulk Threefry kernels: one launch per request, values bit-identical to caa9aec (
 CPU tier (no NKI): the native path is driven with stand-in `trnrand::threefry_bulk_*`
 ops that compute each launch's output from its (P, F) lane / (P, C) start / key
 inputs with an independent numpy Threefry4x32-20 + Box-Muller reference, laid
-out exactly as the kernel lays it out (chunk c, word w, column j at
-c·4F + w·F + j). The wrapper output is compared with the same reference math
+out exactly as the kernel lays it out: chunk c, word w, column j at
+c·4F + w·F + j for the 8/16-bit kernels, and per-tile order, (C·P, F, 4) with
+partition p holding pairs t = p·F + j (batch start[c] + t >> 7, lane = c0), for
+the full-word kernels. The wrapper output is compared with the same reference math
 evaluated directly in per-tile counter order (batch b = counter_offset + i,
 lane p, word w), which is the mapping the per-tile and streaming kernels use.
 
@@ -111,6 +113,23 @@ def _fake_bulk(normal):
     return op
 
 
+def _fake_bulk32(normal):
+    """Full-word kernels: (C·P, F, 4) in per-tile order (#60 follow-up)."""
+
+    def op(c0, start, k0, k1, _k2, _k3):
+        lane = c0.numpy().astype(np.uint64)  # (P, F): lane of pair t = p·F + j
+        P, F = lane.shape
+        b_local = (np.arange(P * F, dtype=np.uint64) >> np.uint64(7)).reshape(P, F)
+        rows = []
+        for s in start.numpy()[0].astype(np.uint64):  # one start per chunk
+            c1 = (s + b_local) & np.uint64(0xFFFFFF)
+            x = _threefry_np(lane, c1, int(k0[0, 0]), int(k1[0, 0]))
+            rows.append(np.stack(_words_to_values(x, normal), axis=-1))  # (P, F, 4)
+        return torch.from_numpy(np.concatenate(rows, axis=0))
+
+    return op
+
+
 def _nki_seeds(seed, k):
     """The first k 24-bit kernel seeds `distributions._nki_seed` draws for Generator(seed)."""
     g = torch.Generator()
@@ -136,7 +155,8 @@ class _FakeNative:
         for variant in ("bulk", "bulk16", "bulk32"):  # TRNRAND_LIMB_BITS = 8 / 16 / 32
             for kind, normal in (("normal", True), ("uniform", False)):
                 name = f"threefry_{variant}_{kind}"
-                ops[name] = counted(name, _fake_bulk(normal))
+                fake = _fake_bulk32 if variant == "bulk32" else _fake_bulk
+                ops[name] = counted(name, fake(normal))
         return ops
 
     def to_device(self, t):
@@ -156,6 +176,7 @@ def native(monkeypatch):
     monkeypatch.setattr(dispatch, "_get_native_ops", nat.ops)
     monkeypatch.setattr(dispatch, "_h2d", nat.to_device)
     monkeypatch.setattr(dispatch, "_d2h", nat.to_host)
+    monkeypatch.setattr(dispatch, "_device_lane_tiles", {})
     monkeypatch.delenv("TRNRAND_BULK_STREAMING", raising=False)
     monkeypatch.delenv("TRNRAND_BULK_KERNEL", raising=False)
     monkeypatch.delenv("TRNRAND_LIMB_BITS", raising=False)
@@ -243,7 +264,34 @@ class TestBulkMatchesReference:
         got = dispatch.threefry_normal_nki(n, seed=99, counter_offset=2**24 - 40)
         assert torch.equal(got, _reference(n, 99, 2**24 - 40, True))
         assert native.calls["threefry_bulk32_normal"] == L  # default width
-        assert native.h2d == 6 and native.d2h == 1
+        assert native.h2d == 1 and native.d2h == 1  # one packed copy each way
+
+    def test_lane_tile_cached_on_device(self, native, monkeypatch):
+        # The eager path copies the (P, F) lane tile once per plan, then only the
+        # key words and start tiles (#60 follow-up).
+        sizes = []
+        to_device = native.to_device
+        monkeypatch.setattr(dispatch, "_h2d", lambda t: (sizes.append(t.numel()), to_device(t))[1])
+        F, C, _ = dispatch._bulk_plan(70_000)
+        for seed in (1, 2):
+            got = dispatch.threefry_normal_nki(70_000, seed=seed, counter_offset=9)
+            assert torch.equal(got, _reference(70_000, seed, 9, True))
+        assert sizes == [LANES * (4 + C + F), LANES * (4 + C)]
+        assert native.d2h == 2
+
+    def test_final_order_lane_tile_and_result(self):
+        F, C = 32, 3
+        lane = dispatch._bulk_lane_tile(F, True)
+        assert lane.shape == (LANES, F) and lane.dtype == np.int32
+        t = np.arange(LANES * F).reshape(LANES, F)
+        assert np.array_equal(lane, t & 127)
+        old = np.broadcast_to(np.arange(LANES).reshape(-1, 1), (LANES, F))
+        assert np.array_equal(dispatch._bulk_lane_tile(F, False), old)
+        out = torch.arange(C * LANES * F * 4, dtype=torch.float32).reshape(C * LANES, F, 4)
+        assert torch.equal(dispatch._bulk_result([out, out + 1], F, 10, True), out.reshape(-1)[:10])
+        assert dispatch._bulk_final_order("threefry_bulk32_normal")
+        assert not dispatch._bulk_final_order("threefry_bulk16_normal")
+        assert not dispatch._bulk_final_order("threefry_bulk_uniform")
 
     @pytest.mark.parametrize("n", [1, 16_384, 1_048_576, 4_194_304])
     def test_one_launch_up_to_4m(self, monkeypatch, n):
@@ -252,6 +300,7 @@ class TestBulkMatchesReference:
         monkeypatch.setattr(dispatch, "_get_dispatch_path", lambda: "native")
         monkeypatch.setattr(dispatch, "_h2d", nat.to_device)
         monkeypatch.setattr(dispatch, "_d2h", nat.to_host)
+        monkeypatch.setattr(dispatch, "_device_lane_tiles", {})
         F, C, _ = dispatch._bulk_plan(n)
         shapes = []
 

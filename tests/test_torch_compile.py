@@ -263,6 +263,7 @@ def nki_native(monkeypatch):
     monkeypatch.setattr(dispatch, "_get_native_ops", lambda: _FAKE_OPS)
     monkeypatch.setattr(dispatch, "_h2d", lambda t: t.clone())
     monkeypatch.setattr(dispatch, "_d2h", lambda t: t.clone())
+    monkeypatch.setattr(dispatch, "_device_lane_tiles", {})
     monkeypatch.delenv("TRNRAND_BULK_STREAMING", raising=False)
     monkeypatch.delenv("TRNRAND_BULK_KERNEL", raising=False)
     monkeypatch.delenv("TRNRAND_LIMB_BITS", raising=False)

@@ -7,6 +7,32 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+#### Faster full-word bulk Threefry kernels and host path on Trn2 (#60)
+
+Output stays bit-identical: every value, at every seed and `counter_offset`,
+matches the 8-bit kernels (`test_limb_variants_bit_identical`, on Trn2).
+
+- A Trn2 profile of `normal(4M)` showed the device time was GpSimd integer
+  adds (~2/3) plus Vector rotate/xor. Vector instructions issued while a
+  GpSimd add runs stretch to the add's length, because the two engines share
+  the SBUF port, so double-buffering the engines cannot help.
+- The full-word kernels (`TRNRAND_LIMB_BITS=32`, the native default) now use
+  both physical cores of an LNC=2 logical core. A gridless NKI kernel at
+  LNC=2 used to run in full on both cores. The work is split by
+  `program_id`: whole chunks per core when the chunk count is even,
+  otherwise half the columns.
+- Chunk-invariant key-injection adds are hoisted, and the u24 → uniform
+  conversion is one fused `tensor_scalar`.
+- The full-word kernels write their output in per-tile order, shape
+  `(C·P, F, 4)`, so the host reorder (`_bulk_tile_order`) is gone for them.
+  The 8/16-bit kernels keep their layout.
+- Native host path: one packed host→device copy per call instead of six.
+  The eager bulk path caches the lane tile on the device, and
+  `normal`/`uniform` apply `* std + mean` in place, which avoids two
+  out-of-place n-element CPU passes (~9 ms at 4M).
+
 ## [0.8.0] - 2026-10-28
 
 Validated on Trn2 (trn2.3xlarge, Neuron SDK 2.33.0, native TorchNeuron device) — see trnsci/trnsci#35.
