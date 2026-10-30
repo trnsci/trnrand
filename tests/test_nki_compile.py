@@ -78,3 +78,20 @@ def test_kernel_mlir_verifies(kernel_name, target):
         kernel, *_KERNEL_INPUTS[kernel_name](), target=target, frontend=FrontendKind.TRACER
     )
     result.verify()
+
+
+# Full-word kernels split work across the two physical cores of an LNC=2
+# logical core (#60): whole chunks per core when C is even, else half the
+# columns of every chunk. Trace both cores and verify every split shape.
+@pytest.mark.parametrize("cols,chunks", [(512, 16), (512, 5), (512, 1), (32, 1), (64, 2)])
+@pytest.mark.parametrize(
+    "kernel_name", ["threefry_bulk32_normal_kernel", "threefry_bulk32_uniform_kernel"]
+)
+def test_bulk32_lnc2_mlir_verifies(kernel_name, cols, chunks):
+    from trnrand.nki import dispatch
+
+    kernel = getattr(dispatch, kernel_name)
+    result = source_to_mlir(
+        kernel, *_bulk(cols, chunks), target="trn2", lnc=2, frontend=FrontendKind.TRACER
+    )
+    result.verify()

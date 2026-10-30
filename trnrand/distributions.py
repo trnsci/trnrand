@@ -74,6 +74,17 @@ def _nki_draw(kind: str, gen: Generator, n: int) -> torch.Tensor:
     return _nki_draw_eager(kind, gen, n)
 
 
+def _affine(out: torch.Tensor, scale: float, shift: float) -> torch.Tensor:
+    """out * scale + shift. Eager NKI draws are fresh host tensors, so this runs
+    in place: the same two float32 ops, without allocating two more n-element
+    tensors (out-of-place, this was ~9 ms of a 4M `normal()` on Trn2, #60)."""
+    if _compiling():
+        return out * scale + shift
+    if scale != 1.0:  # x * 1.0 == x exactly
+        out.mul_(scale)
+    return out.add_(shift)
+
+
 def _torch_fill(kind, size, a, b, dtype, generator):
     gen = generator or get_default_generator()
     if _compiling():
@@ -97,7 +108,7 @@ def uniform(
     if _nki_active():
         gen = generator or get_default_generator()
         out = _nki_draw("uniform", gen, math.prod(size))
-        return (out * (high - low) + low).to(dtype).reshape(size)
+        return _affine(out, high - low, low).to(dtype).reshape(size)
     return _torch_fill("uniform", size, low, high, dtype, generator)
 
 
@@ -112,7 +123,7 @@ def normal(
     if _nki_active():
         gen = generator or get_default_generator()
         out = _nki_draw("normal", gen, math.prod(size))
-        return (out * std + mean).to(dtype).reshape(size)
+        return _affine(out, std, mean).to(dtype).reshape(size)
     return _torch_fill("normal", size, mean, std, dtype, generator)
 
 

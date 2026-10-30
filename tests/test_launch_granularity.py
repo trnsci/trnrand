@@ -188,8 +188,9 @@ class TestNativeDeviceResident:
         assert fake_native.launcher.calls == Counter(
             {f"threefry_streaming_{fn}": _ceil(n, PER_STREAM)}
         )
-        # c0 + 4 key words + one (launches, P, 1) start_batch tensor; one copy back.
-        assert fake_native.h2d == 6
+        # c0, 4 key words and the (launches, P, 1) start_batch tensor go over as
+        # one packed copy (`_h2d_packed`); one copy back.
+        assert fake_native.h2d == 1
         assert fake_native.d2h == 1
 
     @pytest.mark.parametrize("n", [1, 513, 16_385, 50_000, 100_000])
