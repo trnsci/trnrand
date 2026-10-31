@@ -599,6 +599,7 @@ class TestPinnedHostOutput:
             return real_empty(*args, **kw)
 
         monkeypatch.setattr(dispatch.torch, "empty", fake_empty)
+        monkeypatch.setattr(dispatch, "_neuron_host_allocator", lambda: True)
         return calls
 
     def test_use_host_cache(self, pins, monkeypatch):
@@ -612,6 +613,13 @@ class TestPinnedHostOutput:
         monkeypatch.delenv("TRNRAND_PINNED_OUTPUT")
         monkeypatch.setattr(dispatch.torch.compiler, "is_compiling", lambda: True)
         assert not dispatch._use_host_cache("cpu", 64 * MiB)
+
+    def test_needs_the_neuron_host_allocator(self, pins, monkeypatch):
+        # A CUDA build with no GPU raises on pin_memory=True: never pin there.
+        monkeypatch.setattr(dispatch, "_neuron_host_allocator", lambda: False)
+        assert not dispatch._use_host_cache("cpu", 64 << 20)
+        dispatch.threefry_normal_nki(262_145, seed=1)
+        assert pins == []
 
     def test_off_the_native_path(self, monkeypatch):
         monkeypatch.setattr(dispatch, "_get_dispatch_path", lambda: "xla")

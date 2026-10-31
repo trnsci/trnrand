@@ -182,6 +182,16 @@ def _pinned_output_enabled() -> bool:
     return value not in ("0", "false", "no", "off")
 
 
+def _neuron_host_allocator() -> bool:
+    """True when `pin_memory=True` would come from the Neuron accelerator's
+    caching host allocator. On a CUDA build with no GPU, pinning raises, so
+    the cache is used only when the current accelerator is Neuron."""
+    acc = getattr(torch, "accelerator", None)
+    if acc is None or not acc.is_available():
+        return False
+    return acc.current_accelerator().type == "neuron"
+
+
 def _use_host_cache(device, nbytes: int) -> bool:
     """True when a CPU result of `nbytes` should come from the caching host
     allocator: native eager path, CPU destination, large enough, not disabled."""
@@ -192,6 +202,7 @@ def _use_host_cache(device, nbytes: int) -> bool:
         and not _use_simulator()
         and _get_dispatch_path() == "native"
         and not torch.compiler.is_compiling()
+        and _neuron_host_allocator()
     )
 
 
