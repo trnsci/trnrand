@@ -37,7 +37,7 @@ from .distributions import (
 from .generator import Generator, get_default_generator, manual_seed
 
 # Backend control
-from .nki import HAS_NKI, get_backend, set_backend
+from .nki import HAS_NKI, get_backend, get_cores, set_backend, set_cores
 
 # Streaming generator program
 from .nki.program import GeneratorProgram
@@ -77,4 +77,7 @@ __all__ = [
     "HAS_NKI",
     "set_backend",
     "get_backend",
+    # Multi-core bulk draws
+    "set_cores",
+    "get_cores",
 ]
