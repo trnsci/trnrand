@@ -583,6 +583,98 @@ def _threefry_limb16_np(c0, c1, k0, k1):
     return [w[0] | (w[1] << np.uint64(16)) for w in x]
 
 
+class TestPinnedHostOutput:
+    """Host results through the caching host allocator (trnblas#61): same bits, faster."""
+
+    @pytest.fixture
+    def pins(self, native, monkeypatch):
+        """Record pinned allocations (a CPU-only host has no accelerator to pin for)."""
+        monkeypatch.delenv("TRNRAND_PINNED_OUTPUT", raising=False)
+        calls = []
+        real_empty = torch.empty
+
+        def fake_empty(*args, pin_memory=False, **kw):
+            if pin_memory:
+                calls.append(args[0])
+            return real_empty(*args, **kw)
+
+        monkeypatch.setattr(dispatch.torch, "empty", fake_empty)
+        return calls
+
+    def test_use_host_cache(self, pins, monkeypatch):
+        MiB = 1 << 20
+        assert dispatch._use_host_cache("cpu", MiB)
+        assert not dispatch._use_host_cache("cpu", MiB - 1)
+        assert not dispatch._use_host_cache("meta", 64 * MiB)
+        for value in ("0", "false", "off", "no"):
+            monkeypatch.setenv("TRNRAND_PINNED_OUTPUT", value)
+            assert not dispatch._use_host_cache("cpu", 64 * MiB)
+        monkeypatch.delenv("TRNRAND_PINNED_OUTPUT")
+        monkeypatch.setattr(dispatch.torch.compiler, "is_compiling", lambda: True)
+        assert not dispatch._use_host_cache("cpu", 64 * MiB)
+
+    def test_off_the_native_path(self, monkeypatch):
+        monkeypatch.setattr(dispatch, "_get_dispatch_path", lambda: "xla")
+        monkeypatch.setattr(dispatch, "_use_simulator", lambda: False)
+        assert not dispatch._use_host_cache("cpu", 64 << 20)
+        monkeypatch.setattr(dispatch, "_get_dispatch_path", lambda: "native")
+        monkeypatch.setattr(dispatch, "_use_simulator", lambda: True)
+        assert not dispatch._use_host_cache("cpu", 64 << 20)
+
+    @pytest.mark.parametrize("normal", [True, False])
+    @pytest.mark.parametrize("cores", [1, 3])
+    def test_bulk_gather_is_pinned_and_bit_identical(self, pins, monkeypatch, normal, cores):
+        n = 262_145  # just over 1 MiB of float32
+        monkeypatch.setattr(dispatch, "_visible_cores", lambda: 4)
+        monkeypatch.setenv("TRNRAND_CORES_MIN_ELEMENTS", "0")
+        dispatch.set_cores(cores)
+        try:
+            fn = dispatch.threefry_normal_nki if normal else dispatch.threefry_uniform_nki
+            got = fn(n, seed=5, counter_offset=3)
+            assert pins == [(n,)]
+            monkeypatch.setenv("TRNRAND_PINNED_OUTPUT", "0")
+            off = fn(n, seed=5, counter_offset=3)
+            assert pins == [(n,)]  # unchanged: the escape hatch takes pageable memory
+        finally:
+            dispatch.set_cores(None)
+        assert torch.equal(got.view(torch.int32), off.view(torch.int32))
+        assert torch.equal(got, _reference(n, 5, 3, normal))
+
+    def test_small_draws_stay_pageable(self, pins):
+        dispatch.threefry_normal_nki(100_003, seed=1)
+        assert pins == []
+
+    def test_results_never_alias(self, pins):
+        a = dispatch.threefry_uniform_nki(262_145, seed=1)
+        b = dispatch.threefry_uniform_nki(262_145, seed=1)
+        assert a.data_ptr() != b.data_ptr() and torch.equal(a, b)
+
+    def test_to_host(self, pins):
+        t = torch.randn(512, 1024)
+        assert dispatch._to_host(t) is t  # already on the host
+        assert pins == []
+
+
+class TestUniformAffine:
+    """`uniform()` skips the `+ 0.0` pass only where it is the identity bit for bit."""
+
+    @pytest.mark.parametrize("scale", [1.0, 0.5, 3.0, 2.0**-30])
+    def test_skip_matches_add(self, scale):
+        u = torch.arange(0, 2**24, 997, dtype=torch.float32) * 2.0**-24  # kernel values k·2^-24
+        want = u * scale + 0.0
+        got = distributions._affine(u.clone(), scale, 0.0, nonneg=True)
+        assert torch.equal(got.view(torch.int32), want.view(torch.int32))
+
+    def test_negative_scale_still_adds(self):
+        # +0.0 · -1 = -0.0, and -0.0 + 0.0 = +0.0: the add is kept.
+        got = distributions._affine(torch.zeros(4), -1.0, 0.0, nonneg=True)
+        assert torch.equal(got.view(torch.int32), torch.zeros(4).view(torch.int32))
+
+    def test_shift_applied(self):
+        got = distributions._affine(torch.full((4,), 0.5), 2.0, -1.0, nonneg=True)
+        assert torch.equal(got, torch.zeros(4))
+
+
 class TestLimb16Arithmetic:
     @pytest.mark.parametrize("seed", [0, 12345, 2**40 + 3, 2**48 - 1])
     @pytest.mark.parametrize("offset", [0, 2**24 - 5, 2**24 - 1])

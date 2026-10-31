@@ -158,6 +158,61 @@ def _get_native_ops() -> dict:
     return _native_ops
 
 
+# ── Host results through the caching host allocator ─────────────────────────
+#
+# Same fix as trnblas#61/#64. On Trn2 (SDK 2.33, native TorchNeuron), a
+# device→host copy into fresh pageable memory (`.cpu()`, `torch.empty` +
+# `copy_`) runs at ~4 GB/s, because the host page-faults every page it
+# touches. A copy into memory that is already faulted in runs at the link
+# rate, 13-14 GB/s. `torch.empty(..., pin_memory=True)` comes from the
+# accelerator's caching host allocator: each call still returns a fresh tensor
+# (a block is recycled only after the tensor that owned it is freed, so results
+# never alias), and recycled blocks come back already faulted in.
+#
+# Costs: blocks are rounded up to a power of two, and freed blocks stay cached
+# until `torch.accelerator.empty_host_cache()`. TRNRAND_PINNED_OUTPUT=0 turns
+# this off (plain pageable memory). Results under `_PINNED_OUTPUT_MIN_BYTES`
+# always use pageable memory. The XLA path, the simulator and torch.compile
+# tracing are unchanged. The values are the same bits either way.
+_PINNED_OUTPUT_MIN_BYTES = 1 << 20
+
+
+def _pinned_output_enabled() -> bool:
+    value = os.environ.get("TRNRAND_PINNED_OUTPUT", "1").strip().lower()
+    return value not in ("0", "false", "no", "off")
+
+
+def _use_host_cache(device, nbytes: int) -> bool:
+    """True when a CPU result of `nbytes` should come from the caching host
+    allocator: native eager path, CPU destination, large enough, not disabled."""
+    return (
+        torch.device(device).type == "cpu"
+        and nbytes >= _PINNED_OUTPUT_MIN_BYTES
+        and _pinned_output_enabled()
+        and not _use_simulator()
+        and _get_dispatch_path() == "native"
+        and not torch.compiler.is_compiling()
+    )
+
+
+def _host_empty(shape, dtype: torch.dtype, device="cpu") -> torch.Tensor:
+    """`torch.empty(shape, dtype=dtype, device=device)`; a large CPU tensor on the
+    native path comes from the caching host allocator (fresh, already faulted in)."""
+    shape = tuple(shape)
+    nbytes = math.prod(shape) * torch.empty((), dtype=dtype).element_size()
+    if _use_host_cache(device, nbytes):
+        return torch.empty(shape, dtype=dtype, pin_memory=True)
+    return torch.empty(shape, dtype=dtype, device=device)
+
+
+def _to_host(t: torch.Tensor, device="cpu") -> torch.Tensor:
+    """`t.to(device)`. A large device → CPU copy lands in a fresh tensor from
+    the caching host allocator, about 3x faster than `.cpu()` (trnblas#61)."""
+    if t.device.type == "cpu" or not _use_host_cache(device, t.numel() * t.element_size()):
+        return t.to(device)
+    return _host_empty(t.shape, t.dtype, device).copy_(t)
+
+
 def _launch(kernel, op_name: str, *tensors: torch.Tensor) -> torch.Tensor:
     """Run one kernel launch on the Neuron device and return the host result.
 
@@ -167,7 +222,7 @@ def _launch(kernel, op_name: str, *tensors: torch.Tensor) -> torch.Tensor:
     if _get_dispatch_path() == "native":
         orig = tensors[0].device
         op = _get_native_ops()[op_name]
-        return op(*(t.to(_NEURON_DEVICE) for t in tensors)).to(orig)
+        return _to_host(op(*(t.to(_NEURON_DEVICE) for t in tensors)), orig)
     xs, orig = _to_xla(*tensors)
     return kernel(*xs).to(orig)
 
@@ -3262,8 +3317,9 @@ def _h2d(t: torch.Tensor, device: str | None = None) -> torch.Tensor:
 
 
 def _d2h(t: torch.Tensor) -> torch.Tensor:
-    """Neuron device → host copy (one hook so tests can count copies)."""
-    return t.cpu()
+    """Neuron device → host copy (one hook so tests can count copies); large
+    results land in cached host memory (`_to_host`)."""
+    return _to_host(t)
 
 
 def _d2h_into(dst: torch.Tensor, src: torch.Tensor) -> None:
@@ -3483,7 +3539,9 @@ def _bulk_parts(normal, n_elements, seed, counter_offset, parts, devices):
     for a, m, op_name, F, final, n_launches, c0_d, sb_d, k_d in staged:
         op = _get_native_ops()[op_name]
         pending.append((a, m, F, final, [op(c0_d, sb_d[i], *k_d) for i in range(n_launches)]))
-    out = torch.empty(n_elements, dtype=torch.float32)
+    # Already-faulted-in cached host memory: the copies below run at the link
+    # rate instead of the host page-fault rate (`_host_empty`).
+    out = _host_empty((n_elements,), torch.float32)
     for a, m, F, final, outs_d in pending:
         if not final:  # 8/16-bit kernels: reorder on the host
             stacked = outs_d[0].unsqueeze(0) if len(outs_d) == 1 else torch.stack(outs_d)
