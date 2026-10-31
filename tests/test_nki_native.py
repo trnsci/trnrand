@@ -170,3 +170,55 @@ class TestNativeDispatch:
             gen.new_program().uniform(n // P, out="u").build().stream_into({"u": buf})
             parts.append(buf)
         assert torch.equal(torch.cat(parts), full)
+
+
+class TestMultiCore:
+    """Bulk draws split over logical NeuronCores (#60): bit-identical for every core count.
+
+    Needs at least two visible logical cores (e.g. NEURON_RT_VISIBLE_CORES=0-3)."""
+
+    @pytest.fixture(autouse=True)
+    def _cores(self, monkeypatch):
+        from trnrand.nki import dispatch
+
+        if dispatch._visible_cores() < 2:
+            pytest.skip("needs >= 2 visible logical NeuronCores")
+        monkeypatch.setenv("TRNRAND_CORES_MIN_ELEMENTS", "0")
+        yield
+        dispatch.set_cores(None)
+
+    @pytest.mark.parametrize("bits", ["32", "8"])
+    @pytest.mark.parametrize(
+        "n,seed,offset",
+        [
+            (1, 0, 0),
+            (1_048_577, 2**40 + 3, 7),
+            (4_194_305, 9, 2**24 - 40),
+            (16_777_216, 12345, 2**24 - 3000),
+        ],
+    )
+    def test_bit_identical_across_core_counts(self, monkeypatch, bits, n, seed, offset):
+        from trnrand.nki import dispatch
+
+        if bits == "8" and n > 4_194_305:
+            pytest.skip("8-bit kernels are slow; 4M covers them")
+        monkeypatch.setenv("TRNRAND_LIMB_BITS", bits)
+        vis = dispatch._visible_cores()
+        for fn in (dispatch.threefry_normal_nki, dispatch.threefry_uniform_nki):
+            dispatch.set_cores(1)
+            want = fn(n, seed=seed, counter_offset=offset)
+            for k in sorted({2, 3, vis}):
+                if k > vis:
+                    continue
+                dispatch.set_cores(k)
+                assert torch.equal(fn(n, seed=seed, counter_offset=offset), want), k
+
+    def test_public_api(self):
+        import trnrand
+
+        n = 4_194_304 + 513
+        trnrand.set_cores(1)
+        a = trnrand.normal(n, mean=1.0, std=3.0, generator=trnrand.Generator(seed=5))
+        trnrand.set_cores("auto")
+        b = trnrand.normal(n, mean=1.0, std=3.0, generator=trnrand.Generator(seed=5))
+        assert torch.equal(a, b)

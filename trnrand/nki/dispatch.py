@@ -3256,9 +3256,9 @@ def _threefry_normal_per_tile(
     return result.float()[:n_elements]
 
 
-def _h2d(t: torch.Tensor) -> torch.Tensor:
+def _h2d(t: torch.Tensor, device: str | None = None) -> torch.Tensor:
     """Host → Neuron device copy (one hook so tests can count copies)."""
-    return t.to(_NEURON_DEVICE)
+    return t.to(device or _NEURON_DEVICE)
 
 
 def _d2h(t: torch.Tensor) -> torch.Tensor:
@@ -3266,27 +3266,16 @@ def _d2h(t: torch.Tensor) -> torch.Tensor:
     return t.cpu()
 
 
-def _bulk_launches(normal: bool, n_elements, seed, counter_offset):
-    """Run the bulk Threefry kernel; return host values in per-tile order (#60).
+def _d2h_into(dst: torch.Tensor, src: torch.Tensor) -> None:
+    """Neuron device → preallocated host slice (the multi-core gather, one hook for tests)."""
+    dst.copy_(src)
 
-    One launch covers up to _BULK_CHUNKS_MAX × _BULK_COLS_MAX batches
-    (16 × 512 × 512 = 4,194,304 values at the defaults), so `normal(4M)` is
-    one launch instead of 256. Chunk c of launch L starts at batch
-    (counter_offset + (L·C + c)·F) & 0xFFFFFF, and column j of it is batch
-    (start + j) & 0xFFFFFF: the same counter for every element as the
-    per-tile and streaming paths, so the values are bit-identical.
 
-    Native path: the (P, F) lane tile, key words and every launch's (P, C)
-    start tile go to the device in one packed copy, and the outputs come back
-    in one device→host copy. The full-word kernels write per-tile order
-    themselves, so their output is only flattened; the 8/16-bit kernels'
-    output is reordered on the host (`_bulk_tile_order`).
-    """
+def _bulk_host_inputs(normal: bool, n_elements, seed, counter_offset):
+    """Host (numpy) inputs of the bulk kernels for one request: plan, op and tiles."""
     LANES = _THREEFRY_LANES
     F, C, n_launches = _bulk_plan(n_elements)
     op_name = _bulk_op_name(normal)
-    kernel_name = op_name + "_kernel"
-
     k0_val = seed & 0xFFFFFF
     k1_val = (seed >> 24) & 0xFFFFFF
     final = _bulk_final_order(op_name)
@@ -3301,23 +3290,212 @@ def _bulk_launches(normal: bool, n_elements, seed, counter_offset):
     sb_np = np.ascontiguousarray(
         np.broadcast_to(starts.astype(np.int32).reshape(n_launches, 1, C), (n_launches, LANES, C))
     )
+    return op_name, F, n_launches, final, c0_np, sb_np, k_np
 
-    if _use_simulator():
-        sim = nki.simulate(_kernel(kernel_name))
-        outs = [
-            torch.from_numpy(np.asarray(sim(c0_np, sb_np[i], *k_np))) for i in range(n_launches)
-        ]
-    else:
-        outs = _native_launches(
-            op_name,
-            n_launches,
+
+def _bulk_launches(normal: bool, n_elements, seed, counter_offset):
+    """Run the bulk Threefry kernel; return host values in per-tile order (#60).
+
+    One launch covers up to _BULK_CHUNKS_MAX × _BULK_COLS_MAX batches
+    (16 × 512 × 512 = 4,194,304 values at the defaults), so `normal(4M)` is
+    one launch instead of 256. Chunk c of launch L starts at batch
+    (counter_offset + (L·C + c)·F) & 0xFFFFFF, and column j of it is batch
+    (start + j) & 0xFFFFFF: the same counter for every element as the
+    per-tile and streaming paths, so the values are bit-identical.
+
+    Native path (`_bulk_launches_native`): the (P, F) lane tile, key words and
+    every launch's (P, C) start tile go to the device in one packed copy, and
+    each launch's output is copied straight into its slice of one host tensor.
+    The full-word kernels write per-tile order themselves, so their output is
+    only flattened; the 8/16-bit kernels' output is reordered on the host
+    (`_bulk_tile_order`). With more than one core requested (`set_cores` /
+    TRNRAND_CORES) and a large enough request, the batch range is also split
+    across logical cores; the values are the same.
+    """
+    if not _use_simulator():
+        return _bulk_launches_native(
+            normal, n_elements, seed, counter_offset, _plan_cores(n_elements)
+        )
+    op_name, F, n_launches, final, c0_np, sb_np, k_np = _bulk_host_inputs(
+        normal, n_elements, seed, counter_offset
+    )
+    sim = nki.simulate(_kernel(op_name + "_kernel"))
+    outs = [torch.from_numpy(np.asarray(sim(c0_np, sb_np[i], *k_np))) for i in range(n_launches)]
+    return _bulk_result(outs, F, n_elements, final)
+
+
+# ── Multi-core bulk draws (#60) ──────────────────────────────────────────────
+#
+# Threefry is counter-based, so a request's batch range splits across logical
+# NeuronCores the same way `Generator(partition_rank=r, partition_size=P)`
+# splits it across chips: core r draws the contiguous batches
+# [counter_offset + b_r, counter_offset + b_{r+1}), and its output, in per-tile
+# order, is exactly elements [512·b_r, 512·b_{r+1}) of the single-core stream.
+# Every core's launches are queued before any result is read back (TorchNeuron
+# launches are asynchronous), and the parts are copied into one preallocated
+# host tensor in order. Values never depend on the core count.
+#
+# Off by default. TRNRAND_CORES=<n>|auto, or `set_cores(n)`, opts in; requests
+# smaller than TRNRAND_CORES_MIN_ELEMENTS stay on one core. Measured on Trn2
+# (#60): the kernels scale from 2M values (4M: 2.8 -> 1.6 ms on 2 cores), but
+# the result goes to the host, where the device→host copy and page faults do not
+# scale with cores; end to end, splitting only wins from about 8M values
+# (8M: ~20 -> ~18 ms; 4M: 7 -> 8-10 ms, a loss).
+
+_CORES_MIN_ELEMENTS_DEFAULT = 8 * 2**20
+_cores_override: int | str | None = None
+
+
+def _parse_cores(value) -> int | str:
+    if isinstance(value, str):
+        v = value.strip().lower()
+        if v in ("auto", "all"):
+            return "auto"
+        value = int(v)
+    if isinstance(value, bool) or not isinstance(value, int) or value < 1:
+        raise ValueError(f"cores must be a positive int or 'auto'; got {value!r}")
+    return value
+
+
+def set_cores(cores: int | str | None) -> None:
+    """Spread large native-path `uniform`/`normal` draws over `cores` logical NeuronCores.
+
+    `cores` is a positive int, ``"auto"`` (every visible core), or None to go
+    back to the ``TRNRAND_CORES`` environment setting (default 1). The values
+    are bit-identical for every core count; only the work is split. Requests
+    under ``TRNRAND_CORES_MIN_ELEMENTS`` (default 8,388,608) stay on one core.
+    The cores are the logical devices ``neuron:0..`` visible to the process
+    (``NEURON_RT_VISIBLE_CORES``), starting at the current device.
+    """
+    global _cores_override
+    _cores_override = None if cores is None else _parse_cores(cores)
+
+
+def _visible_cores() -> int:
+    """Logical NeuronCores visible to this process on the native path, else 1."""
+    if _use_simulator() or _get_dispatch_path() != "native":
+        return 1
+    try:
+        return max(1, int(torch.neuron.device_count()))
+    except Exception:
+        return 1
+
+
+def get_cores() -> int:
+    """Logical cores a large native bulk draw is spread over (see `set_cores`)."""
+    req = _cores_override
+    if req is None:
+        env = os.environ.get("TRNRAND_CORES", "").strip()
+        req = _parse_cores(env) if env else 1
+    vis = _visible_cores()
+    return vis if req == "auto" else min(req, vis)
+
+
+def _cores_min_elements() -> int:
+    env = os.environ.get("TRNRAND_CORES_MIN_ELEMENTS", "").strip()
+    return int(env) if env else _CORES_MIN_ELEMENTS_DEFAULT
+
+
+def _plan_cores(n_elements: int) -> int:
+    """Logical cores for one bulk request: 1 unless opted in and over the threshold."""
+    if _use_simulator() or _get_dispatch_path() != "native":
+        return 1
+    if n_elements < _cores_min_elements():
+        return 1
+    return get_cores()
+
+
+def _core_split(n_elements: int, cores: int) -> list[tuple[int, int]]:
+    """Split a request into per-core (first batch, n values) parts, in stream order.
+
+    Parts are whole (P, F) chunks of _BULK_COLS_MAX batches when there are at
+    least `cores` of them (so each core runs a full-width plan), else whole
+    batches. Every part but the last is a whole number of batches, so the parts
+    concatenate to the single-core stream. May return fewer than `cores` parts.
+    """
+    per_batch = _THREEFRY_LANES * 4
+    n_batches = max(1, -(-int(n_elements) // per_batch))
+    unit = _BULK_COLS_MAX if n_batches >= cores * _BULK_COLS_MAX else 1
+    units = -(-n_batches // unit)
+    per = -(-units // cores) * unit  # batches per core
+    parts, b = [], 0
+    while b < n_batches:
+        nb = min(per, n_batches - b)
+        parts.append((b, min(nb * per_batch, n_elements - b * per_batch)))
+        b += nb
+    return parts
+
+
+def _core_devices(k: int) -> list[str]:
+    """Device names of `k` logical cores, starting at the current device."""
+    vis = _visible_cores()
+    base = _current_core() or 0
+    return [f"{_NEURON_DEVICE}:{(base + i) % vis}" for i in range(k)]
+
+
+def _bulk_launches_native(normal: bool, n_elements, seed, counter_offset, cores: int = 1):
+    """Native bulk draw on `cores` logical cores; host values in per-tile order (#60).
+
+    Same values as the single-core path, element for element (see `_core_split`).
+    Three phases, so the cores run together: every core's inputs go to its
+    device (one packed copy each), then every launch is queued (TorchNeuron
+    launches are asynchronous), then each launch's output is copied into its
+    slice of one preallocated host tensor. The inputs are all copied before any
+    launch because a host→device copy waits for work already queued.
+    Copying each launch's output into place also replaces the old device-side
+    stack and host-side concatenation of multi-launch draws (one full copy).
+    """
+    parts = _core_split(n_elements, cores)
+    # Explicit device names, also for one core: "neuron" means the current
+    # device, which can change between calls, and the lane-tile cache is per device.
+    devices = _core_devices(len(parts))
+    # Touching other devices can move TorchNeuron's current device; put it back.
+    base = _current_core()
+    try:
+        return _bulk_parts(normal, n_elements, seed, counter_offset, parts, devices)
+    finally:
+        if base is not None and _current_core() != base:
+            torch.neuron.set_device(base)
+
+
+def _current_core() -> int | None:
+    try:
+        return int(torch.neuron.current_device())
+    except Exception:
+        return None
+
+
+def _bulk_parts(normal, n_elements, seed, counter_offset, parts, devices):
+    staged = []
+    for (b, m), dev in zip(parts, devices, strict=True):
+        op_name, F, n_launches, final, c0_np, sb_np, k_np = _bulk_host_inputs(
+            normal, m, seed, counter_offset + b
+        )
+        c0_d, sb_d, k_d = _h2d_packed(
             torch.from_numpy(c0_np),
             torch.from_numpy(sb_np),
             [torch.from_numpy(a) for a in k_np],
-            c0_key=(F, final),
+            c0_key=(F, final, dev),
+            device=dev,
         )
-
-    return _bulk_result(outs, F, n_elements, final)
+        staged.append((b * _THREEFRY_LANES * 4, m, op_name, F, final, n_launches, c0_d, sb_d, k_d))
+    pending = []
+    for a, m, op_name, F, final, n_launches, c0_d, sb_d, k_d in staged:
+        op = _get_native_ops()[op_name]
+        pending.append((a, m, F, final, [op(c0_d, sb_d[i], *k_d) for i in range(n_launches)]))
+    out = torch.empty(n_elements, dtype=torch.float32)
+    for a, m, F, final, outs_d in pending:
+        if not final:  # 8/16-bit kernels: reorder on the host
+            stacked = outs_d[0].unsqueeze(0) if len(outs_d) == 1 else torch.stack(outs_d)
+            out[a : a + m] = _bulk_result(list(_d2h(stacked).unbind(0)), F, m, False)
+            continue
+        off, end = a, a + m
+        for o in outs_d:  # each launch is the next contiguous run of the part
+            o = o.reshape(-1)
+            take = min(o.numel(), end - off)
+            _d2h_into(out[off : off + take], o[:take])
+            off += take
+    return out
 
 
 def _bulk_op_name(normal: bool) -> str:
@@ -3432,7 +3610,7 @@ def _stream_launches(kernel_name: str, op_name: str, n_elements, seed, counter_o
 _device_lane_tiles: dict = {}
 
 
-def _h2d_packed(c0, sb, k, c0_key=None):
+def _h2d_packed(c0, sb, k, c0_key=None, device=None):
     """Copy the kernel inputs to the device in ONE transfer.
 
     Each host→device copy has a fixed cost on Trn2 (0.05-0.2 ms measured for
@@ -3443,7 +3621,8 @@ def _h2d_packed(c0, sb, k, c0_key=None):
     """
     cached = _device_lane_tiles.get(c0_key) if c0_key is not None else None
     parts = [*k, sb] if cached is not None else [*k, sb, c0]
-    flat_d = _h2d(torch.cat([t.reshape(-1).to(torch.int32) for t in parts]))
+    flat = torch.cat([t.reshape(-1).to(torch.int32) for t in parts])
+    flat_d = _h2d(flat) if device is None else _h2d(flat, device)
     views, off = [], 0
     for t in parts:
         views.append(flat_d[off : off + t.numel()].view(t.shape))

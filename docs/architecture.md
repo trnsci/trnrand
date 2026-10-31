@@ -57,6 +57,35 @@ uniform stream:
   trig calls but uses rejection sampling, which serializes branch-divergent
   lanes and kills SIMD throughput. Box-Muller has constant work per pair.
 
+## Multi-core bulk draws (Trn2, opt-in)
+
+On the native TorchNeuron path, a large `uniform()` / `normal()` (and anything
+built on them) can be spread over several logical NeuronCores of one chip:
+
+```python
+import trnrand
+trnrand.set_cores("auto")      # or an int; or TRNRAND_CORES=auto|<n>
+x = trnrand.normal(64 * 2**20)  # same values as on one core
+```
+
+- The batch range is split the same way `Generator(partition_rank=r,
+  partition_size=P)` splits it across chips: core r draws one contiguous run
+  of batches, and its output is that run of the single-core stream. The parts
+  are copied into one host tensor in order, so the output is bit-identical for
+  every core count (`tests/test_bulk_kernel.py::TestMultiCore`, and on
+  hardware `tests/test_nki_native.py::TestMultiCore`).
+- The cores are the logical devices `neuron:0..` visible to the process
+  (`NEURON_RT_VISIBLE_CORES`), starting at the current device.
+- Requests under `TRNRAND_CORES_MIN_ELEMENTS` (default 8,388,608) stay on one
+  core. The kernels scale from about 2M values, but the result goes to the
+  host, and the device-to-host copy and host page faults do not get faster
+  with more cores. End to end, splitting only pays off from about 8M values.
+- Measured on trn2.3xlarge (#60): kernel time at 64M values is 36 ms on one
+  core, 19 ms on two and 12 ms on four. End to end to the host it is about
+  136, 126 and 120 ms. For large host draws, `THP_MEM_ALLOC_ENABLE=1`
+  (transparent huge pages for PyTorch CPU allocations) cuts the page-fault
+  share: 64M on four cores goes from about 120 to 71 ms.
+
 ## Known gaps
 
 - **NKI Philox and Box-Muller kernels await validation.** Both landed in

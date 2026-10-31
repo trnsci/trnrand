@@ -7,6 +7,34 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+#### Multi-core bulk `uniform()` / `normal()` on one Trn2 chip (#60)
+
+- `trnrand.set_cores(n | "auto" | None)` / `trnrand.get_cores()`, and the
+  `TRNRAND_CORES` environment setting, spread large native-path bulk draws
+  over several logical NeuronCores. Off by default.
+- The counter range is split as the partitioned generators split it across
+  chips: one contiguous run of batches per core, gathered into one host tensor
+  in the original order. Output is bit-identical for every core count (CPU
+  tests, plus 1/2/3/4 cores on Trn2 at up to 16M values, 8- and 32-bit kernels).
+- Requests under `TRNRAND_CORES_MIN_ELEMENTS` (default 8,388,608, measured)
+  stay on one core.
+- Kernel time at 64M values: 36 ms on one core, 19 ms on two, 12 ms on four.
+  End to end to the host the gain is small (about 136 to 120 ms at 64M),
+  because the device→host copy and host page faults do not scale with cores.
+
+### Changed
+
+- Native bulk draws copy each launch's output straight into a preallocated
+  host tensor. This replaces the device-side stack and host concatenation of
+  multi-launch draws. Single-core end to end: 16M values 48 → 32 ms, 64M
+  200 → 121 ms. Values are unchanged.
+- The eager bulk path names the device explicitly and caches the lane tile
+  per device. `torch.neuron.synchronize(i)` makes device i current. Before,
+  if the current device changed between draws, the cached tile stayed on the
+  old device and the launch failed ("Inconsistent device IDs").
+
 ## [0.9.0] - 2026-10-30
 
 Native TorchNeuron dispatch (Trn2/Trn3) alongside the PyTorch/XLA path (Trn1, maintenance); validated on Trn2 (trn2.3xlarge, Neuron SDK 2.33.0) — see trnsci/trnsci#35.

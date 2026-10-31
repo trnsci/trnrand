@@ -142,6 +142,8 @@ class _FakeNative:
         self.calls = Counter()
         self.h2d = 0
         self.d2h = 0
+        self.devices = []
+        self.into = []
 
     def ops(self):
         def counted(name, fn):
@@ -159,13 +161,19 @@ class _FakeNative:
                 ops[name] = counted(name, fake(normal))
         return ops
 
-    def to_device(self, t):
+    def to_device(self, t, device=None):
         self.h2d += 1
+        self.devices.append(device)
         return t.clone()
 
     def to_host(self, t):
         self.d2h += 1
         return t.clone()
+
+    def to_host_into(self, dst, src):
+        self.d2h += 1
+        self.into.append(dst.numel())
+        dst.copy_(src)
 
 
 @pytest.fixture
@@ -176,6 +184,7 @@ def native(monkeypatch):
     monkeypatch.setattr(dispatch, "_get_native_ops", nat.ops)
     monkeypatch.setattr(dispatch, "_h2d", nat.to_device)
     monkeypatch.setattr(dispatch, "_d2h", nat.to_host)
+    monkeypatch.setattr(dispatch, "_d2h_into", nat.to_host_into)
     monkeypatch.setattr(dispatch, "_device_lane_tiles", {})
     monkeypatch.delenv("TRNRAND_BULK_STREAMING", raising=False)
     monkeypatch.delenv("TRNRAND_BULK_KERNEL", raising=False)
@@ -264,14 +273,17 @@ class TestBulkMatchesReference:
         got = dispatch.threefry_normal_nki(n, seed=99, counter_offset=2**24 - 40)
         assert torch.equal(got, _reference(n, 99, 2**24 - 40, True))
         assert native.calls["threefry_bulk32_normal"] == L  # default width
-        assert native.h2d == 1 and native.d2h == 1  # one packed copy each way
+        # One packed copy in; each launch's output copied straight into its slice.
+        assert native.h2d == 1 and native.d2h == L and sum(native.into) == n
 
     def test_lane_tile_cached_on_device(self, native, monkeypatch):
         # The eager path copies the (P, F) lane tile once per plan, then only the
         # key words and start tiles (#60 follow-up).
         sizes = []
         to_device = native.to_device
-        monkeypatch.setattr(dispatch, "_h2d", lambda t: (sizes.append(t.numel()), to_device(t))[1])
+        monkeypatch.setattr(
+            dispatch, "_h2d", lambda t, dev=None: (sizes.append(t.numel()), to_device(t, dev))[1]
+        )
         F, C, _ = dispatch._bulk_plan(70_000)
         for seed in (1, 2):
             got = dispatch.threefry_normal_nki(70_000, seed=seed, counter_offset=9)
@@ -385,6 +397,131 @@ class TestLimbVariants:
         assert torch.equal(torch.cat(chunks), full)
         assert native.calls["threefry_bulk_normal"] == 0
         assert native.calls["threefry_bulk16_normal"] > 0
+
+
+class TestMultiCore:
+    """Bulk draws split over logical cores (#60): same values for every core count."""
+
+    @pytest.fixture
+    def cores(self, native, monkeypatch):
+        monkeypatch.setattr(dispatch, "_visible_cores", lambda: 4)
+        monkeypatch.setattr(dispatch, "_cores_override", None)
+        monkeypatch.delenv("TRNRAND_CORES", raising=False)
+        monkeypatch.setenv("TRNRAND_CORES_MIN_ELEMENTS", "0")
+        return native
+
+    @pytest.mark.parametrize(
+        "n,cores,parts",
+        [
+            (1, 4, [(0, 1)]),
+            (512 * 3, 2, [(0, 1024), (2, 512)]),
+            (512 * 3 + 1, 4, [(0, 512), (1, 512), (2, 512), (3, 1)]),
+            (2**22, 4, [(r * 2048, 2**20) for r in range(4)]),  # whole 512-batch chunks
+            # 17 chunks: 5 + 5 + 5 + 2 (the last batch has 5 values)
+            (
+                2**22 + 5,
+                4,
+                [(0, 5 * 2**18), (2560, 5 * 2**18), (5120, 5 * 2**18), (7680, 2**18 + 5)],
+            ),
+        ],
+    )
+    def test_split(self, n, cores, parts):
+        got = dispatch._core_split(n, cores)
+        assert got == parts
+        assert sum(m for _, m in got) == n
+        for (b, m), (b2, _) in zip(got, got[1:], strict=False):
+            assert b2 == b + m // 512 and m % 512 == 0  # whole batches, in stream order
+
+    @pytest.mark.parametrize("bits", ["32", "8"])
+    @pytest.mark.parametrize("normal", [True, False])
+    @pytest.mark.parametrize("n", [1, 513, 100_003, 262_145])
+    def test_bit_identical_across_core_counts(self, cores, monkeypatch, bits, normal, n):
+        monkeypatch.setenv("TRNRAND_LIMB_BITS", bits)
+        monkeypatch.setattr(dispatch, "_BULK_COLS_MAX", 32)  # several chunks per core
+        fn = dispatch.threefry_normal_nki if normal else dispatch.threefry_uniform_nki
+        want = _reference(n, 2**40 + 3, 2**24 - 40, normal)  # crosses the counter wrap
+        for k in (1, 2, 3, 4):
+            dispatch.set_cores(k)
+            got = fn(n, seed=2**40 + 3, counter_offset=2**24 - 40)
+            assert got.dtype == torch.float32 and torch.equal(got, want), k
+
+    def test_one_packed_copy_per_core(self, cores):
+        n = 4 * 512 * 32 + 7
+        dispatch.set_cores(4)
+        got = dispatch.threefry_normal_nki(n, seed=3, counter_offset=11)
+        assert torch.equal(got, _reference(n, 3, 11, True))
+        devs = [f"neuron:{i}" for i in range(4)]
+        assert cores.devices == devs and cores.h2d == 4
+        assert len(cores.into) == 4 and sum(cores.into) == n
+        cores.devices.clear()
+        dispatch.threefry_normal_nki(n, seed=4, counter_offset=0)
+        assert cores.devices == devs  # lane tiles cached per device, still one copy each
+
+    def test_threshold_keeps_small_draws_on_one_core(self, cores, monkeypatch):
+        monkeypatch.setenv("TRNRAND_CORES_MIN_ELEMENTS", "10000")
+        dispatch.set_cores(4)
+        dispatch.threefry_uniform_nki(9_999, seed=1)
+        assert cores.devices == ["neuron:0"] and cores.into == [9_999]  # current device only
+        dispatch.threefry_uniform_nki(10_000, seed=1)
+        assert cores.devices[1:] == ["neuron:0", "neuron:1", "neuron:2", "neuron:3"]
+
+    def test_default_threshold(self, monkeypatch):
+        monkeypatch.delenv("TRNRAND_CORES_MIN_ELEMENTS", raising=False)
+        assert dispatch._cores_min_elements() == dispatch._CORES_MIN_ELEMENTS_DEFAULT
+
+    def test_settings(self, cores, monkeypatch):
+        assert dispatch.get_cores() == 1  # opt-in: default is one core
+        monkeypatch.setenv("TRNRAND_CORES", "2")
+        assert trnrand.get_cores() == 2
+        monkeypatch.setenv("TRNRAND_CORES", "auto")
+        assert trnrand.get_cores() == 4
+        monkeypatch.setenv("TRNRAND_CORES", "16")
+        assert trnrand.get_cores() == 4  # clamped to the visible cores
+        trnrand.set_cores(3)  # the API wins over the environment
+        assert trnrand.get_cores() == 3
+        trnrand.set_cores(None)
+        assert trnrand.get_cores() == 4
+        for bad in (0, -1, "x", 1.5, True):
+            with pytest.raises(ValueError):
+                trnrand.set_cores(bad)
+
+    def test_never_on_xla_or_simulator(self, monkeypatch):
+        monkeypatch.setenv("TRNRAND_CORES", "4")
+        monkeypatch.setenv("TRNRAND_CORES_MIN_ELEMENTS", "0")
+        monkeypatch.setattr(dispatch, "_cores_override", None)
+        monkeypatch.setattr(dispatch, "_use_simulator", lambda: False)
+        monkeypatch.setattr(dispatch, "_get_dispatch_path", lambda: "xla")
+        assert dispatch._plan_cores(2**26) == 1
+        monkeypatch.setattr(dispatch, "_use_simulator", lambda: True)
+        assert dispatch._plan_cores(2**26) == 1
+
+    @pytest.mark.parametrize("fn", ["normal", "uniform"])
+    def test_public_api_and_partitioned_generators(self, cores, monkeypatch, fn):
+        # Core splitting composes with the multi-chip partitioned generators.
+        monkeypatch.setattr(distributions, "_nki_active", lambda: True)
+        monkeypatch.setattr(dispatch, "_BULK_COLS_MAX", 32)
+        n, parts = 512 * 2 * 37, 2
+        dispatch.set_cores(1)
+        full = (
+            getattr(trnrand, fn)(n, mean=0.5, std=2.0, generator=trnrand.Generator(seed=31))
+            if fn == "normal"
+            else getattr(trnrand, fn)(n, low=-1.0, high=3.0, generator=trnrand.Generator(seed=31))
+        )
+        for k in (2, 4):
+            dispatch.set_cores(k)
+            kw = dict(mean=0.5, std=2.0) if fn == "normal" else dict(low=-1.0, high=3.0)
+            assert torch.equal(
+                getattr(trnrand, fn)(n, generator=trnrand.Generator(seed=31), **kw), full
+            )
+            chunks = [
+                getattr(trnrand, fn)(
+                    n // parts,
+                    generator=trnrand.Generator(seed=31, partition_rank=r, partition_size=parts),
+                    **kw,
+                )
+                for r in range(parts)
+            ]
+            assert torch.equal(torch.cat(chunks), full)
 
 
 # numpy port of the 16-bit limb kernel (`_threefry_bulk16_body`), op for op.
