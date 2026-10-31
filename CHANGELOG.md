@@ -7,6 +7,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+#### Host results at the host-link rate (#60)
+
+- On the native TorchNeuron path, large `uniform()` / `normal()` results (1 MiB
+  and up) now land in memory from the accelerator's caching host allocator
+  (`torch.empty(..., pin_memory=True)`), the fix trnblas#64 made for BLAS
+  results. A device-to-host copy into fresh pageable memory runs at about
+  4 GB/s on Trn2 because every page faults; into that memory it runs at
+  13-14 GB/s. Each call still returns a fresh tensor, and the output is
+  bit-identical.
+- `uniform()` with `low=0` skips the `+ 0.0` pass, which is the identity bit
+  for bit on the kernel's non-negative values.
+- Trn2, warm medians, end to end to the host: `normal(64M)` 130 -> 76 ms on one
+  core and 109 -> 55 ms on four (`set_cores(4)`); `uniform(64M)` 126 -> 60 ms
+  and 103 -> 36 ms. Draws of 4M values and fewer are unchanged.
+- `TRNRAND_PINNED_OUTPUT=0` turns it off. Cached blocks are rounded up to a
+  power of two and stay cached until `torch.accelerator.empty_host_cache()`.
+
 ## [0.10.0] - 2026-10-31
 
 Validated on Trn2 (trn2.3xlarge, Neuron SDK 2.33.0, native TorchNeuron) — see trnsci/trnsci#35.

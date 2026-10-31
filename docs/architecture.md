@@ -81,10 +81,14 @@ x = trnrand.normal(64 * 2**20)  # same values as on one core
   host, and the device-to-host copy and host page faults do not get faster
   with more cores. End to end, splitting only pays off from about 8M values.
 - Measured on trn2.3xlarge (#60): kernel time at 64M values is 36 ms on one
-  core, 19 ms on two and 12 ms on four. End to end to the host it is about
-  136, 126 and 120 ms. For large host draws, `THP_MEM_ALLOC_ENABLE=1`
-  (transparent huge pages for PyTorch CPU allocations) cuts the page-fault
-  share: 64M on four cores goes from about 120 to 71 ms.
+  core, 19 ms on two and 12 ms on four. End to end to the host it was about
+  136, 126 and 120 ms, because the device-to-host copy into fresh pageable
+  memory page-faults at about 4 GB/s.
+- The host result now comes from the accelerator's caching host allocator
+  (`torch.empty(..., pin_memory=True)`, as in trnblas#64): a fresh tensor per
+  call, already faulted in, so the copy runs at the 13-14 GB/s link rate.
+  `normal(64M)` end to end is about 76 ms on one core and 55 ms on four.
+  `TRNRAND_PINNED_OUTPUT=0` turns it off.
 
 ## Known gaps
 
