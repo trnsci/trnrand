@@ -20,6 +20,10 @@ from trnrand.generator import _BATCH_SIZE, Generator
 from trnrand.nki.dispatch import threefry_uniform_cpu
 from trnrand.nki.program import GeneratorProgram, ProgramBuilder
 
+# Counter arithmetic only: advance / advance_to on default (key_mode="draw")
+# generators warn that they do not resume the host-keyed stream (#76).
+pytestmark = pytest.mark.filterwarnings("ignore::trnrand.AdvanceWarning")
+
 try:
     from trnrand.nki.dispatch import HAS_NKI as _HAS_NKI
 except ImportError:

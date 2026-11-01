@@ -27,6 +27,28 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - **`latin_hypercube(dtype=torch.float16 / torch.bfloat16)` was not a Latin hypercube** (silent). Affects released versions **0.1.0 through 0.12.1**, on every backend. Each column was computed as `(perm + u) / n` in the output dtype, and the rounding pushed points into the next stratum or onto 1.0. For n = 64, 8 of 20 float16 and all bfloat16 columns had a stratum with two points. Points outside their stratum are now moved back in (all others are bit-identical), and a dtype that cannot hold a point in every stratum (bfloat16 n > 256, float16 n > 2048) raises `ValueError`. float32 / float64 are unchanged (#96).
 
+### Fixed
+
+- **`advance_to(position())` did not resume the stream with the default
+  `key_mode="draw"`** (silent), although the `position()` docstring gave it as
+  the checkpoint / resume recipe. Affects released versions **0.7.0 through
+  0.12.1**, on the NKI path (`set_backend("nki")`, or `"auto"` on Neuron
+  hardware). Each draw-mode NKI draw takes a fresh key from the host
+  `torch.Generator`, and `advance` / `advance_to` move only the Threefry
+  counter, so a resumed generator drew its first key at the advanced counter
+  and returned different values (Trn2: `uniform` and `normal`, n = 512, 1000,
+  4096). The key sequence depends on the number of draws, which the position
+  does not record, so draw mode cannot resume from a position without changing
+  its streams. Instead:
+  - `advance` / `advance_to` with `key_mode="draw"` now emit
+    `trnrand.AdvanceWarning` when they move the counter. They still move it
+    exactly as before, and no stream changes for code that does not call them.
+  - The `position()` / `advance()` / `advance_to()` docstrings now give
+    `get_state()` / `set_state()` (fixed in 0.12.1, #74) as the checkpoint
+    recipe, in both key modes and on both paths, and state that
+    `advance_to(position())` resumes only with `key_mode="counter"`, for the
+    NKI `uniform` / `normal` / `standard_normal` draws (#76).
+
 ## [0.12.1] - 2026-11-01
 
 Validated on Trn2 (trn2.3xlarge, Neuron SDK 2.33.0, native TorchNeuron) — see trnsci/trnsci#35.
