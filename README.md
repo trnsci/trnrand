@@ -55,6 +55,19 @@ device are present, and the XLA path when `torch_xla` is installed; without
 versions installed wheels and can serve stale kernels. See
 [installation](docs/installation.md).
 
+### Known platform issue: NKI trace cache and kernel factories
+
+`import torch_neuronx` turns on the NKI trace cache, and the cache key ignores
+constants captured in a kernel's closure: two `@nki.jit` kernels built by one
+factory, differing only in a captured value, share one trace, and the second
+silently returns the first's results
+([aws-neuron/aws-neuron-sdk#1454](https://github.com/aws-neuron/aws-neuron-sdk/issues/1454)).
+trnrand's kernels do not rely on closure constants (or on module globals that
+can differ between processes): every value that specialises a kernel is a
+kernel argument, and `tests/test_trace_cache_safety.py` enforces this. If you
+write your own NKI kernels with a factory, set `NKI_ENABLE_TRACE_CACHE=0`
+before importing `torch_neuronx`.
+
 ## Usage
 
 ```python
