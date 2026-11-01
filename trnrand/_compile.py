@@ -131,7 +131,7 @@ def nki_draw(gen, kind: str, n_elements: int) -> torch.Tensor:
         n_batches = -(-n_elements // _BATCH_SIZE)
         offset = gen._ctr + gen._partition_rank * n_batches
         out = dispatch.threefry_stream_from_key(kind, n_elements, gen._key_words, offset)
-        gen._ctr.add_(n_batches)
+        gen._ctr.add_(n_batches * gen._partition_size)  # every chip's slice
         return out
     if native:
         state = torch.ops.trnrand.gen_nki_state(gen._compile_token, gen._handle, n_elements)

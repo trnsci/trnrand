@@ -381,7 +381,7 @@ def normal_into(
         streaming_batches = n_launches * _PROGRAM_TILES
         counter_offset = gen._partition_rank * streaming_batches + gen._counter
         raw = threefry_stream_normal(n, seed=seed, counter_offset=counter_offset)
-        gen._counter += streaming_batches
+        gen._counter += streaming_batches * gen._partition_size  # every chip's slice
         if mean != 0.0 or std != 1.0:
             raw = raw * std + mean
         buf.copy_(raw.reshape(buf.shape))
@@ -418,7 +418,7 @@ def uniform_into(
         streaming_batches = n_launches * _PROGRAM_TILES
         counter_offset = gen._partition_rank * streaming_batches + gen._counter
         raw = threefry_stream_uniform(n, seed=seed, counter_offset=counter_offset)
-        gen._counter += streaming_batches
+        gen._counter += streaming_batches * gen._partition_size  # every chip's slice
         if low != 0.0 or high != 1.0:
             raw = raw * (high - low) + low
         buf.copy_(raw.reshape(buf.shape))
@@ -454,7 +454,7 @@ def exponential_into(
         streaming_batches = n_launches * _PROGRAM_TILES
         counter_offset = gen._partition_rank * streaming_batches + gen._counter
         u = threefry_stream_uniform(n, seed=seed, counter_offset=counter_offset)
-        gen._counter += streaming_batches
+        gen._counter += streaming_batches * gen._partition_size  # every chip's slice
         raw = -torch.log(u) / rate
         buf.copy_(raw.reshape(buf.shape))
         return

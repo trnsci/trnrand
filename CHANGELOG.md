@@ -7,6 +7,38 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- **Partitioned generators reused counters from the second draw on** (silent).
+  Affects released versions **0.7.0 through 0.11.0**, on the NKI path only
+  (`set_backend("nki")`, or `"auto"` on Neuron hardware); the PyTorch CPU path
+  is not affected. A `Generator(partition_rank=r, partition_size=P)` with P > 1
+  advanced its counter by one rank's share after each draw, so rank r's next
+  draw used the counters rank r+1 had just used.
+  - `key_mode="counter"` (0.8.0 to 0.11.0): the key is fixed per seed, so rank
+    r's draw k+1 **returned the same values** as rank r+1's draw k. Streams
+    across ranks contained duplicates from the second call on.
+  - `key_mode="draw"` (the default, and the only behaviour in 0.7.x): each call
+    takes a fresh key, so values did not repeat, but from the second call on
+    the ranks no longer concatenated to the single-chip stream, as the
+    partition API documents.
+  - Every draw (`uniform`, `normal`, `exponential`, `poisson`, the `*_into`
+    variants and the `torch.compile` route) now advances past all P slices.
+    Unpartitioned generators (P = 1) were never affected.
+- `halton_nki(start_index=s)` started at Halton index `max(s, 1)`, so
+  `start_index=0` and `1` gave the same points and chunked calls repeated a
+  point at each chunk boundary. Point j is now index `s + j + 1`, the CPU
+  convention. `trnrand.halton()` (start 0) is unchanged.
+- `sobol_nki` now raises past index 2^24 instead of silently dropping the high
+  Gray-code bits (24-bit direction vectors) and repeating points.
+
+### Added
+
+- `tests/test_nki_tail_audit.py`: every NKI path at awkward sizes (1, 3, 127,
+  129, 200, 1000, 4097, 65,537, 262,145, 4,194,305), odd counter offsets,
+  chained and partitioned draws, multi-core splits, Sobol / Halton, Philox and
+  Box-Muller, against independent CPU oracles (trnsci/trnsci#35).
+
 ## [0.11.0] - 2026-10-31
 
 Validated on Trn2 (trn2.3xlarge, Neuron SDK 2.33.0, native TorchNeuron) — see trnsci/trnsci#35.

@@ -115,10 +115,10 @@ parameters, keep the gradient on the parameters and use trnrand only
 for the non-differentiable noise:
 
 ```python
-eps = trnrand.standard_normal(n)          # no grad; pure noise
-z = mu + sigma * eps                      # grad flows through mu, sigma
+eps = trnrand.standard_normal(n)  # no grad; pure noise
+z = mu + sigma * eps  # grad flows through mu, sigma
 loss = model(z).sum()
-loss.backward()                           # mu.grad, sigma.grad populated
+loss.backward()  # mu.grad, sigma.grad populated
 ```
 
 This is the standard pattern and mirrors how `torch.randn()` is used in

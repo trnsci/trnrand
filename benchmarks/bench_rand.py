@@ -105,9 +105,7 @@ class TestSobol:
 
     def test_sobol_torch(self, benchmark, square_size):
         n = square_size
-        benchmark(
-            lambda: torch.quasirandom.SobolEngine(dimension=8, scramble=True, seed=0).draw(n)
-        )
+        benchmark(lambda: torch.quasirandom.SobolEngine(dimension=8, scramble=True, seed=0).draw(n))
 
 
 # ── Latin Hypercube ───────────────────────────────────────────────────────────

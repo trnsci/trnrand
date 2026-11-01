@@ -159,6 +159,20 @@ class TestGeneratorPartitionAPI:
         gen._advance_by_elements(1)
         assert gen._counter == 1  # ceil(1/512) = 1
 
+    def test_advance_by_elements_skips_every_rank(self):
+        # One partitioned draw consumes all P ranks' slices; the next must start after them.
+        P, n = 4, 1000  # 2 batches per rank
+        gens = [Generator(seed=0, partition_rank=r, partition_size=P) for r in range(P)]
+        ranges = []
+        for _ in range(3):
+            for g in gens:
+                off = g._chip_counter_offset(n)
+                ranges.append(range(off, off + math.ceil(n / _BATCH_SIZE)))
+                g._advance_by_elements(n)
+        used = [b for r in ranges for b in r]
+        assert len(used) == len(set(used)) == 3 * P * 2
+        assert sorted(used) == list(range(3 * P * 2))
+
     def test_position_returns_samples_not_batches(self):
         gen = Generator(seed=0)
         gen._counter = 3
