@@ -14,6 +14,8 @@ Use cases:
 
 from __future__ import annotations
 
+import math
+
 import torch
 
 from .nki import HAS_NKI, get_backend
@@ -133,5 +135,34 @@ def latin_hypercube(
     for d in range(n_dims):
         perm = torch.randperm(n_points, generator=generator)
         u = torch.rand(n_points, generator=generator, dtype=dtype)
-        result[:, d] = (perm.to(dtype) + u) / n_points
+        col = (perm.to(dtype) + u) / n_points
+        if dtype in (torch.float16, torch.bfloat16):
+            col = _into_strata(col, perm, u, n_points)
+        result[:, d] = col
     return result
+
+
+def _into_strata(col: torch.Tensor, perm: torch.Tensor, u: torch.Tensor, n: int) -> torch.Tensor:
+    """Move reduced-precision LHS points back into their stratum [perm/n, (perm+1)/n).
+
+    float16 / bfloat16 rounding of `perm + u` and of the division can push a
+    point into the next stratum or onto 1.0 (#96). Points already inside their
+    stratum are unchanged; the others get the correctly rounded value, stepped
+    one ulp back inside. Raises if the dtype has no value in some stratum.
+    """
+    lo = perm.double() / n
+    hi = (perm.double() + 1) / n
+    bad = (col.double() < lo) | (col.double() >= hi)
+    if not bool(bad.any()):
+        return col
+    v = ((perm.double() + u.double()) / n).to(col.dtype)
+    down = torch.nextafter(v, torch.full_like(v, -math.inf))
+    up = torch.nextafter(v, torch.full_like(v, math.inf))
+    v = torch.where(v.double() >= hi, down, v)
+    v = torch.where(v.double() < lo, up, v)
+    if bool(((v.double() < lo) | (v.double() >= hi))[bad].any()):
+        raise ValueError(
+            f"latin_hypercube: {col.dtype} cannot represent a point in each of "
+            f"{n} strata; use float32 or fewer points"
+        )
+    return torch.where(bad, v, col)
