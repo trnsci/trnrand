@@ -108,3 +108,58 @@ class TestSobolNKITables:
         got = sobol_reference(n, _SOBOL_MAX_DIMS, start_index=start_index)
         got_int = (got.double() * 2.0**_SOBOL_BITS).round().long()
         assert torch.equal(got_int, expected)
+
+
+class TestLatinHypercubeReducedPrecision:
+    """float16 / bfloat16 LHS must keep one point per stratum (#96)."""
+
+    @staticmethod
+    def _stratified(x, n):
+        if bool((x >= 1).any()) or bool((x < 0).any()):
+            return False
+        return all(
+            torch.equal(
+                torch.sort(torch.floor(x[:, d].double() * n).long()).values, torch.arange(n)
+            )
+            for d in range(x.shape[1])
+        )
+
+    @pytest.mark.parametrize(
+        ("dtype", "n"),
+        [(torch.float16, 64), (torch.float16, 1000), (torch.bfloat16, 32), (torch.bfloat16, 200)],
+    )
+    def test_one_point_per_stratum(self, dtype, n):
+        for seed in range(5):
+            x = trnrand.latin_hypercube(
+                n, 3, dtype=dtype, generator=torch.Generator().manual_seed(seed)
+            )
+            assert x.dtype == dtype
+            assert self._stratified(x, n), f"seed {seed}"
+
+    def test_valid_points_unchanged(self):
+        n = 64
+        x = trnrand.latin_hypercube(
+            n, 2, dtype=torch.bfloat16, generator=torch.Generator().manual_seed(1)
+        )
+        g = torch.Generator().manual_seed(1)
+        for d in range(2):
+            perm = torch.randperm(n, generator=g)
+            u = torch.rand(n, generator=g, dtype=torch.bfloat16)
+            old = (perm.to(torch.bfloat16) + u) / n
+            ok = (old.double() >= perm.double() / n) & (old.double() < (perm.double() + 1) / n)
+            assert ok.any()
+            assert torch.equal(x[ok, d], old[ok])
+
+    def test_unrepresentable_raises(self):
+        with pytest.raises(ValueError, match="strata"):
+            trnrand.latin_hypercube(
+                5000, 1, dtype=torch.bfloat16, generator=torch.Generator().manual_seed(0)
+            )
+
+    def test_float32_unchanged(self):
+        x = trnrand.latin_hypercube(100, 2, generator=torch.Generator().manual_seed(3))
+        g = torch.Generator().manual_seed(3)
+        for d in range(2):
+            perm = torch.randperm(100, generator=g)
+            u = torch.rand(100, generator=g)
+            assert torch.equal(x[:, d], (perm.float() + u) / 100)

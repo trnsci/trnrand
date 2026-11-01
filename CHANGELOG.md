@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- **`latin_hypercube(dtype=torch.float16 / torch.bfloat16)` was not a Latin hypercube** (silent). Affects released versions **0.1.0 through 0.12.1**, on every backend. Each column was computed as `(perm + u) / n` in the output dtype, and the rounding pushed points into the next stratum or onto 1.0. For n = 64, 8 of 20 float16 and all bfloat16 columns had a stratum with two points. Points outside their stratum are now moved back in (all others are bit-identical), and a dtype that cannot hold a point in every stratum (bfloat16 n > 256, float16 n > 2048) raises `ValueError`. float32 / float64 are unchanged (#96).
+
 ## [0.12.1] - 2026-11-01
 
 Validated on Trn2 (trn2.3xlarge, Neuron SDK 2.33.0, native TorchNeuron) — see trnsci/trnsci#35.
