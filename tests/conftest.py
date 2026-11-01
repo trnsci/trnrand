@@ -28,3 +28,21 @@ def pytest_configure(config):
         "markers",
         "nki_simulator: runs NKI kernels via nki.simulate(...) on CPU (no hardware)",
     )
+
+
+def pytest_addoption(parser):
+    # tests/test_conformance.py (trnsci/trnsci#105): run the reference cases on
+    # another backend / with device buffers, e.g. on a Neuron host:
+    #   pytest tests/test_conformance.py --backend nki --conformance-device neuron
+    group = parser.getgroup("conformance")
+    group.addoption(
+        "--backend",
+        choices=("pytorch", "nki", "auto"),
+        default="pytorch",
+        help="trnrand backend for tests/test_conformance.py (default: pytorch)",
+    )
+    group.addoption(
+        "--conformance-device",
+        default="cpu",
+        help="device for *_into / GeneratorProgram buffers in tests/test_conformance.py (default: cpu)",
+    )
