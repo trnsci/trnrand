@@ -163,3 +163,38 @@ class TestLatinHypercubeReducedPrecision:
             perm = torch.randperm(100, generator=g)
             u = torch.rand(100, generator=g)
             assert torch.equal(x[:, d], (perm.float() + u) / 100)
+
+
+class TestQuasiReducedPrecisionRange:
+    """float16 / bfloat16 sobol / halton stay inside the unit interval (#101)."""
+
+    @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
+    @pytest.mark.parametrize(
+        "fn",
+        [
+            lambda n, dt: trnrand.sobol(n, 4, seed=3, dtype=dt),
+            lambda n, dt: trnrand.sobol(n, 4, scramble=False, dtype=dt),
+            lambda n, dt: trnrand.halton(n, 4, dtype=dt),
+        ],
+        ids=["sobol", "sobol_unscrambled", "halton"],
+    )
+    def test_below_one(self, fn, dtype):
+        x = fn(4096, dtype)
+        assert x.dtype == dtype
+        assert bool((x >= 0).all() and (x < 1).all()), f"{int((x >= 1).sum())} points >= 1"
+
+    @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
+    def test_only_points_rounding_to_one_change(self, dtype):
+        ref = torch.quasirandom.SobolEngine(4, scramble=True, seed=3).draw(4096)
+        cast = ref.to(dtype)
+        x = trnrand.sobol(4096, 4, seed=3, dtype=dtype)
+        hit = cast == 1
+        assert bool(hit.any())  # the case this guards actually occurs
+        assert torch.equal(x[~hit], cast[~hit])
+        top = torch.nextafter(torch.ones((), dtype=dtype), torch.zeros((), dtype=dtype))
+        assert bool((x[hit] == top).all())
+
+    @pytest.mark.parametrize("dtype", [torch.float32, torch.float64])
+    def test_full_precision_bit_identical(self, dtype):
+        ref = torch.quasirandom.SobolEngine(4, scramble=True, seed=3).draw(4096).to(dtype)
+        assert torch.equal(trnrand.sobol(4096, 4, seed=3, dtype=dtype), ref)
