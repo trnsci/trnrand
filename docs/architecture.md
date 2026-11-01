@@ -11,7 +11,9 @@ trnrand/
 │   ├── quasi.py           # sobol, halton, latin_hypercube
 │   └── nki/
 │       ├── __init__.py    # Backend dispatch (set_backend / HAS_NKI)
-│       └── dispatch.py    # Philox kernel scaffold for on-device RNG
+│       ├── dispatch.py    # NKI kernels, host wrappers, dispatch-path selection
+│       ├── _native.py     # TorchNeuron custom ops (nki_op), loaded lazily
+│       └── program.py     # GeneratorProgram streaming builder
 ├── tests/
 ├── examples/mc_integration.py
 └── benchmarks/
@@ -33,7 +35,10 @@ trnrand/
 
 ## NKI strategy
 
-The Philox 4×32 counter-based RNG maps cleanly to Trainium:
+Counter-based RNGs map cleanly to Trainium. Every NKI distribution draws
+from Threefry4x32-20, which needs no 32-bit integer multiply; a Philox
+4×32-10 kernel ships alongside it (`torch.ops.trnrand.philox4x32`). Both are
+bit-exact against their CPU references on Trn2.
 
 - **GpSimd engine** runs the integer multiply-XOR rounds (the Tensor Engine
   is wasted on this).
@@ -42,13 +47,14 @@ The Philox 4×32 counter-based RNG maps cleanly to Trainium:
 - **Deterministic:** `(counter, key) → output` — no state to synchronize
   across cores.
 
-Philox is preferred over Mersenne Twister precisely because it's stateless
-and trivially parallelizable. It's the same engine used by cuRAND and JAX.
+Counter-based RNGs are preferred over Mersenne Twister precisely because
+they're stateless and trivially parallelizable. Philox is cuRAND's default
+engine; Threefry is JAX's.
 
 ## Box-Muller for `normal()`
 
-The on-device normal path is a Box-Muller transform layered on the Philox
-uniform stream:
+The on-device normal path is a Box-Muller transform layered on the Threefry
+uniform stream, fused into the same kernel:
 
 - Pairs of uniforms `(u1, u2)` → standard-normal pairs `(z1, z2)` via
   `r = √(-2 ln u1)`, `θ = 2π u2`, `z1 = r cos θ`, `z2 = r sin θ`.
@@ -93,14 +99,16 @@ x = trnrand.normal(64 * 2**20)  # same values as on one core
 
 ## Known gaps
 
-- **NKI Philox and Box-Muller kernels await validation.** Both landed in
-  v0.1.0 with CPU conformance oracles (the three canonical Salmon et al.
-  SC'11 test vectors pass in
-  `tests/test_nki_philox.py::TestPhiloxReference::test_spec_vectors`).
-  Tracked on the [v0.3.0 milestone](https://github.com/trnsci/trnrand/milestones)
-  (#1 Philox, #2 Box-Muller, #18 Phase 1).
+- **Checkpoint/resume with `advance_to` needs `key_mode="counter"`.** With
+  the default `key_mode="draw"`, each NKI draw takes a fresh key from the
+  host `torch.Generator`, and `advance` / `advance_to` move only the
+  Threefry counter, so a new generator advanced to `position()` draws
+  different values. On the PyTorch path they have no effect. Use
+  `get_state` / `set_state` (which carry the counter since v0.12.1), or
+  `key_mode="counter"`, which fixes the key per seed for `uniform`,
+  `normal` and `standard_normal` (#76).
 
-**Phase 1 iteration is no longer hardware-gated.** Neuron SDK 2.29
+**Kernel iteration is not hardware-gated.** Neuron SDK 2.29
 (April 2026) brought NKI 0.3.0 Stable with a CPU simulator
 (`nki.simulate_kernel`); the `test-simulator` CI job exercises kernel
 correctness on `ubuntu-latest` without a trn1 instance. Use
@@ -110,7 +118,9 @@ via `scripts/run_neuron_tests.sh` are reserved for final real-device
 validation, not inner-loop iteration.
 - **Halton degrades above ~20 dimensions** — known algorithmic limitation.
   Sobol is preferred for `d > 10`.
-- **Quasi-random sequences are host-only.** NKI scrambling for
-  Sobol/Halton is scoped for [v0.3.0](roadmap.md) (#11, #12).
-- **FP32 throughout.** BF16 / FP16 output paths and multi-NeuronCore
-  sharding are v0.4+ candidates (see [roadmap](roadmap.md)).
+- **NKI Sobol covers 10 dimensions and 2^24 points** (it raises past
+  2^24), and its scrambling is a per-dimension random shift, not the Owen
+  scrambling of the CPU `SobolEngine` path. NKI Halton covers 10 dimensions
+  and indices below 2^22. Past those limits the NKI path raises; use
+  `set_backend("pytorch")`.
+- **FP32 throughout.** BF16 / FP16 output paths are future work.

@@ -7,6 +7,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **Guard against the NKI trace-cache closure bug ([aws-neuron/aws-neuron-sdk#1454](https://github.com/aws-neuron/aws-neuron-sdk/issues/1454),
+  trnsci/trnsci#35).** `tests/test_trace_cache_safety.py` (CPU) finds every
+  `@nki.jit` kernel and fails if its body, or a helper it calls, reads a
+  closure variable or a module global that is not a constant expression
+  (reviewed exceptions are allow-listed with a reason), and checks each
+  kernel's `__closure__` at runtime against a stub `nki`.
+- Tests: `conftest.py` no longer turns the NKI trace cache off. Neuron tests
+  run with it on, as under `import torch_neuronx`, with a fresh
+  `NKI_TRACE_CACHE_URL` directory per session (no stale editable-install
+  traces). `NKI_ENABLE_TRACE_CACHE=0` still turns it off.
+- README: known platform issue note for #1454.
 ### Fixed
 
 - **`exponential(dtype=torch.float16 / torch.bfloat16)` returned `inf` / biased samples** (silent). Affects released versions **0.1.0 through 0.12.1**, on the PyTorch path. The uniform variate was drawn in the output dtype: float16 has ~11 random bits, so `u == 0` about once in 2^11, and the `1e-10` clamp underflows to 0 (`-log(0) = inf`; 487 inf in 2M samples). bfloat16 mapped `u == 0` (about once in 2^8) to 23.0, which biased the mean +4.5 %. The uniform is now drawn in at least float32; float32 and float64 output is bit-identical (#80).
