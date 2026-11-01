@@ -20,6 +20,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `NKI_TRACE_CACHE_URL` directory per session (no stale editable-install
   traces). `NKI_ENABLE_TRACE_CACHE=0` still turns it off.
 - README: known platform issue note for #1454.
+- **Reference-conformance suite (trnsci/trnsci#105).** `tests/test_conformance.py`
+  checks every public API against independent references (scipy.stats
+  KS / chi-square and moments, scipy.stats.qmc Sobol / Halton, the Latin
+  hypercube stratum property, documented support, dtype, shape, seeding and
+  state contracts) at sizes 0, 1, 127, 129, 1000 and the Threefry block
+  boundaries, on CPU in the regular CI job (~5 s). `--backend nki|auto` and
+  `--conformance-device neuron` run the same cases on a Neuron host.
+  Needs-decision behaviour (#98, #99, #100) and the new #101 are strict xfails.
 ### Fixed
 
 - **`exponential(dtype=torch.float16 / torch.bfloat16)` returned `inf` / biased samples** (silent). Affects released versions **0.1.0 through 0.12.1**, on the PyTorch path. The uniform variate was drawn in the output dtype: float16 has ~11 random bits, so `u == 0` about once in 2^11, and the `1e-10` clamp underflows to 0 (`-log(0) = inf`; 487 inf in 2M samples). bfloat16 mapped `u == 0` (about once in 2^8) to 23.0, which biased the mean +4.5 %. The uniform is now drawn in at least float32; float32 and float64 output is bit-identical (#80).
