@@ -57,5 +57,7 @@ identity `X / (X + Y)` where `X ~ Gamma(α, 1)`, `Y ~ Gamma(β, 1)`.
 
 ## `poisson(*size, lam=1.0, dtype=torch.float32, generator=None)`
 
-Poisson distribution with rate `λ ≥ 0`. Mean and variance both `λ`. Wraps
-`torch.poisson` with a generator-bound rates tensor for reproducibility.
+Poisson distribution with rate `λ ≥ 0`. Mean and variance both `λ`. On the
+NKI path with `λ ≥ 20` it is the normal approximation `round(N(λ, √λ))`
+clamped to `≥ 0`; otherwise it wraps `torch.poisson` (exact) with a
+generator-bound rates tensor for reproducibility.
