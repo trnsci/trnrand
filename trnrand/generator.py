@@ -2,13 +2,13 @@
 Random number generator state management for Trainium.
 
 Provides a Generator class that wraps torch.Generator for CPU/CUDA
-and will wrap NKI-based on-device RNG for Trainium. Reproducible
-seeding is critical for scientific computing — same seed, same stream,
-regardless of backend.
+and carries the Threefry counter that the NKI on-device RNG draws from.
+Reproducible seeding is critical for scientific computing — same seed,
+same stream on a given backend.
 
-The Philox counter-based RNG is the natural NKI target because it's
-stateless (counter + key → output), embarrassingly parallel across
-tiles, and used by both PyTorch and JAX as their default engine.
+Counter-based RNGs (Threefry, Philox) are the natural NKI target because
+they're stateless (counter + key → output) and embarrassingly parallel
+across tiles.
 """
 
 from __future__ import annotations
@@ -166,13 +166,21 @@ class Generator:
         """Logical sample count consumed from this generator's stream.
 
         Returns the number of samples that have been drawn (rounded up to the
-        nearest Threefry batch boundary). Use with :meth:`advance_to` for
-        checkpoint / resume::
+        nearest Threefry batch boundary). With ``key_mode="counter"``, use
+        with :meth:`advance_to` to resume ``uniform`` / ``normal`` draws on
+        the NKI path::
 
             pos = gen.position()
             # ... experiment runs, crashes, or cluster is reshaped ...
-            new_gen = Generator(seed=s, partition_rank=r, partition_size=P)
+            new_gen = Generator(seed=s, partition_rank=r, partition_size=P,
+                                key_mode="counter")
             new_gen.advance_to(pos)   # resume from the same point
+
+        This does not resume the default ``key_mode="draw"`` stream: each
+        NKI draw there takes a fresh key from the ``torch.Generator``, which
+        ``advance_to`` does not move. On the PyTorch path ``advance`` /
+        ``advance_to`` have no effect. For checkpoint / resume in either
+        mode, use :meth:`get_state` / :meth:`set_state` (#76).
         """
         return self._counter * _BATCH_SIZE
 
