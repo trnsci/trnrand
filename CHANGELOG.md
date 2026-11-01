@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.12.1] - 2026-11-01
+
+Validated on Trn2 (trn2.3xlarge, Neuron SDK 2.33.0, native TorchNeuron) — see trnsci/trnsci#35.
+
+Headline: **correctness fix:** in 0.7.0–0.12.0, `Generator.get_state()` / `set_state()` did not save the NKI stream counter, so a restored generator drew different values on the `nki` / `auto` paths. The state now carries the counter, and old-format states are still accepted (#75, #74).
+
 ### Fixed
 
 - **`Generator.get_state()` / `set_state()` did not restore the NKI stream** (silent).
