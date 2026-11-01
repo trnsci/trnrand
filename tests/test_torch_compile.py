@@ -453,13 +453,36 @@ class TestCounterKeyMode:
 
     def test_eager_stream(self, nki_native):
         g = trnrand.Generator(seed=2**30 + 99, key_mode="counter")
-        torch_state = g.get_state().clone()
+        torch_state = g.torch_generator.get_state().clone()
         a, b = trnrand.normal(1000, generator=g), trnrand.normal(1000, generator=g)
         # Fixed key, counter advances by ceil(1000 / 512) = 2 batches per call.
         assert torch.equal(a, dispatch.threefry_stream_normal(1000, g._key48, 0))
         assert torch.equal(b, dispatch.threefry_stream_normal(1000, g._key48, 2))
-        assert torch.equal(g.get_state(), torch_state)  # host RNG untouched
+        assert torch.equal(g.torch_generator.get_state(), torch_state)  # host RNG untouched
         assert g.position() == 4 * 512
+
+    @pytest.mark.parametrize("key_mode", ["draw", "counter"])
+    @pytest.mark.parametrize("draw", [trnrand.uniform, trnrand.normal])
+    def test_state_restore_replays(self, nki_native, key_mode, draw):
+        """get_state/set_state must replay the NKI stream, so the state holds
+        the counter as well as the torch.Generator state (#74)."""
+        g = trnrand.Generator(seed=11, key_mode=key_mode)
+        draw(1000, generator=g)
+        state = g.get_state().clone()
+        a = draw(4096, generator=g)
+        g.set_state(state)
+        assert torch.equal(draw(4096, generator=g), a)
+        h = trnrand.Generator(seed=99, key_mode=key_mode)  # another generator
+        h.set_state(state)
+        assert h.position() == 2 * 512
+        assert torch.equal(draw(4096, generator=h), a)
+
+    def test_set_state_accepts_bare_torch_state(self):
+        g = trnrand.Generator(seed=3)
+        bare = g.torch_generator.get_state().clone()
+        x = trnrand.uniform(100, generator=g)
+        g.set_state(bare)
+        assert torch.equal(trnrand.uniform(100, generator=g), x)
 
     @pytest.mark.parametrize("name", list(FNS))
     @pytest.mark.parametrize("make_gen", COUNTER_GENS)

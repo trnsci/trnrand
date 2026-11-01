@@ -7,6 +7,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- **`Generator.get_state()` / `set_state()` did not restore the NKI stream** (silent).
+  Affects released versions **0.7.0 through 0.12.0**, on the NKI path only
+  (`set_backend("nki")`, or `"auto"` on Neuron hardware); the PyTorch path is
+  not affected. The state held only the `torch.Generator` state, not the
+  Threefry counter the NKI draws take their offsets from, so restoring a
+  checkpoint and drawing again gave different values (Trn2: max |diff| 0.97
+  for `uniform`, 5.7 for `normal`, both key modes). The state now carries the
+  counter too (`torch` state followed by 8 counter bytes), and `set_state`
+  restores both and re-derives the counter-mode key. A bare `torch.Generator`
+  state is still accepted (#74).
+
 ## [0.12.0] - 2026-11-01
 
 Validated on Trn2 (trn2.3xlarge, Neuron SDK 2.33.0, native TorchNeuron) — see trnsci/trnsci#35.

@@ -230,10 +230,29 @@ class Generator:
     # ── State management ──────────────────────────────────────────────────────
 
     def get_state(self) -> torch.Tensor:
-        return self._torch_gen.get_state()
+        """Generator state for checkpointing: a uint8 tensor holding the
+        ``torch.Generator`` state followed by the 8-byte stream counter.
+
+        The counter is part of the state: the NKI draws (and any
+        ``key_mode="counter"`` draw) take their Threefry counter from it, so a
+        state without it does not replay them (#74).
+        """
+        ctr = torch.tensor([self._counter], dtype=torch.int64).view(torch.uint8)
+        return torch.cat([self._torch_gen.get_state(), ctr])
 
     def set_state(self, state: torch.Tensor):
-        self._torch_gen.set_state(state)
+        """Restore a state from :meth:`get_state`.
+
+        A bare ``torch.Generator`` state (as returned through 0.12.0) is still
+        accepted; it restores the host RNG and leaves the counter unchanged.
+        """
+        n = self._torch_gen.get_state().numel()
+        if state.numel() == n + 8:
+            self._torch_gen.set_state(state[:n].clone())
+            self._counter = int(state[n:].clone().view(torch.int64).item())
+        else:
+            self._torch_gen.set_state(state)
+        self._set_key()
 
     @property
     def torch_generator(self) -> torch.Generator:
