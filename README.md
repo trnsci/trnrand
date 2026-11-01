@@ -10,7 +10,7 @@
 
 Random number generation for AWS Trainium via NKI.
 
-Seeded pseudo-random distributions, quasi-random sequences for quasi-Monte Carlo, and on-device Philox RNG targeting the GpSimd engine.
+Seeded pseudo-random distributions, quasi-random sequences for quasi-Monte Carlo, and on-device counter-based RNG (Threefry4x32-20, with a Philox 4x32-10 kernel alongside) on the GpSimd engine.
 
 Part of the trnsci scientific computing suite ([github.com/trnsci](https://github.com/trnsci)).
 
@@ -18,10 +18,10 @@ Part of the trnsci scientific computing suite ([github.com/trnsci](https://githu
 
 trnrand follows the [trnsci 5-phase roadmap](https://trnsci.dev/roadmap/). Active work is tracked in phase-labeled GitHub issues:
 
-- **[Phase 1 — correctness](https://github.com/trnsci/trnrand/issues/18)** (active): Philox 4×32 and Box-Muller NKI kernels scaffolded with CPU-reference oracles; awaiting hardware validation on trn1 / trn2.
-- **[Phase 3 — perf](https://github.com/trnsci/trnrand/issues/19)**: batched-tile RNG streaming, NEFF cache reuse.
-- **[Phase 4 — multi-chip](https://github.com/trnsci/trnrand/issues/20)**: stream-partitioned RNG across NeuronCores.
-- **[Phase 5 — generation](https://github.com/trnsci/trnrand/issues/21)**: trn2 PSUM sizing for larger batched tile generation.
+- **[Phase 1 — correctness](https://github.com/trnsci/trnrand/issues/18)** (done): Threefry, Box-Muller, Philox, Sobol and Halton NKI kernels are bit-exact against their CPU references on Trn2 (Neuron SDK 2.33, native TorchNeuron).
+- **[Phase 3 — perf](https://github.com/trnsci/trnrand/issues/19)** (done): wide-tile bulk Threefry kernels (v0.8.0–v0.9.0), opt-in multi-core bulk draws with `set_cores` (v0.10.0), pinned host output (v0.11.0).
+- **[Phase 4 — multi-chip](https://github.com/trnsci/trnrand/issues/20)** (done): counter-partitioned generators (`partition_rank` / `partition_size`); the counter reuse on P > 1 in 0.7.0–0.11.0 is fixed in v0.12.0.
+- **[Phase 5 — generation](https://github.com/trnsci/trnrand/issues/21)** (open): trn2 PSUM sizing for larger batched tile generation.
 
 _(No Phase 2 for trnrand — the precision story is inherited where relevant.)_
 
@@ -103,6 +103,9 @@ x = trnrand.standard_normal(256)
 | | `randint` | Uniform integers [low, high) |
 | | `randperm` | Random permutation |
 | | `truncated_normal` | Bounded normal (rejection sampling) |
+| | `gamma`, `beta`, `chi_squared` | Gamma(k, θ), Beta(α, β), χ²(df) |
+| | `poisson` | Poisson(λ) |
+| | `normal_into`, `uniform_into`, `exponential_into` | In-place fills of a preallocated tensor |
 | Quasi-random | `sobol` | Sobol sequence (scrambled) |
 | | `halton` | Halton sequence |
 | | `latin_hypercube` | Latin Hypercube Sampling |
@@ -121,8 +124,9 @@ Compares pseudo-random vs Sobol quasi-random for estimating the volume of a 5-D 
 - [x] Standard distributions (uniform, normal, exponential, Bernoulli, etc.)
 - [x] Sobol, Halton, Latin Hypercube sequences
 - [x] MC vs QMC integration example
-- [ ] NKI Philox kernel on GpSimd
-- [ ] On-device Box-Muller (uniform → normal)
+- [x] NKI Threefry and Philox kernels on GpSimd (bit-exact on Trn2)
+- [x] On-device Box-Muller (uniform → normal)
+- [x] Counter-partitioned multi-chip generators and multi-core bulk draws (`set_cores`)
 - [ ] Benchmarks vs cuRAND
 
 ## Related Projects
@@ -132,6 +136,8 @@ Compares pseudo-random vs Sobol quasi-random for estimating the volume of a 5-D 
 | [trnfft](https://github.com/trnsci/trnfft) | FFT + complex ops |
 | [trnblas](https://github.com/trnsci/trnblas) | BLAS operations |
 | [trnsolver](https://github.com/trnsci/trnsolver) | Linear solvers |
+| [trnsparse](https://github.com/trnsci/trnsparse) | Sparse formats + SpMM |
+| [trntensor](https://github.com/trnsci/trntensor) | Einsum + tensor decompositions |
 
 ## License
 
