@@ -2,7 +2,7 @@
 
 trnrand kernels measured against two baselines on the same Trainium instance:
 
-1. **NKI** — trnrand with `set_backend("nki")` (Philox on GpSimd; Box-Muller
+1. **NKI** — trnrand with `set_backend("nki")` (Threefry on GpSimd; Box-Muller
    on Vector Engine for `normal()`).
 2. **trnrand-PyTorch** — trnrand with `set_backend("pytorch")` running on
    the host CPU (`torch.Generator` + `torch.empty(...).uniform_()` etc.).
@@ -28,8 +28,8 @@ difference between trnrand and reaching for raw torch?"*
 ## Caveats
 
 - **Small sizes are dispatch-bound.** NKI kernel invocation has fixed overhead. Below some per-op threshold the host CPU wins for RNG, where each call already amortizes to a few hundred nanoseconds per element.
-- **Philox is integer-heavy.** GpSimd does the multiply-XOR rounds; the Tensor Engine isn't useful here. Don't expect Tensor-Engine-class speedups — the win comes from avoiding host→device transfer of the random tensor.
-- **Quasi-random is host-only today.** Sobol/Halton/LHS run via `torch.quasirandom` on the host. NKI scrambling is a v0.3 follow-up.
+- **Threefry is integer-heavy.** GpSimd does the add-rotate-xor rounds; the Tensor Engine isn't useful here. Don't expect Tensor-Engine-class speedups — the win comes from avoiding host→device transfer of the random tensor.
+- **Quasi-random:** Sobol and Halton have NKI kernels (v0.5.0); Latin Hypercube runs on the host.
 - **FP32 throughout.** BF16/FP16 paths are future work.
 - Numbers vary 5-15% run-to-run; treat the table as approximate.
 
@@ -37,6 +37,10 @@ difference between trnrand and reaching for raw torch?"*
 
 <!-- BENCH_TABLE_START -->
 
-_Pending first run on trn1.2xlarge — see issue #3._
+_Pending first run on trn1.2xlarge — see issue #3._ Trn2 (native
+TorchNeuron) timings for each release are in the
+[CHANGELOG](https://github.com/trnsci/trnrand/blob/main/CHANGELOG.md):
+v0.9.0 (full-word bulk kernels), v0.10.0 (`set_cores`) and v0.11.0
+(pinned host output).
 
 <!-- BENCH_TABLE_END -->
