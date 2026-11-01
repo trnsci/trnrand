@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- **`uniform(dtype=torch.bfloat16 / torch.float16)` returned `high`, outside `[low, high)`** (silent). Affects released versions **0.5.0 through 0.12.1**, on the NKI path only (`set_backend("nki")`, or `"auto"` on Neuron hardware). The float32 kernel output was cast to `dtype` with round-to-nearest, which maps values within half an ulp of `high` up to `high`: about 1 sample in 2^9 for bfloat16 and 1 in 2^12 for float16. Such values now become the largest representable value below `high`. Other values and float32 / float64 output are unchanged (#94).
+
 ## [0.12.1] - 2026-11-01
 
 Validated on Trn2 (trn2.3xlarge, Neuron SDK 2.33.0, native TorchNeuron) — see trnsci/trnsci#35.
