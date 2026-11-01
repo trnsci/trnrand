@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.12.0] - 2026-11-01
+
+Validated on Trn2 (trn2.3xlarge, Neuron SDK 2.33.0, native TorchNeuron) — see trnsci/trnsci#35.
+
+Headline: **correctness fix — upgrade recommended for partitioned generators.** In 0.7.0–0.11.0, partitioned generators (P > 1) on the NKI path advanced their counter by one chip's share instead of all P chips', so from the second draw on chip r reused chip r+1's counters: with `key_mode="counter"` the ranks returned duplicate values, and with `"draw"` the stream no longer matched the single-chip stream. P = 1 and the CPU path are unaffected (#72). Also fixes `halton_nki` repeating a point at chunk boundaries, and makes `sobol_nki` reject indices ≥ 2^24, where points would repeat.
+
 ### Fixed
 
 - **Partitioned generators reused counters from the second draw on** (silent).
