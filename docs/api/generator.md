@@ -26,21 +26,19 @@ Re-seed in place. Returns `self` so you can chain.
 ## `Generator.get_state() / set_state(state)`
 
 Save and restore the generator for checkpointing: the `torch.Generator`
-state followed by the 8-byte Threefry counter. Use this to checkpoint and
-resume in either key mode. Before v0.12.1 the state held only the
-`torch.Generator` state, so a restored generator drew different values on
-the NKI path (#74); a bare `torch.Generator` state is still accepted and
-leaves the counter unchanged.
+state plus the NKI stream counter. This is the checkpoint / resume recipe;
+it works in both key modes and on both the NKI and PyTorch paths.
 
 ## `Generator.position() / advance(n) / advance_to(position)`
 
-`position()` is the number of samples drawn (in 512-sample Threefry
-batches); `advance` and `advance_to` move the Threefry counter without
-drawing. They resume a stream only with `key_mode="counter"` (for
-`uniform` / `normal`) on the NKI path. With the default `key_mode="draw"`
-the per-draw keys come from the `torch.Generator`, which they don't move,
-and on the PyTorch path they have no effect. Use `get_state` / `set_state`
-for checkpoint/resume (#76).
+The stream counter in samples, and counter skip-ahead. With
+`key_mode="counter"`, `advance_to(gen.position())` on a fresh generator
+with the same seed resumes the NKI `uniform` / `normal` /
+`standard_normal` stream, for any partition layout. With the default
+`key_mode="draw"` each NKI draw takes a fresh key from the host
+`torch.Generator`, which the position does not capture, so `advance` /
+`advance_to` cannot resume the stream and emit `trnrand.AdvanceWarning`
+when they move the counter (#76). On the PyTorch path they have no effect.
 
 ## `Generator.torch_generator`
 
