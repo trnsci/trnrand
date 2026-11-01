@@ -27,9 +27,9 @@ x = trnrand.standard_normal(256)
 ```python
 import trnrand
 
-trnrand.set_backend("auto")     # NKI on Trainium, PyTorch elsewhere (default)
+trnrand.set_backend("auto")  # NKI on Trainium, PyTorch elsewhere (default)
 trnrand.set_backend("pytorch")  # force PyTorch
-trnrand.set_backend("nki")      # force NKI (requires Neuron hardware)
+trnrand.set_backend("nki")  # force NKI (requires Neuron hardware)
 ```
 
 ## MC vs QMC example

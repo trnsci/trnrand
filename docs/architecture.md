@@ -64,7 +64,8 @@ built on them) can be spread over several logical NeuronCores of one chip:
 
 ```python
 import trnrand
-trnrand.set_cores("auto")      # or an int; or TRNRAND_CORES=auto|<n>
+
+trnrand.set_cores("auto")  # or an int; or TRNRAND_CORES=auto|<n>
 x = trnrand.normal(64 * 2**20)  # same values as on one core
 ```
 

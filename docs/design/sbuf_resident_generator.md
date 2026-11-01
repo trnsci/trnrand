@@ -99,17 +99,16 @@ Python side:
 
 ```python
 gen = trnrand.Generator(seed=42)
-program = gen.new_program() \
-    .uniform(n=1024, out="u") \
-    .normal(n=4096, mu=mu, sigma=sigma, out="z") \
-    .build()                      # first call: compile + cache NEFF
+program = (
+    gen.new_program().uniform(n=1024, out="u").normal(n=4096, mu=mu, sigma=sigma, out="z").build()
+)  # first call: compile + cache NEFF
 ```
 
 Repeat invocations:
 
 ```python
 for step in range(n_steps):
-    program.stream_into({"u": u_buf, "z": z_buf})   # ~10s of μs
+    program.stream_into({"u": u_buf, "z": z_buf})  # ~10s of μs
 ```
 
 The expensive compile happens once. Per-step cost is kernel-launch

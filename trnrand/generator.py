@@ -215,8 +215,17 @@ class Generator:
         return self._partition_rank * n_batches + self._counter
 
     def _advance_by_elements(self, n_elements: int) -> None:
-        """Advance _counter by the batches consumed by n_elements samples."""
-        self._counter += math.ceil(n_elements / _BATCH_SIZE)
+        """Advance _counter past one partitioned draw of n_elements samples per chip.
+
+        All P chips together consume ``P × ceil(n_elements / 512)`` batches
+        (chip r takes the r-th slice, see :meth:`_chip_counter_offset`), so
+        the counter moves by that much: the next draw starts after every
+        chip's slice. Advancing by one chip's share instead made chip r's
+        next draw reuse chip r+1's counters (with key_mode="counter" the
+        values repeated across chips) and broke single-chip equivalence
+        from the second draw on. For P = 1 this is ``ceil(n / 512)``.
+        """
+        self._counter += math.ceil(n_elements / _BATCH_SIZE) * self._partition_size
 
     # ── State management ──────────────────────────────────────────────────────
 

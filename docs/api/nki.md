@@ -8,9 +8,9 @@ Trainium GpSimd engine (Philox 4×32) or fall back to `torch.Generator`.
 ```python
 import trnrand
 
-trnrand.set_backend("auto")     # NKI on Trainium, PyTorch elsewhere (default)
+trnrand.set_backend("auto")  # NKI on Trainium, PyTorch elsewhere (default)
 trnrand.set_backend("pytorch")  # force PyTorch fallback
-trnrand.set_backend("nki")      # force NKI (requires neuronxcc)
+trnrand.set_backend("nki")  # force NKI (requires neuronxcc)
 ```
 
 `trnrand.HAS_NKI` is `True` when `nki>=0.3.0` is importable.

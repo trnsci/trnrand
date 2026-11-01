@@ -1904,6 +1904,13 @@ if HAS_NKI:
             f"sobol_nki supports 1 ≤ n_dims ≤ {_SOBOL_MAX_DIMS}, got {n_dims}"
         )
         assert n_points > 0
+        assert start_index >= 0
+        # Gray codes are 24-bit (_SOBOL_BITS direction vectors): index 2^24 and up
+        # would silently drop the high bits and repeat earlier points.
+        assert start_index + n_points <= 1 << _SOBOL_BITS, (
+            f"sobol_nki: index {start_index + n_points} exceeds 2^{_SOBOL_BITS}. "
+            "Use the CPU path (set_backend('pytorch')) for longer sequences."
+        )
 
         LANES = _THREEFRY_LANES  # 128 — same tile size as Threefry wrappers
 
@@ -2048,9 +2055,11 @@ if HAS_NKI:
         Args:
             n_points: Number of points to generate.
             n_dims: Dimensionality (1 ≤ n_dims ≤ 10).
-            start_index: First index in the Halton sequence (default 0 → starts at i=1).
-                         Halton(0, b) = 0 for all b, so the sequence conventionally
-                         starts at index 1. If start_index > 0, uses start_index + 1.
+            start_index: Number of points to skip (default 0). Point j of the result
+                         is Halton index start_index + j + 1: Halton(0, b) = 0 for all
+                         b, so the sequence conventionally starts at index 1, as the
+                         CPU path does. Consecutive calls with start_index advanced
+                         by n_points therefore concatenate to one longer call.
 
         Returns:
             Float32 tensor of shape (n_points, n_dims) with values in (0, 1).
@@ -2060,7 +2069,11 @@ if HAS_NKI:
         )
         assert n_points > 0
         # All indices must be < 2^22 for exact float32 digit extraction
-        first_idx = max(start_index, 1)  # skip index 0 (all-zero point)
+        assert start_index >= 0
+        # Skip index 0 (the all-zero point). This used to be max(start_index, 1),
+        # which made start_index = 0 and 1 give the same points and repeated the
+        # last point of a call at the start of the next chunk.
+        first_idx = start_index + 1
         last_idx = first_idx + n_points
         assert last_idx <= _HALTON_MAX_POINTS, (
             f"halton_nki: index {last_idx} exceeds 2^22 = {_HALTON_MAX_POINTS}. "

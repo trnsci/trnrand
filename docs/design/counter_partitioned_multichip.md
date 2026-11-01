@@ -69,12 +69,12 @@ import trnrand
 
 gen = trnrand.Generator(
     seed=42,
-    partition_rank=xm.get_ordinal(),      # 0 ≤ rank < size
-    partition_size=xm.xrt_world_size(),   # total chips in cluster
+    partition_rank=xm.get_ordinal(),  # 0 ≤ rank < size
+    partition_size=xm.xrt_world_size(),  # total chips in cluster
 )
 
 # Subsequent calls take this chip's subrange of the logical stream:
-samples = gen.uniform(1_000_000)   # emits N/P samples on chip rank
+samples = gen.uniform(1_000_000)  # emits N/P samples on chip rank
 ```
 
 Defaults (`rank=0, size=1`) preserve the single-chip behavior
@@ -85,8 +85,8 @@ identically. Users who never use multi-chip pay nothing.
 A cheap way to skip forward in the logical stream:
 
 ```python
-gen.advance(1_000_000)   # skip 1M samples; counter jumps, no work done
-gen.uniform(1_000)       # emits samples (1M+1) through (1M+1000)
+gen.advance(1_000_000)  # skip 1M samples; counter jumps, no work done
+gen.uniform(1_000)  # emits samples (1M+1) through (1M+1000)
 ```
 
 This enables:
@@ -131,13 +131,12 @@ ref = g1.sample(dist, N, **params)
 
 # P-chip run, concatenated in rank order
 per_chip = [
-    trnrand.Generator(seed=s, partition_rank=r, partition_size=P)
-      .sample(dist, N // P, **params)
+    trnrand.Generator(seed=s, partition_rank=r, partition_size=P).sample(dist, N // P, **params)
     for r in range(P)
 ]
 multi = torch.cat(per_chip)
 
-assert torch.equal(ref, multi)   # byte-for-byte
+assert torch.equal(ref, multi)  # byte-for-byte
 ```
 
 ### 2. Seed invariance
@@ -157,12 +156,12 @@ experiment gives the user a consistent stream, not a different one.
 
 ```python
 # Record position
-position = gen.position()   # returns the current counter
+position = gen.position()  # returns the current counter
 
 # ... run, crash, restart on different chip count ...
 
 new_gen = trnrand.Generator(seed=s, partition_rank=r, partition_size=P_new)
-new_gen.advance_to(position)   # resume from the same logical index
+new_gen.advance_to(position)  # resume from the same logical index
 ```
 
 Position is a single integer (the global counter index), portable
@@ -240,8 +239,7 @@ N = 4096
 full = philox_uniform_cpu(N, seed=42, counter_offset=0)
 for P in [2, 4, 8, 16]:
     chunks = [
-        philox_uniform_cpu(N // P, seed=42, counter_offset=r * (N // P) // 4)
-        for r in range(P)
+        philox_uniform_cpu(N // P, seed=42, counter_offset=r * (N // P) // 4) for r in range(P)
     ]
     assert torch.equal(full, torch.cat(chunks))
 ```

@@ -341,6 +341,35 @@ class TestBulkMatchesReference:
             chunks.append(out)
         assert torch.equal(torch.cat(chunks), full)
 
+    @pytest.mark.parametrize("key_mode", ["draw", "counter"])
+    @pytest.mark.parametrize("fn", ["normal", "uniform", "uniform_into"])
+    @pytest.mark.parametrize("parts", [2, 4])
+    def test_partitioned_generators_every_call(self, native, monkeypatch, fn, parts, key_mode):
+        # Each call advances the counter past all P ranks' slices, so the ranks
+        # tile the single-chip stream on every call, not only the first. Advancing
+        # by one rank's share made rank r's second draw reuse rank r+1's first
+        # counters (duplicate values with key_mode="counter").
+        monkeypatch.setattr(distributions, "_nki_active", lambda: True)
+        n = 512 * 3 if fn != "uniform_into" else 16_384
+
+        def draw(m, g):
+            if fn == "uniform_into":
+                buf = torch.empty(m)
+                trnrand.uniform_into(buf, generator=g)
+                return buf
+            return getattr(trnrand, fn)(m, generator=g)
+
+        def gen(**kw):
+            return trnrand.Generator(seed=31, key_mode=key_mode, **kw)
+
+        one = gen()
+        full = [draw(parts * n, one) for _ in range(3)]
+        gens = [gen(partition_rank=r, partition_size=parts) for r in range(parts)]
+        per_rank = [[draw(n, g) for _ in range(3)] for g in gens]
+        for c in range(3):
+            assert torch.equal(torch.cat([per_rank[r][c] for r in range(parts)]), full[c]), c
+        assert all(g._counter == one._counter for g in gens)
+
     def test_generator_advances_like_before(self, native, monkeypatch):
         monkeypatch.setattr(distributions, "_nki_active", lambda: True)
         g = trnrand.Generator(seed=8)
