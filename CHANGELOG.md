@@ -9,14 +9,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
-- **Partitioned generators reused counters from the second draw on** (silent). A
-  `Generator(partition_rank=r, partition_size=P)` advanced its counter by one
-  rank's share after each NKI draw, so rank r's next draw used the counters
-  rank r+1 had just used. With `key_mode="counter"` the ranks returned
-  duplicate values; with `key_mode="draw"` the ranks no longer concatenated to
-  the single-chip stream after the first call. Every draw (`uniform`, `normal`,
-  `exponential`, `poisson`, the `*_into` variants and the `torch.compile` route)
-  now advances past all P slices. Unpartitioned generators are unchanged.
+- **Partitioned generators reused counters from the second draw on** (silent).
+  Affects released versions **0.7.0 through 0.11.0**, on the NKI path only
+  (`set_backend("nki")`, or `"auto"` on Neuron hardware); the PyTorch CPU path
+  is not affected. A `Generator(partition_rank=r, partition_size=P)` with P > 1
+  advanced its counter by one rank's share after each draw, so rank r's next
+  draw used the counters rank r+1 had just used.
+  - `key_mode="counter"` (0.8.0 to 0.11.0): the key is fixed per seed, so rank
+    r's draw k+1 **returned the same values** as rank r+1's draw k. Streams
+    across ranks contained duplicates from the second call on.
+  - `key_mode="draw"` (the default, and the only behaviour in 0.7.x): each call
+    takes a fresh key, so values did not repeat, but from the second call on
+    the ranks no longer concatenated to the single-chip stream, as the
+    partition API documents.
+  - Every draw (`uniform`, `normal`, `exponential`, `poisson`, the `*_into`
+    variants and the `torch.compile` route) now advances past all P slices.
+    Unpartitioned generators (P = 1) were never affected.
 - `halton_nki(start_index=s)` started at Halton index `max(s, 1)`, so
   `start_index=0` and `1` gave the same points and chunked calls repeated a
   point at each chunk boundary. Point j is now index `s + j + 1`, the CPU
