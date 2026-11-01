@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- **`exponential(dtype=torch.float16 / torch.bfloat16)` returned `inf` / biased samples** (silent). Affects released versions **0.1.0 through 0.12.1**, on the PyTorch path. The uniform variate was drawn in the output dtype: float16 has ~11 random bits, so `u == 0` about once in 2^11, and the `1e-10` clamp underflows to 0 (`-log(0) = inf`; 487 inf in 2M samples). bfloat16 mapped `u == 0` (about once in 2^8) to 23.0, which biased the mean +4.5 %. The uniform is now drawn in at least float32; float32 and float64 output is bit-identical (#80).
+
 ## [0.12.1] - 2026-11-01
 
 Validated on Trn2 (trn2.3xlarge, Neuron SDK 2.33.0, native TorchNeuron) — see trnsci/trnsci#35.
