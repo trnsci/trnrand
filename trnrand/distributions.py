@@ -166,10 +166,14 @@ def exponential(
         u = torch.clamp(u, min=1e-10)
         return (-torch.log(u) / rate).to(dtype).reshape(size)
     gen = (generator or get_default_generator()).torch_generator
-    u = torch.empty(*size, dtype=dtype).uniform_(0, 1, generator=gen)
+    # Draw the uniform in at least float32: a float16 / bfloat16 uniform has only
+    # ~11 / ~8 random bits, so u == 0 is common, and 1e-10 underflows to 0 in
+    # float16 (-log(0) = inf). float32 / float64 are unchanged (#80).
+    work = torch.promote_types(dtype, torch.float32)
+    u = torch.empty(*size, dtype=work).uniform_(0, 1, generator=gen)
     # Clamp to avoid log(0)
     u = torch.clamp(u, min=1e-10)
-    return -torch.log(u) / rate
+    return (-torch.log(u) / rate).to(dtype)
 
 
 def bernoulli(

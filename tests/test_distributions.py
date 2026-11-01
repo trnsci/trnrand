@@ -87,6 +87,27 @@ class TestExponential:
         np.testing.assert_allclose(x.mean().item(), 1.0 / rate, atol=0.02)
 
 
+class TestExponentialReducedPrecision:
+    """float16 / bfloat16 output must be finite and unbiased (#80)."""
+
+    @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
+    def test_finite_and_unbiased(self, dtype):
+        x = trnrand.exponential(1_000_000, rate=2.5, dtype=dtype, generator=Generator(seed=0))
+        assert x.dtype == dtype
+        assert torch.isfinite(x).all()
+        # Exp(2.5): mean 0.4, sd 0.4; 6 sigma at n=1e6 is 0.0024, plus rounding.
+        assert abs(x.double().mean().item() - 0.4) < 0.004
+        assert x.max().item() < 10.0  # no -log(1e-10) spike at 23 / 2.5
+
+    @pytest.mark.parametrize("dtype", [torch.float32, torch.float64])
+    def test_full_precision_unchanged(self, dtype):
+        g = torch.Generator().manual_seed(4)
+        u = torch.empty(1000, dtype=dtype).uniform_(0, 1, generator=g)
+        ref = -torch.log(torch.clamp(u, min=1e-10)) / 3.0
+        gen = Generator(seed=4)
+        assert torch.equal(trnrand.exponential(1000, rate=3.0, dtype=dtype, generator=gen), ref)
+
+
 class TestBernoulli:
     def test_binary(self):
         g = Generator(seed=42)
