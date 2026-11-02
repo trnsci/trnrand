@@ -206,7 +206,8 @@ class GeneratorProgram:
                 raw = threefry_stream_uniform(
                     n_actual, seed=self._seed, counter_offset=counter_offset
                 )
-                raw = -torch.log(raw) / kwargs["rate"]
+                # Clamp as exponential() does: the kernel can emit u == 0 (#82).
+                raw = -torch.log(torch.clamp(raw, min=1e-10)) / kwargs["rate"]
                 buf.copy_(raw.reshape(buf.shape))
 
             # Advance counter by the FULL single-chip step size so that the

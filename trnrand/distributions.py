@@ -166,10 +166,14 @@ def exponential(
         u = torch.clamp(u, min=1e-10)
         return (-torch.log(u) / rate).to(dtype).reshape(size)
     gen = (generator or get_default_generator()).torch_generator
-    u = torch.empty(*size, dtype=dtype).uniform_(0, 1, generator=gen)
+    # Draw the uniform in at least float32: a float16 / bfloat16 uniform has only
+    # ~11 / ~8 random bits, so u == 0 is common, and 1e-10 underflows to 0 in
+    # float16 (-log(0) = inf). float32 / float64 are unchanged (#80).
+    work = torch.promote_types(dtype, torch.float32)
+    u = torch.empty(*size, dtype=work).uniform_(0, 1, generator=gen)
     # Clamp to avoid log(0)
     u = torch.clamp(u, min=1e-10)
-    return -torch.log(u) / rate
+    return (-torch.log(u) / rate).to(dtype)
 
 
 def bernoulli(
@@ -455,7 +459,9 @@ def exponential_into(
         counter_offset = gen._partition_rank * streaming_batches + gen._counter
         u = threefry_stream_uniform(n, seed=seed, counter_offset=counter_offset)
         gen._counter += streaming_batches * gen._partition_size  # every chip's slice
-        raw = -torch.log(u) / rate
+        # The kernel emits k * 2^-24, k >= 0: clamp as exponential() does, or
+        # u == 0 (p = 2^-24 per sample) gives +inf (#82).
+        raw = -torch.log(torch.clamp(u, min=1e-10)) / rate
         buf.copy_(raw.reshape(buf.shape))
         return
     gen_t = (generator or get_default_generator()).torch_generator

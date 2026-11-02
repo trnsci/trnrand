@@ -82,7 +82,8 @@ identically. Users who never use multi-chip pay nothing.
 
 ### `Generator.advance(n)` — checkpoint primitive
 
-A cheap way to skip forward in the logical stream:
+A cheap way to skip forward in the logical stream (a true skip-ahead
+with `key_mode="counter"`; see "Checkpoint resumption" below):
 
 ```python
 gen.advance(1_000_000)  # skip 1M samples; counter jumps, no work done
@@ -166,6 +167,15 @@ new_gen.advance_to(position)  # resume from the same logical index
 
 Position is a single integer (the global counter index), portable
 across cluster topologies.
+
+This holds with `key_mode="counter"`, where the Threefry key is fixed by
+the seed and the counter is the whole stream state. With the default
+`key_mode="draw"` each NKI draw also takes a fresh key from the host
+`torch.Generator`; that key sequence depends on the number of draws, which
+the position does not record, so `advance_to(position)` does not resume
+the stream and warns (`trnrand.AdvanceWarning`, #76). Checkpoint with
+`gen.get_state()` / `new_gen.set_state(state)` in that mode; it carries
+the host generator state and the counter.
 
 ## What GPU libraries typically can't do
 

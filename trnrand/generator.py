@@ -2,13 +2,13 @@
 Random number generator state management for Trainium.
 
 Provides a Generator class that wraps torch.Generator for CPU/CUDA
-and will wrap NKI-based on-device RNG for Trainium. Reproducible
-seeding is critical for scientific computing — same seed, same stream,
-regardless of backend.
+and carries the Threefry counter that the NKI on-device RNG draws from.
+Reproducible seeding is critical for scientific computing — same seed,
+same stream on a given backend.
 
-The Philox counter-based RNG is the natural NKI target because it's
-stateless (counter + key → output), embarrassingly parallel across
-tiles, and used by both PyTorch and JAX as their default engine.
+Counter-based RNGs (Threefry, Philox) are the natural NKI target because
+they're stateless (counter + key → output) and embarrassingly parallel
+across tiles.
 """
 
 from __future__ import annotations
@@ -16,6 +16,7 @@ from __future__ import annotations
 import itertools
 import math
 import os
+import warnings
 import weakref
 from typing import TYPE_CHECKING
 
@@ -35,6 +36,28 @@ _BATCH_SIZE: int = 128 * 4
 _HANDLES = itertools.count()
 
 _KEY_MODES = ("draw", "counter")
+
+
+class AdvanceWarning(UserWarning):
+    """`Generator.advance` / `advance_to` called with ``key_mode="draw"``.
+
+    In that mode they move only the Threefry counter: the next NKI draw still
+    takes a fresh key from the host ``torch.Generator``, so they do not resume
+    a stream recorded with :meth:`Generator.position` (#76). Checkpoint with
+    :meth:`Generator.get_state` / :meth:`Generator.set_state`, or use
+    ``key_mode="counter"``.
+    """
+
+
+def _warn_draw_mode(method: str) -> None:
+    warnings.warn(
+        f'Generator.{method}() with key_mode="draw" moves only the Threefry counter; '
+        "the next NKI draw still takes a fresh key from the host torch.Generator, so "
+        "this does not resume a stream recorded with position() (#76). To checkpoint, "
+        'use get_state()/set_state(); for counter skip-ahead, use key_mode="counter".',
+        AdvanceWarning,
+        stacklevel=3,
+    )
 
 
 def _key48(seed: int) -> int:
@@ -166,13 +189,37 @@ class Generator:
         """Logical sample count consumed from this generator's stream.
 
         Returns the number of samples that have been drawn (rounded up to the
-        nearest Threefry batch boundary). Use with :meth:`advance_to` for
-        checkpoint / resume::
+        nearest Threefry batch boundary), i.e. the stream counter in samples.
+
+        To checkpoint and resume, save the full state; this works in both key
+        modes and on both the NKI and PyTorch paths::
+
+            state = gen.get_state()
+            # ... experiment runs, crashes, restarts ...
+            new_gen = Generator(seed=s, partition_rank=r, partition_size=P)
+            new_gen.set_state(state)   # resume from the same point
+
+        ``advance_to(position())`` resumes only with ``key_mode="counter"``,
+        where the Threefry key is fixed by the seed and the position is the
+        whole stream state, so it is portable across ``partition_size``::
 
             pos = gen.position()
-            # ... experiment runs, crashes, or cluster is reshaped ...
-            new_gen = Generator(seed=s, partition_rank=r, partition_size=P)
-            new_gen.advance_to(pos)   # resume from the same point
+            new_gen = Generator(seed=s, partition_rank=r, partition_size=P,
+                                key_mode="counter")
+            new_gen.advance_to(pos)    # resume from the same point
+
+        With the default ``key_mode="draw"`` each NKI draw takes a fresh key
+        from the host ``torch.Generator``. That key sequence depends on how
+        many draws were made, which the position does not record, so
+        :meth:`advance_to` cannot resume the stream and warns
+        (:class:`AdvanceWarning`, #76).
+
+        Scope of ``advance`` / ``advance_to`` in counter mode: the NKI
+        ``uniform``, ``normal`` and ``standard_normal`` draws. The other NKI
+        distributions (``exponential``, ``gamma``, ``poisson``, the ``*_into``
+        variants, ...) take a fresh host key per call in both modes, and the
+        PyTorch path draws through ``torch.Generator``, which has no
+        skip-ahead; ``get_state``/``set_state`` covers all of them.
         """
         return self._counter * _BATCH_SIZE
 
@@ -182,15 +229,30 @@ class Generator:
         Increments the internal counter by ``ceil(n_samples / 512)`` batches.
         Cheap — no RNG work is performed.
 
+        This is a true skip-ahead only with ``key_mode="counter"`` (see
+        :meth:`position` for the scope). With ``key_mode="draw"`` it moves the
+        counter but not the per-draw host key, so it emits
+        :class:`AdvanceWarning` (#76) whenever the counter moves.
+
         Args:
             n_samples: Number of samples to skip (non-negative).
         """
         if n_samples < 0:
             raise ValueError(f"n_samples must be non-negative; got {n_samples}")
-        self._counter += math.ceil(n_samples / _BATCH_SIZE)
+        step = math.ceil(n_samples / _BATCH_SIZE)
+        if step and self._key_mode == "draw":
+            _warn_draw_mode("advance")
+        self._counter += step
 
     def advance_to(self, position: int) -> None:
-        """Jump to an absolute sample position for checkpoint / resume.
+        """Jump to an absolute sample position (``key_mode="counter"`` resume).
+
+        With ``key_mode="counter"``, ``advance_to(pos)`` on a fresh generator
+        with the same seed resumes the stream at ``pos = gen.position()``,
+        for any partition layout (see :meth:`position` for the scope). With
+        ``key_mode="draw"`` it does not resume the stream: it sets the counter
+        and, if that moves it, emits :class:`AdvanceWarning`; use :meth:`get_state` /
+        :meth:`set_state` to checkpoint instead (#76).
 
         Args:
             position: Target sample index (non-negative, as returned by
@@ -198,7 +260,10 @@ class Generator:
         """
         if position < 0:
             raise ValueError(f"position must be non-negative; got {position}")
-        self._counter = position // _BATCH_SIZE
+        target = position // _BATCH_SIZE
+        if target != self._counter and self._key_mode == "draw":
+            _warn_draw_mode("advance_to")
+        self._counter = target
 
     def _chip_counter_offset(self, n_elements: int) -> int:
         """Counter offset for chip r of P dispatching n_elements samples.

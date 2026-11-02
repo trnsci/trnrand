@@ -42,14 +42,14 @@ trn1-compiler-rejected constructs eliminated from the kernel call trees. trn1
 hardware validation: 4/5 `TestThreefryNKI` pass; Threefry normal kernel blocked
 by NCC_IBIR605 (trn1-only). Self-contained trn2 Terraform root; TMPDIR fix.
 
-## v0.4.1 — trn2 hardware validation _(pending — pre-staged in `feat/trn2-validated`)_
+## v0.4.1 — trn2 hardware validation _(shipped 2026-04-18)_
 
 Both `test_normal_kernel_distribution` and `test_normal_kernel_matches_box_muller_cpu`
 pass on trn2.3xlarge (XPASS). NCC_IBIR605 confirmed trn1-only; does not affect
 trn2+. `xfail` marks removed. Closes
 [#2](https://github.com/trnsci/trnrand/issues/2).
 
-## v0.5.0 — QMC on-device + NKI distributions _(planned)_
+## v0.5.0 — QMC on-device + NKI distributions _(shipped 2026-04-21)_
 
 Extend the stateless GpSimd infra to quasi-random sequences and the distribution
 kernels that currently use CPU fallbacks.
@@ -67,15 +67,16 @@ kernels that currently use CPU fallbacks.
   (gamma-ratio method). _CPU path shipped in v0.2.0; NKI pending._
 - [#14](https://github.com/trnsci/trnrand/issues/14) — Gamma distribution
   (Marsaglia-Tsang + boost). _CPU path shipped in v0.2.0; NKI pending._
-- [#15](https://github.com/trnsci/trnrand/issues/15) — Poisson distribution
-  (Knuth / Atkinson rejection). _CPU path shipped in v0.2.0; NKI pending._
+- [#15](https://github.com/trnsci/trnrand/issues/15) — Poisson distribution.
+  _CPU path shipped in v0.2.0; NKI path for `λ ≥ 20` (normal approximation)
+  shipped in v0.7.1._
 - [#16](https://github.com/trnsci/trnrand/issues/16) — Chi-squared
   distribution (sum of squared normals). _CPU path shipped in v0.2.0;
   NKI pending._
 - [#17](https://github.com/trnsci/trnrand/issues/17) — Truncated normal on
   the Vector Engine (currently host-side rejection).
 
-## v0.6.0 — Phase 3: single-chip streaming performance _(planned)_
+## v0.6.0 — Phase 3: single-chip streaming performance _(shipped 2026-04-22)_
 
 Batched-tile RNG streaming, NEFF compile-cache reuse, per-kernel tuning
 so the NKI path is meaningfully faster than the PyTorch fallback.
@@ -90,7 +91,7 @@ per-call dispatch model, not a perf tweak.
   `trnrand.normal_into(buf)` streaming API, Sobol/Halton perf parity,
   published tokens/sec + GB/s benchmarks.
 
-## v0.7.0 — Phase 4: multi-chip counter partitioning _(planned)_
+## v0.7.0 — Phase 4: multi-chip counter partitioning _(shipped 2026-04-27)_
 
 Philox's counter-based design makes cross-chip sharding trivial — each
 NeuronCore gets a disjoint counter subrange, outputs are bit-exact vs
@@ -107,7 +108,28 @@ property.
   `Generator` accepts `partition_rank` / `partition_size`; near-linear
   strong scaling on `trn1.32xlarge`.
 
-## v0.8.0 — Phase 5: trn2 wider-PSUM fast path _(planned)_
+In 0.7.0–0.11.0 partitioned generators (P > 1) on the NKI path reused
+counters from the second draw on; fixed in v0.12.0.
+
+## v0.8.0–v0.12.1 — TorchNeuron on Trn2 _(shipped 2026-10-28 to 2026-11-01)_
+
+Validated on Trn2 (Neuron SDK 2.33, native TorchNeuron); see the
+[CHANGELOG](https://github.com/trnsci/trnrand/blob/main/CHANGELOG.md).
+
+- v0.8.0 — native PyTorch dispatch on TorchNeuron alongside the XLA path
+  (#54); Philox bit-exact on hardware (#56); wide-tile bulk Threefry kernels
+  (#60); `torch.compile` support with `key_mode="counter"` (#61).
+- v0.9.0 — faster full-word bulk kernels; `normal()` end to end beats CPU
+  `randn`.
+- v0.10.0 — opt-in multi-core bulk draws, `set_cores` (bit-identical across
+  core counts).
+- v0.11.0 — pinned host output: bulk draws of 8M values and up 1.5–2.9×
+  faster end to end.
+- v0.12.0 — partitioned-generator counter fix; Halton `start_index` and
+  Sobol index-guard fixes.
+- v0.12.1 — `get_state` / `set_state` carry the NKI stream counter (#74).
+
+## Phase 5: trn2 wider-PSUM fast path _(open, unscheduled)_
 
 Exploit trn2's larger partition count without maintaining two separately
 tuned codebases; runtime capability detection picks the right kernel.
@@ -122,8 +144,8 @@ trnrand's roadmap aligns with the
 
 | Suite Phase | trnrand Milestone | Tracker |
 |---|---|---|
-| Phase 1 — correctness on hardware | v0.4.0 / v0.4.1 | [#18](https://github.com/trnsci/trnrand/issues/18) |
+| Phase 1 — correctness on hardware | v0.4.0 / v0.4.1, v0.8.0 (Trn2 native) | [#18](https://github.com/trnsci/trnrand/issues/18) |
 | Phase 2 — precision | *(N/A — trnrand is precision-neutral)* | — |
 | Phase 3 — single-chip perf | v0.6.0 | [#19](https://github.com/trnsci/trnrand/issues/19) |
 | Phase 4 — multi-chip | v0.7.0 | [#20](https://github.com/trnsci/trnrand/issues/20) |
-| Phase 5 — generation-specific | v0.8.0 | [#21](https://github.com/trnsci/trnrand/issues/21) |
+| Phase 5 — generation-specific | *(unscheduled)* | [#21](https://github.com/trnsci/trnrand/issues/21) |
