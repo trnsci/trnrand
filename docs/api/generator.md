@@ -6,8 +6,12 @@ path draws from on the GpSimd engine.
 
 ## `Generator(seed=None, device="cpu", partition_rank=0, partition_size=1, key_mode=None)`
 
-Construct a seeded generator. `seed=None` leaves the underlying
-`torch.Generator` unseeded (random state).
+Construct a seeded generator. `seed=None` seeds the underlying
+`torch.Generator` from OS entropy, so every unseeded generator (and the
+module default generator used when no `generator=` is passed) draws an
+independent stream; `gen.torch_generator.initial_seed()` reports the seed
+chosen. Through 0.13.0, `seed=None` used torch's fixed default seed and
+every unseeded generator drew the same stream (#98).
 
 - `partition_rank` / `partition_size`: this generator is rank `r` of `P`
   in a counter-partitioned stream; concatenating the ranks' draws in order

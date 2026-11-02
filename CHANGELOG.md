@@ -87,6 +87,7 @@ Lands in 0.14.0. **Changes the stream for float64 callers on the NKI path**
   float64 under `TRNRAND_REQUIRE_NKI`. `philox4x32_nki` refuses float, bool and
   complex counter / key words with `TypeError` (integer words still go to
   int32 as before).
+- **`Generator(seed=None)` drew the same stream every time** (silent). Affects released versions **0.1.0 through 0.13.0**, on every backend. A fresh `torch.Generator` starts at torch's fixed default seed, so every unseeded `Generator`, in every process, and the module default generator behind un-seeded `trnrand.uniform(...)` etc. drew one identical stream: one unseeded generator per worker gave perfectly correlated workers. `seed=None` now seeds from OS entropy (`torch.Generator.seed()`); `gen.torch_generator.initial_seed()` reports the seed chosen, and `get_state` / `set_state` replay as before. Code that never seeds now gets different output each run. Every seeded stream (`Generator(seed=s)`, `manual_seed(s)`) is bit-identical (#98).
 
 ## [0.13.0] - 2026-11-02
 
