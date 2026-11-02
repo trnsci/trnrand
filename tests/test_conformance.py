@@ -777,8 +777,7 @@ def test_generator_rejects_bad_arguments():
         G(1).advance_to(-1)
 
 
-def test_unseeded_generators_are_independent(request):
-    known(request, "98", "Generator(seed=None) always draws the same stream", strict=True)
+def test_unseeded_generators_are_independent():
     a = host(tr.uniform(100, generator=tr.Generator()))
     b = host(tr.uniform(100, generator=tr.Generator()))
     assert not torch.equal(a, b)
