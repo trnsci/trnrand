@@ -248,59 +248,72 @@ class TestPartitionEquivalenceProgram:
 # ── Advance / resume ──────────────────────────────────────────────────────────
 
 
-@pytest.mark.nki_simulator
-class TestAdvanceResumeEquivalence:
-    """advance() followed by continued generation must match an uninterrupted run."""
+def _advance(gen, method, arg):
+    """advance / advance_to; key_mode="draw" warns that it is no resume (#76)."""
+    if gen.key_mode == "draw":
+        with pytest.warns(trnrand.AdvanceWarning):
+            getattr(gen, method)(arg)
+    else:
+        getattr(gen, method)(arg)
 
-    def test_advance_then_uniform(self):
+
+@pytest.mark.nki_simulator
+@pytest.mark.parametrize("key_mode", ["draw", "counter"])
+class TestAdvanceResumeEquivalence:
+    """advance() on a fresh generator followed by one draw must match the tail
+    of one uninterrupted draw. Holds in both key modes: a fresh draw-mode
+    generator takes the same first host key. Resuming after several draws
+    holds only in counter mode, see tests/test_advance_resume.py (#76)."""
+
+    def test_advance_then_uniform(self, key_mode):
         seed = 11
         N_skip = 512 * 8  # must be a multiple of _BATCH_SIZE
         N_draw = 512 * 4
 
         # Uninterrupted 1-chip run; take the tail
         trnrand.set_backend("nki")
-        g_ref = Generator(seed=seed)
+        g_ref = Generator(seed=seed, key_mode=key_mode)
         full = trnrand.uniform(N_skip + N_draw, generator=g_ref)
         tail_ref = full[N_skip:]
 
         # Skip N_skip, then draw N_draw
-        g_skip = Generator(seed=seed)
-        g_skip.advance(N_skip)
+        g_skip = Generator(seed=seed, key_mode=key_mode)
+        _advance(g_skip, "advance", N_skip)
         tail_skip = trnrand.uniform(N_draw, generator=g_skip)
 
         assert torch.equal(tail_ref, tail_skip), (
             "advance then uniform: output does not match uninterrupted tail"
         )
 
-    def test_advance_then_normal(self):
+    def test_advance_then_normal(self, key_mode):
         seed = 22
         N_skip = 512 * 8
         N_draw = 512 * 4
 
         trnrand.set_backend("nki")
-        g_ref = Generator(seed=seed)
+        g_ref = Generator(seed=seed, key_mode=key_mode)
         full = trnrand.normal(N_skip + N_draw, generator=g_ref)
         tail_ref = full[N_skip:]
 
-        g_skip = Generator(seed=seed)
-        g_skip.advance(N_skip)
+        g_skip = Generator(seed=seed, key_mode=key_mode)
+        _advance(g_skip, "advance", N_skip)
         tail_skip = trnrand.normal(N_draw, generator=g_skip)
 
         assert torch.equal(tail_ref, tail_skip)
 
-    def test_advance_to_resume(self):
+    def test_advance_to_resume(self, key_mode):
         """advance_to(position) picks up the same stream as advance(n)."""
         seed = 33
         N_skip = 512 * 6
         N_draw = 512 * 2
 
         trnrand.set_backend("nki")
-        g_advance = Generator(seed=seed)
-        g_advance.advance(N_skip)
+        g_advance = Generator(seed=seed, key_mode=key_mode)
+        _advance(g_advance, "advance", N_skip)
         out_advance = trnrand.uniform(N_draw, generator=g_advance)
 
-        g_to = Generator(seed=seed)
-        g_to.advance_to(N_skip)
+        g_to = Generator(seed=seed, key_mode=key_mode)
+        _advance(g_to, "advance_to", N_skip)
         out_to = trnrand.uniform(N_draw, generator=g_to)
 
         assert torch.equal(out_advance, out_to)

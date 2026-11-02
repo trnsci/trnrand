@@ -7,6 +7,55 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **Guard against the NKI trace-cache closure bug ([aws-neuron/aws-neuron-sdk#1454](https://github.com/aws-neuron/aws-neuron-sdk/issues/1454),
+  trnsci/trnsci#35).** `tests/test_trace_cache_safety.py` (CPU) finds every
+  `@nki.jit` kernel and fails if its body, or a helper it calls, reads a
+  closure variable or a module global that is not a constant expression
+  (reviewed exceptions are allow-listed with a reason), and checks each
+  kernel's `__closure__` at runtime against a stub `nki`.
+- Tests: `conftest.py` no longer turns the NKI trace cache off. Neuron tests
+  run with it on, as under `import torch_neuronx`, with a fresh
+  `NKI_TRACE_CACHE_URL` directory per session (no stale editable-install
+  traces). `NKI_ENABLE_TRACE_CACHE=0` still turns it off.
+- README: known platform issue note for #1454.
+- **Reference-conformance suite (trnsci/trnsci#105).** `tests/test_conformance.py`
+  checks every public API against independent references (scipy.stats
+  KS / chi-square and moments, scipy.stats.qmc Sobol / Halton, the Latin
+  hypercube stratum property, documented support, dtype, shape, seeding and
+  state contracts) at sizes 0, 1, 127, 129, 1000 and the Threefry block
+  boundaries, on CPU in the regular CI job (~5 s). `--backend nki|auto` and
+  `--conformance-device neuron` run the same cases on a Neuron host.
+  Needs-decision behaviour (#98, #99, #100) and the new #101 are strict xfails.
+### Fixed
+
+- **`exponential(dtype=torch.float16 / torch.bfloat16)` returned `inf` / biased samples** (silent). Affects released versions **0.1.0 through 0.12.1**, on the PyTorch path. The uniform variate was drawn in the output dtype: float16 has ~11 random bits, so `u == 0` about once in 2^11, and the `1e-10` clamp underflows to 0 (`-log(0) = inf`; 487 inf in 2M samples). bfloat16 mapped `u == 0` (about once in 2^8) to 23.0, which biased the mean +4.5 %. The uniform is now drawn in at least float32; float32 and float64 output is bit-identical (#80).
+### Fixed
+
+- **`latin_hypercube(dtype=torch.float16 / torch.bfloat16)` was not a Latin hypercube** (silent). Affects released versions **0.1.0 through 0.12.1**, on every backend. Each column was computed as `(perm + u) / n` in the output dtype, and the rounding pushed points into the next stratum or onto 1.0. For n = 64, 8 of 20 float16 and all bfloat16 columns had a stratum with two points. Points outside their stratum are now moved back in (all others are bit-identical), and a dtype that cannot hold a point in every stratum (bfloat16 n > 256, float16 n > 2048) raises `ValueError`. float32 / float64 are unchanged (#96).
+
+### Fixed
+
+- **`advance_to(position())` did not resume the stream with the default
+  `key_mode="draw"`** (silent), although the `position()` docstring gave it as
+  the checkpoint / resume recipe. Affects released versions **0.7.0 through
+  0.12.1**, on the NKI path (`set_backend("nki")`, or `"auto"` on Neuron
+  hardware). Each draw-mode NKI draw takes a fresh key from the host
+  `torch.Generator`, and `advance` / `advance_to` move only the Threefry
+  counter, so a resumed generator drew its first key at the advanced counter
+  and returned different values (Trn2: `uniform` and `normal`, n = 512, 1000,
+  4096). The key sequence depends on the number of draws, which the position
+  does not record, so draw mode cannot resume from a position without changing
+  its streams. Instead:
+  - `advance` / `advance_to` with `key_mode="draw"` now emit
+    `trnrand.AdvanceWarning` when they move the counter. They still move it
+    exactly as before, and no stream changes for code that does not call them.
+  - The `position()` / `advance()` / `advance_to()` docstrings now give
+    `get_state()` / `set_state()` (fixed in 0.12.1, #74) as the checkpoint
+    recipe, in both key modes and on both paths, and state that
+    `advance_to(position())` resumes only with `key_mode="counter"`, for the
+    NKI `uniform` / `normal` / `standard_normal` draws (#76).
 ### Fixed
 
 - **`exponential_into()` and `GeneratorProgram` `.exponential()` steps returned `inf`** (silent). Affects released versions **0.6.0 through 0.12.1**, on the NKI path only (`set_backend("nki")`, or `"auto"` on Neuron hardware). They computed `-log(u)` without the `1e-10` clamp `exponential()` uses, and the Threefry uniform kernels emit `u == 0` with probability 2^-24 per sample (about 4 `inf` in a 64M buffer). Only those samples change (#82).
