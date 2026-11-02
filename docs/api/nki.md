@@ -16,12 +16,40 @@ trnrand.set_backend("nki")  # force NKI (requires neuronxcc)
 `trnrand.HAS_NKI` is `True` when `nki>=0.3.0` is importable.
 `trnrand.get_backend()` returns the active backend name.
 
+## Precision and dtypes
+
+The NKI kernels draw float32 values (24-bit uniforms; every kernel operand is
+an int32 word, or float32 for Box-Muller). A float64 request
+(`dtype=torch.float64`, or a float64 buffer for `*_into` /
+`GeneratorProgram.stream_into`) follows the trnsci suite policy (trnrand#105,
+from 0.14.0):
+
+| Mode | float64 request |
+|---|---|
+| `set_backend("auto")` | Drawn in torch at float64 precision: the same values as `set_backend("pytorch")`, no kernel launch. |
+| `set_backend("nki")` | The float32 kernels run and the result is cast to float64; one `UserWarning` per op per process says the precision is float32. |
+| `TRNRAND_REQUIRE_NKI=1` | `NotImplementedError` (either backend). |
+
+The result dtype always matches the PyTorch backend: the requested dtype (or
+the buffer's) for float32, float64, float16 and bfloat16. float16 / bfloat16
+requests run on the kernels and are rounded from float32, staying inside the
+documented support. Integer, bool and complex requests take the PyTorch path
+(the same values or the same error as `set_backend("pytorch")`), or raise
+`NotImplementedError` under `TRNRAND_REQUIRE_NKI=1`.
+
+`sobol` is the exception: the PyTorch backend's float64 Sobol is a float32
+`SobolEngine` draw cast to float64, so a float64 Sobol request keeps the NKI
+kernel on every backend, without a warning or a `TRNRAND_REQUIRE_NKI` error.
+
+Before 0.14.0, float64 on the NKI path (including `"auto"` on a Neuron host)
+was always the cast float32 kernel output, with no warning.
+
 ## Environment variables
 
 | Env var | Effect |
 |---|---|
 | `TRNRAND_USE_SIMULATOR=1` | Dispatch routes kernels through `nki.simulate(kernel)(numpy_args)` on CPU — bypasses `torch_xla` and hardware. Use for fast correctness iteration; no NEFF compile. |
-| `TRNRAND_REQUIRE_NKI=1` | Kernel-path failures re-raise instead of silently falling back to PyTorch. Used by the validation suite to catch silent kernel breakage. |
+| `TRNRAND_REQUIRE_NKI=1` | Kernel-path failures re-raise instead of silently falling back to PyTorch, and requests the kernels cannot serve at full precision (float64, integer, bool, complex) raise `NotImplementedError` (see [Precision and dtypes](#precision-and-dtypes)). Used by the validation suite to catch silent kernel breakage. |
 | `TRNRAND_CORES=<n>\|auto` | Default for `set_cores` (below). Off (1) by default. |
 | `TRNRAND_CORES_MIN_ELEMENTS` | Requests below this (default 8,388,608) stay on one core. |
 | `TRNRAND_PINNED_OUTPUT=0` | Turns off pinned host output for large native-path draws (on by default since v0.11.0). |

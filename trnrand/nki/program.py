@@ -169,7 +169,7 @@ class GeneratorProgram:
             self._stream_into_pytorch(buffers)
 
     def _stream_into_nki(self, buffers: dict[str, torch.Tensor]) -> None:
-        from .dispatch import threefry_stream_normal, threefry_stream_uniform
+        from .dispatch import _float64_to_torch, threefry_stream_normal, threefry_stream_uniform
 
         # The kernels draw real float32 values. An integer / bool buffer raises on
         # the CPU path too (normal_ / uniform_ / exponential_), and a complex one
@@ -182,6 +182,14 @@ class GeneratorProgram:
                     f"GeneratorProgram.stream_into: buffer {out_name!r} is {dt}; the NKI "
                     "path fills real floating buffers (float32, float64, float16, bfloat16)"
                 )
+        # float64 buffers (trnrand#105): filled in torch at float64 precision under
+        # backend "auto", by the float32 kernel (cast, warned once) under "nki";
+        # TRNRAND_REQUIRE_NKI raises here, before anything is drawn.
+        in_torch = {
+            out_name
+            for _dist, _n, _kwargs, out_name in self._steps
+            if _float64_to_torch("GeneratorProgram.stream_into", buffers[out_name].dtype)
+        }
 
         for dist, _n, kwargs, out_name in self._steps:
             buf = buffers[out_name]
@@ -193,7 +201,15 @@ class GeneratorProgram:
             # self._counter, so its counter_offset is shifted by partition_rank.
             counter_offset = self._counter + self._partition_rank * streaming_batches
 
-            if dist == "normal":
+            if out_name in in_torch:
+                # Same counter slots as the kernel step, so the other steps'
+                # streams do not move; the torch generator is keyed by
+                # (seed, counter_offset), so calls and ranks stay independent.
+                gen = torch.Generator()
+                gen.manual_seed((self._seed * 0x9E3779B97F4A7C15 + counter_offset) % (1 << 63))
+                self._fill_torch(buf, dist, kwargs, gen)
+
+            elif dist == "normal":
                 raw = threefry_stream_normal(
                     n_actual, seed=self._seed, counter_offset=counter_offset
                 )
@@ -240,13 +256,20 @@ class GeneratorProgram:
         gen.manual_seed(self._seed ^ self._counter)
 
         for dist, _n, kwargs, out_name in self._steps:
-            buf = buffers[out_name]
-            if dist == "normal":
-                buf.normal_(mean=kwargs["mean"], std=kwargs["std"], generator=gen)
-            elif dist == "uniform":
-                buf.uniform_(kwargs["low"], kwargs["high"], generator=gen)
-            elif dist == "exponential":
-                buf.exponential_(lambd=kwargs["rate"], generator=gen)
+            self._fill_torch(buffers[out_name], dist, kwargs, gen)
 
         # Increment counter to distinguish consecutive calls on the CPU path.
         self._counter += 1
+
+    @staticmethod
+    def _fill_torch(buf: torch.Tensor, dist: str, kwargs: dict, gen: torch.Generator) -> None:
+        # A device buffer is filled on the host (the generator is a CPU one).
+        out = buf if buf.device.type == "cpu" else torch.empty(buf.shape, dtype=buf.dtype)
+        if dist == "normal":
+            out.normal_(mean=kwargs["mean"], std=kwargs["std"], generator=gen)
+        elif dist == "uniform":
+            out.uniform_(kwargs["low"], kwargs["high"], generator=gen)
+        elif dist == "exponential":
+            out.exponential_(lambd=kwargs["rate"], generator=gen)
+        if out is not buf:
+            buf.copy_(out)

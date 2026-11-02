@@ -253,14 +253,78 @@ def _no_kernel_for_dtype(what: str, *tensors: torch.Tensor) -> None:
         )
 
 
+# ── float64 requests: the suite-wide policy (trnrand#105, trnsci/trnsci#35) ──
+#
+# Every trnrand kernel draws float32 values (24-bit uniforms), so a float64
+# request cannot get float64 precision from a kernel. The policy:
+#   backend "auto"          -> the torch path, which draws in float64 (the same
+#                              values as set_backend("pytorch"));
+#   backend "nki"           -> the float32 kernel, cast to float64, with one
+#                              UserWarning per op per process;
+#   TRNRAND_REQUIRE_NKI=1   -> NotImplementedError (takes precedence).
+# `sobol` is the exception: the pytorch backend's float64 Sobol is a float32
+# SobolEngine draw cast to float64, so torch has no float64-precision Sobol to
+# route to (it would only swap the random shift for a different scrambling).
+# A float64 Sobol request keeps the kernel on every backend, without warning.
+_FP64_WARNED: set[str] = set()
+
+
+_PKG_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__))) + os.sep
+
+
+def _caller_stacklevel() -> int:
+    """`stacklevel` for warnings.warn that points at the first frame outside trnrand."""
+    import sys
+
+    frame, level = sys._getframe(1), 1
+    while frame is not None and os.path.abspath(frame.f_code.co_filename).startswith(_PKG_DIR):
+        frame, level = frame.f_back, level + 1
+    return level
+
+
+def _warn_fp64_once(what: str, hint: str = 'set_backend("auto") draws float64 in torch.') -> None:
+    if what in _FP64_WARNED:
+        return
+    _FP64_WARNED.add(what)
+    warnings.warn(
+        f"trnrand {what}: float64 on the NKI kernels; they compute in float32, so "
+        f"the result has float32 precision (cast to float64). {hint}",
+        UserWarning,
+        stacklevel=_caller_stacklevel(),
+    )
+
+
+def _float64_to_torch(what: str, dtype: torch.dtype) -> bool:
+    """Apply the float64 policy to a request for `dtype` on the NKI path.
+
+    Returns True when the call should take the torch path (float64 under
+    backend "auto"), False when the kernel runs (any other dtype, or float64
+    under backend "nki", after a one-time warning). Under TRNRAND_REQUIRE_NKI
+    a float64 request raises NotImplementedError.
+    """
+    if dtype != torch.float64:
+        return False
+    if _REQUIRE_NKI:
+        raise NotImplementedError(
+            f"trnrand {what}: the NKI kernels draw float32 values and cannot give a "
+            "float64 result float64 precision. Unset TRNRAND_REQUIRE_NKI to draw "
+            'float64 in torch (set_backend("auto")) or cast the float32 kernel '
+            'output (set_backend("nki"))'
+        )
+    if _backend == "nki":
+        _warn_fp64_once(what)
+        return False
+    return True
+
+
 def _kernel_operands(op_name: str, *tensors: torch.Tensor, what: str) -> list[torch.Tensor]:
     """Coerce a caller's tensors to the dtype kernel `op_name` takes.
 
     Integer-word kernels: any integer tensor goes to int32 (the low 32 bits, as
     the wrappers always did); float, complex and bool raise TypeError. Float32
     kernels: float16 / bfloat16 go to float32 exactly; float64 is cast to
-    float32 as before (refused under TRNRAND_REQUIRE_NKI); integer, bool and
-    complex raise TypeError. The caller casts the result back.
+    float32 with a one-time warning (refused under TRNRAND_REQUIRE_NKI);
+    integer, bool and complex raise TypeError. The caller casts the result back.
     """
     target = _KERNEL_DTYPES[op_name][0]
     out = []
@@ -274,6 +338,7 @@ def _kernel_operands(op_name: str, *tensors: torch.Tensor, what: str) -> list[to
                 raise TypeError(f"trnrand {what}: takes real floating tensors; got {dt}")
             if dt == torch.float64:
                 _no_kernel_for_dtype(what, t)
+                _warn_fp64_once(what, hint="Use box_muller_cpu for float64 precision.")
         elif dt == torch.bool or dt.is_floating_point or dt.is_complex:
             raise TypeError(f"trnrand {what}: takes integer tensors; got {dt}")
         out.append(t.to(target))
@@ -1242,8 +1307,8 @@ if HAS_NKI:
         """
         assert uniforms.numel() % 2 == 0, "Box-Muller needs pairs"
         # float16 / bfloat16 / float64 run in float32 and come back in the
-        # caller's dtype, as box_muller_cpu returns (float64 is refused under
-        # TRNRAND_REQUIRE_NKI: the kernel has float32 precision).
+        # caller's dtype, as box_muller_cpu returns (float64 warns once, and is
+        # refused under TRNRAND_REQUIRE_NKI: the kernel has float32 precision).
         out_dtype = uniforms.dtype
         (uniforms,) = _kernel_operands("box_muller", uniforms, what="box_muller_nki")
         uniforms = uniforms.contiguous()

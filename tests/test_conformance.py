@@ -23,6 +23,12 @@ On a Neuron host, the same cases on the NKI path, with ``*_into`` /
     pytest tests/test_conformance.py --backend nki --conformance-device neuron
     pytest tests/test_conformance.py --backend auto --conformance-device neuron
 
+float64 follows the suite policy (trnrand#105): under ``--backend pytorch``
+and ``--backend auto`` a float64 request is drawn in torch and is checked at
+float64 tolerance; only under ``--backend nki`` (float32 kernels, cast, one
+warning per op) does float64 get the float32 tolerance. ``sobol`` is float32
+resolution on every backend (the PyTorch path is a float32 SobolEngine draw).
+
 Known issues are ``xfail`` with the issue number. Needs-decision items are
 ``strict=True``, so the test fails (XPASS) once the behaviour changes and the
 mark must be removed. Bugs with an open fix PR are ``strict=False``.
@@ -47,7 +53,11 @@ REDUCED = (torch.float16, torch.bfloat16)
 SIZES = [1, 127, 129, 1000]
 
 # scipy warns that Sobol balance needs n = 2^k; awkward n is the point here.
-pytestmark = pytest.mark.filterwarnings("ignore:The balance properties of Sobol:UserWarning")
+pytestmark = [
+    pytest.mark.filterwarnings("ignore:The balance properties of Sobol:UserWarning"),
+    # --backend nki: float64 casts warn once per op by design (trnrand#105).
+    pytest.mark.filterwarnings("ignore:trnrand .*float64 on the NKI kernels:UserWarning"),
+]
 BLOCK_SIZES = [511, 512, 513, 16385]
 
 
@@ -71,6 +81,19 @@ def backend(request) -> str:
 def nki_like(backend) -> bool:
     """True when distributions take the NKI path in this run."""
     return backend != "pytorch" and tr.HAS_NKI
+
+
+@pytest.fixture
+def fp32_fp64(backend) -> bool:
+    """True when float64 requests carry float32 precision in this run: only the
+    explicit NKI backend casts float32 kernel output (trnrand#105); "auto"
+    draws float64 in torch."""
+    return backend == "nki" and tr.HAS_NKI
+
+
+def precision(dt, fp32_fp64: bool):
+    """The dtype whose precision a `dt` result carries in this run."""
+    return torch.float32 if (dt == torch.float64 and fp32_fp64) else dt
 
 
 @pytest.fixture
@@ -250,7 +273,7 @@ def assert_support(x, support):
 
 @pytest.mark.parametrize("dt", FLOAT_DTYPES, ids=lambda d: str(d)[6:])
 @pytest.mark.parametrize("name", list(DISTS))
-def test_distribution_matches_scipy(request, nki_like, name, dt):
+def test_distribution_matches_scipy(request, nki_like, fp32_fp64, name, dt):
     known(
         request,
         "94",
@@ -265,7 +288,7 @@ def test_distribution_matches_scipy(request, nki_like, name, dt):
     assert tuple(x.shape) == (n,)
     assert bool(torch.isfinite(x).all()), f"{int((~torch.isfinite(x)).sum())} non-finite"
     assert_support(x, support)
-    assert_moments(x, ref, dt, heavy=heavy)
+    assert_moments(x, ref, precision(dt, fp32_fp64), heavy=heavy)
     if support[0] == "count":
         assert_chi2_discrete(x[:50_000], ref)
     else:
@@ -952,11 +975,12 @@ def test_sobol_seed_determinism():
 
 @pytest.mark.parametrize("d", [1, 4, 10])
 @pytest.mark.parametrize("n", [0, *SIZES])
-def test_halton_matches_scipy(n, d):
+def test_halton_matches_scipy(fp32_fp64, n, d):
     x = host(tr.halton(n, d, dtype=torch.float64))
     ref = torch.from_numpy(qmc.Halton(d, scramble=False).random(n + 1)[1:])
     assert tuple(x.shape) == (n, d)
-    torch.testing.assert_close(x, ref, atol=1e-6, rtol=0)
+    # float32 kernel (cast) only under --backend nki; otherwise float64 in torch.
+    torch.testing.assert_close(x, ref, atol=1e-6 if fp32_fp64 else 1e-12, rtol=0)
 
 
 @pytest.mark.parametrize("dt", FLOAT_DTYPES, ids=lambda d: str(d)[6:])

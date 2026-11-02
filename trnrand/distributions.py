@@ -35,19 +35,30 @@ def _nki_active() -> bool:
     return HAS_NKI
 
 
+def _fp64_to_torch(what: str, dtype: torch.dtype) -> bool:
+    """The float64 policy (trnrand#105): True when a float64 request takes the
+    torch path (backend "auto"); False for every other dtype and for float64
+    under backend "nki" (float32 kernel, cast, one-time UserWarning). Raises
+    NotImplementedError for float64 under TRNRAND_REQUIRE_NKI."""
+    from .nki.dispatch import _float64_to_torch
+
+    return _float64_to_torch(what, dtype)
+
+
 def _nki_takes(dtype: torch.dtype, what: str) -> bool:
     """Whether an NKI draw can produce `dtype` the way the pytorch backend does.
 
     The kernels produce float32 values that are then cast to the requested
-    real floating dtype (float64 included, as before). For an integer, bool or
-    complex request the pytorch backend either raises (integer / bool) or draws
+    real floating dtype; float64 follows `_fp64_to_torch` (torch under
+    "auto", a warned cast under "nki"). For an integer, bool or complex
+    request the pytorch backend either raises (integer / bool) or draws
     something a cast of a real float32 draw is not (a complex variate), so those
     requests take the pytorch route: the same error, or the same values, as
     ``set_backend("pytorch")`` (trnsci/trnsci#35). Under TRNRAND_REQUIRE_NKI
     they raise NotImplementedError instead.
     """
     if dtype.is_floating_point:
-        return True
+        return not _fp64_to_torch(what, dtype)
     from .nki.dispatch import _no_kernel_for_dtype
 
     _no_kernel_for_dtype(what, dtype)
@@ -203,8 +214,10 @@ def exponential(
     Mean: 1/λ
     """
     # Integer / bool requests cast on both backends; complex raises on the
-    # pytorch backend (clamp), so it takes that route.
-    if _nki_active() and (not dtype.is_complex or _nki_takes(dtype, "exponential")):
+    # pytorch backend (clamp), so it takes that route; float64 per #105.
+    if _nki_active() and (
+        _nki_takes(dtype, "exponential") if dtype.is_complex or dtype.is_floating_point else True
+    ):
         from .nki.dispatch import threefry_uniform_nki
 
         gen = generator or get_default_generator()
@@ -274,7 +287,7 @@ def gamma(
     Gamma(shape+1) and multiplies by U^(1/shape) (the "boost" identity).
     """
     assert shape > 0 and scale > 0, "gamma requires shape > 0 and scale > 0"
-    if _nki_active():
+    if _nki_active() and not _fp64_to_torch("gamma", dtype):
         from .nki.dispatch import gamma_nki
 
         gen = generator or get_default_generator()
@@ -335,7 +348,7 @@ def chi_squared(
     Equivalent to Gamma(df/2, scale=2). Mean: df; Variance: 2·df.
     """
     assert df > 0, "chi_squared requires df > 0"
-    if _nki_active():
+    if _nki_active() and not _fp64_to_torch("chi_squared", dtype):
         from .nki.dispatch import chi_squared_nki
 
         gen = generator or get_default_generator()
@@ -361,7 +374,7 @@ def beta(
     Mean: α/(α+β); Variance: αβ/((α+β)²(α+β+1)).
     """
     assert alpha > 0 and beta > 0, "beta requires alpha > 0 and beta > 0"
-    if _nki_active():
+    if _nki_active() and not _fp64_to_torch("beta", dtype):
         from .nki.dispatch import beta_nki
 
         gen = generator or get_default_generator()
@@ -393,7 +406,7 @@ def poisson(
     if _nki_active():
         from .nki.dispatch import _POISSON_NORMAL_THRESHOLD, poisson_nki
 
-        if lam >= _POISSON_NORMAL_THRESHOLD:
+        if lam >= _POISSON_NORMAL_THRESHOLD and not _fp64_to_torch("poisson", dtype):
             gen = generator or get_default_generator()
             seed = _nki_seed(gen)
             n = math.prod(size)
@@ -403,6 +416,18 @@ def poisson(
     gen = (generator or get_default_generator()).torch_generator
     rates = torch.full(size, float(lam), dtype=torch.float32)
     return torch.poisson(rates, generator=gen).to(dtype)
+
+
+def _host_fill(buf: torch.Tensor, method: str, *args, generator, **kwargs) -> None:
+    """`buf.<method>(*args, generator=...)` with the host torch generator. A
+    device buffer (e.g. a float64 request routed to torch on Neuron, #105) is
+    filled on the host and copied over; a CPU buffer is filled in place."""
+    if buf.device.type == "cpu":
+        getattr(buf, method)(*args, generator=generator, **kwargs)
+        return
+    tmp = torch.empty(buf.shape, dtype=buf.dtype)
+    getattr(tmp, method)(*args, generator=generator, **kwargs)
+    buf.copy_(tmp)
 
 
 def normal_into(
@@ -440,7 +465,7 @@ def normal_into(
         buf.copy_(raw.reshape(buf.shape))
         return
     gen_t = (generator or get_default_generator()).torch_generator
-    buf.normal_(mean, std, generator=gen_t)
+    _host_fill(buf, "normal_", mean, std, generator=gen_t)
 
 
 def uniform_into(
@@ -479,7 +504,7 @@ def uniform_into(
         buf.copy_(raw.reshape(buf.shape))
         return
     gen_t = (generator or get_default_generator()).torch_generator
-    buf.uniform_(low, high, generator=gen_t)
+    _host_fill(buf, "uniform_", low, high, generator=gen_t)
 
 
 def exponential_into(
@@ -516,7 +541,7 @@ def exponential_into(
         buf.copy_(raw.reshape(buf.shape))
         return
     gen_t = (generator or get_default_generator()).torch_generator
-    buf.exponential_(lambd=rate, generator=gen_t)
+    _host_fill(buf, "exponential_", lambd=rate, generator=gen_t)
 
 
 def truncated_normal(

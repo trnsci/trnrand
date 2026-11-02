@@ -16,12 +16,18 @@ Every public API that can reach a kernel is then driven with float64,
 bfloat16, float16, int32, int64, bool and complex64 requests under backends
 ``nki`` and ``auto``, and must give the same result dtype (or the same
 exception type) as the pytorch backend.
+
+The float64 policy (trnrand#105) is covered in all three modes: backend
+``auto`` draws float64 in torch (no kernel launch, the pytorch backend's
+values), backend ``nki`` runs the float32 kernels and warns once per op, and
+``TRNRAND_REQUIRE_NKI`` raises ``NotImplementedError``.
 """
 
 import importlib.util
 import pathlib
 import sys
 import types
+import warnings
 
 import numpy as np
 import pytest
@@ -33,6 +39,10 @@ from trnrand import distributions, quasi
 from trnrand.nki import program
 
 _PKG = pathlib.Path(trnrand.nki.__file__).parent
+
+# The float64 cast warning under backend "nki" (trnrand#105) is asserted by the
+# float64 policy tests below; elsewhere it is expected noise.
+pytestmark = pytest.mark.filterwarnings("ignore:trnrand .*float64 on the NKI kernels:UserWarning")
 
 # Independent of trnrand's own table: what the kernel signatures take.
 _I32 = (torch.int32,)
@@ -377,9 +387,9 @@ def test_require_nki_raises_instead_of_routing(env, path):
             APIS["exponential"](torch.complex64)
         with pytest.raises(NotImplementedError, match="TRNRAND_REQUIRE_NKI"):
             env.d.box_muller_nki(torch.rand(8, dtype=torch.float64))
-        # Exact casts and the documented float64 output route still run.
+        # Exact casts still run; float64 raises (trnrand#105, tested below).
         assert env.d.box_muller_nki(torch.rand(8).bfloat16()).dtype == torch.bfloat16
-        assert APIS["uniform"](torch.float64).dtype == torch.float64
+        assert APIS["uniform"](torch.float32).dtype == torch.float32
         assert APIS["normal"](torch.float16).dtype == torch.float16
     finally:
         env.d.set_backend("auto")
@@ -480,3 +490,187 @@ def test_every_op_is_driven(env, monkeypatch):
     env.use_path("xla")
     drive()  # per-tile kernels
     assert seen == set(ALLOWED)
+
+
+# ── float64 policy (trnrand#105) ───────────────────────────────────────────
+
+# APIs whose float64 request takes torch under "auto" -> warning op name.
+FP64_ROUTED = {
+    "uniform": "uniform",
+    "uniform_ab": "uniform",
+    "uniform_counter": "uniform",
+    "normal": "normal",
+    "normal_part": "normal",
+    "standard_normal": "normal",
+    "exponential": "exponential",
+    "truncated_normal": "truncated_normal",
+    "gamma": "gamma",
+    "gamma_small": "gamma",
+    "chi_squared": "chi_squared",
+    "beta": "beta",
+    "poisson": "poisson",
+    "normal_into": "normal_into",
+    "uniform_into": "uniform_into",
+    "exponential_into": "exponential_into",
+    "halton": "halton",
+    "program_normal": "GeneratorProgram.stream_into",
+    "program_uniform": "GeneratorProgram.stream_into",
+    "program_exponential": "GeneratorProgram.stream_into",
+}
+# The pytorch backend's float64 Sobol is a float32 SobolEngine draw cast, so
+# float64 Sobol keeps the kernel on every backend (no warning, no raise).
+FP64_KERNEL = ("sobol", "sobol_noscramble")
+
+
+def _fp64_warnings(record):
+    return [w for w in record if "float64 on the NKI kernels" in str(w.message)]
+
+
+def test_fp64_tables_cover_every_kernel_api():
+    no_kernel = {"bernoulli", "randint", "randperm", "latin_hypercube", "poisson_small"}
+    assert set(FP64_ROUTED) | set(FP64_KERNEL) | no_kernel == set(APIS)
+
+
+@pytest.mark.parametrize("path", ["native", "xla", "sim"])
+@pytest.mark.parametrize("api", sorted(FP64_ROUTED))
+def test_fp64_auto_draws_in_torch(env, path, api):
+    """backend "auto": no kernel launch, no warning, float64-precision values."""
+    env.use_path(path)
+    fn = APIS[api]
+    env.d.set_backend("pytorch")
+    ref = fn(torch.float64)
+    env.d.set_backend("auto")
+    with warnings.catch_warnings(record=True) as rec:
+        warnings.simplefilter("always")
+        got = fn(torch.float64)
+    assert env.kernels.calls == [], f"{api}: kernel launched under auto"
+    assert not _fp64_warnings(rec)
+    assert got.dtype == torch.float64 and got.shape == ref.shape
+    if api.startswith("program_"):
+        # The no-NKI program path seeds differently; check the values instead.
+        assert bool(torch.isfinite(got).all())
+    else:
+        assert torch.equal(got, ref), f"{api}: not the pytorch backend's float64 draw"
+    if api in ("uniform", "uniform_into", "program_uniform", "halton"):
+        # Not on the float32 kernels' 24-bit grid (k * 2^-24).
+        grid = (got.double() * 2**24) % 1
+        assert bool((grid != 0).any()), f"{api}: float32-resolution values"
+
+
+@pytest.mark.parametrize("kind", ["normal", "uniform", "exponential"])
+def test_fp64_program_step_keeps_other_streams(env, kind):
+    """A float64 step drawn in torch takes the same counter slots as its kernel step."""
+
+    def run(dt):
+        env.kernels.calls.clear()
+        prog = getattr(_gen().new_program().normal(40, out="a"), kind)(40, out="x")
+        prog = prog.normal(40, out="b").build()
+        bufs = {"a": torch.empty(40), "x": torch.empty(40, dtype=dt), "b": torch.empty(40)}
+        prog.stream_into(bufs)
+        return prog._counter, len(env.kernels.calls)
+
+    c32, k32 = run(torch.float32)
+    c64, k64 = run(torch.float64)
+    assert c64 == c32
+    assert 0 < k64 < k32  # only the float64 step left the kernels
+
+
+@pytest.mark.parametrize("path", ["native", "xla", "sim"])
+@pytest.mark.parametrize("api", sorted(FP64_ROUTED))
+def test_fp64_nki_casts_and_warns_once(env, path, api):
+    """backend "nki": the float32 kernels run (the stand-ins check the int32 /
+    float32 operands) and the op warns exactly once across repeated calls."""
+    env.use_path(path)
+    env.d.set_backend("nki")
+    try:
+        with warnings.catch_warnings(record=True) as rec:
+            warnings.simplefilter("always")
+            outs = [APIS[api](torch.float64) for _ in range(3)]
+    finally:
+        env.d.set_backend("auto")
+    assert env.kernels.calls, f"{api}: no kernel launched under nki"
+    assert all(o.dtype == torch.float64 for o in outs)
+    got = _fp64_warnings(rec)
+    assert len(got) == 1, [str(w.message) for w in got]
+    assert issubclass(got[0].category, UserWarning)
+    assert f"trnrand {FP64_ROUTED[api]}:" in str(got[0].message)
+    assert got[0].filename == __file__, got[0].filename  # points at the caller
+
+
+def test_fp64_nki_warns_once_per_op(env):
+    env.d.set_backend("nki")
+    try:
+        with warnings.catch_warnings(record=True) as rec:
+            warnings.simplefilter("always")
+            for _ in range(2):
+                for api in ("uniform", "uniform_ab", "normal", "standard_normal", "halton"):
+                    APIS[api](torch.float64)
+                APIS["uniform"](torch.float32)
+    finally:
+        env.d.set_backend("auto")
+    msgs = [str(w.message).split(":")[0] for w in _fp64_warnings(rec)]
+    assert sorted(msgs) == ["trnrand halton", "trnrand normal", "trnrand uniform"]
+
+
+@pytest.mark.parametrize("backend", ["nki", "auto"])
+@pytest.mark.parametrize("api", FP64_KERNEL)
+def test_fp64_sobol_keeps_the_kernel(env, backend, api):
+    env.d.set_backend(backend)
+    try:
+        with warnings.catch_warnings(record=True) as rec:
+            warnings.simplefilter("always")
+            out = APIS[api](torch.float64)
+        env.d._REQUIRE_NKI = True
+        assert APIS[api](torch.float64).dtype == torch.float64  # no raise either
+    finally:
+        env.d.set_backend("auto")
+    assert out.dtype == torch.float64
+    assert "sobol_gray_code" in env.kernels.calls
+    assert not _fp64_warnings(rec)
+
+
+@pytest.mark.parametrize("path", ["native", "xla", "sim"])
+@pytest.mark.parametrize("backend", ["nki", "auto"])
+@pytest.mark.parametrize("api", sorted(FP64_ROUTED))
+def test_fp64_require_nki_raises(env, path, backend, api):
+    env.use_path(path)
+    env.d._REQUIRE_NKI = True
+    env.d.set_backend(backend)
+    try:
+        with pytest.raises(NotImplementedError, match="TRNRAND_REQUIRE_NKI"):
+            APIS[api](torch.float64)
+        assert APIS[api](torch.float32).dtype == torch.float32  # float32 still runs
+    finally:
+        env.d.set_backend("auto")
+
+
+def test_fp64_require_nki_program_draws_nothing(env):
+    env.d._REQUIRE_NKI = True
+    prog = _gen().new_program().normal(8, out="z").uniform(8, out="u").build()
+    before = prog._counter
+    with pytest.raises(NotImplementedError, match="TRNRAND_REQUIRE_NKI"):
+        prog.stream_into({"z": torch.empty(8), "u": torch.empty(8, dtype=torch.float64)})
+    assert prog._counter == before
+    assert env.kernels.calls == []
+
+
+def test_fp64_poisson_small_lam_stays_in_torch(env):
+    # lam < 20 never used a kernel; REQUIRE_NKI does not change that.
+    env.d._REQUIRE_NKI = True
+    env.d.set_backend("nki")
+    try:
+        assert APIS["poisson_small"](torch.float64).dtype == torch.float64
+    finally:
+        env.d.set_backend("auto")
+    assert env.kernels.calls == []
+
+
+@pytest.mark.parametrize("path", ["native", "xla", "sim"])
+def test_box_muller_nki_fp64_warns_once(env, path):
+    env.use_path(path)
+    with warnings.catch_warnings(record=True) as rec:
+        warnings.simplefilter("always")
+        for _ in range(3):
+            assert env.d.box_muller_nki(torch.rand(8, dtype=torch.float64)).dtype == torch.float64
+    got = _fp64_warnings(rec)
+    assert len(got) == 1 and "box_muller_nki" in str(got[0].message)
