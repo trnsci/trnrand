@@ -975,13 +975,6 @@ def test_halton_matches_scipy(n, d):
 def test_quasi_dtype_and_unit_interval(request, fn, dt):
     # sobol: [0, 1); halton: (0, 1); latin_hypercube: [0, 1) by construction.
     lhs = "latin" in request.node.callspec.id
-    known(
-        request,
-        "101",
-        "sobol/halton in float16/bfloat16 round points up to 1.0",
-        strict=True,
-        when=dt in REDUCED and not lhs,
-    )
     n = 250 if lhs else 4096  # bf16 cannot hold 4096 LHS strata (raises by design, #96)
     x = host(fn(n, dt))
     assert x.dtype == dt

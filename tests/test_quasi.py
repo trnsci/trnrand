@@ -163,3 +163,75 @@ class TestLatinHypercubeReducedPrecision:
             perm = torch.randperm(100, generator=g)
             u = torch.rand(100, generator=g)
             assert torch.equal(x[:, d], (perm.float() + u) / 100)
+
+
+class TestQuasiReducedPrecisionRange:
+    """float16 / bfloat16 sobol / halton stay inside the unit interval (#101)."""
+
+    @pytest.fixture
+    def pytorch_backend(self):
+        # The SobolEngine references below are the PyTorch path; on a Neuron
+        # host the auto backend takes the NKI path (a random shift, #100).
+        prev = trnrand.get_backend()
+        trnrand.set_backend("pytorch")
+        yield
+        trnrand.set_backend(prev)
+
+    @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
+    @pytest.mark.parametrize(
+        "fn",
+        [
+            lambda n, dt: trnrand.sobol(n, 4, seed=3, dtype=dt),
+            lambda n, dt: trnrand.sobol(n, 4, scramble=False, dtype=dt),
+            lambda n, dt: trnrand.halton(n, 4, dtype=dt),
+        ],
+        ids=["sobol", "sobol_unscrambled", "halton"],
+    )
+    def test_below_one(self, fn, dtype):
+        x = fn(4096, dtype)
+        assert x.dtype == dtype
+        assert bool((x >= 0).all() and (x < 1).all()), f"{int((x >= 1).sum())} points >= 1"
+
+    @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
+    def test_only_points_rounding_to_one_change(self, pytorch_backend, dtype):
+        ref = torch.quasirandom.SobolEngine(4, scramble=True, seed=3).draw(4096)
+        cast = ref.to(dtype)
+        x = trnrand.sobol(4096, 4, seed=3, dtype=dtype)
+        hit = cast == 1
+        assert bool(hit.any())  # the case this guards actually occurs
+        assert torch.equal(x[~hit], cast[~hit])
+        top = torch.nextafter(torch.ones((), dtype=dtype), torch.zeros((), dtype=dtype))
+        assert bool((x[hit] == top).all())
+
+    @pytest.mark.parametrize("dtype", [torch.float32, torch.float64])
+    def test_full_precision_bit_identical(self, pytorch_backend, dtype):
+        ref = torch.quasirandom.SobolEngine(4, scramble=True, seed=3).draw(4096).to(dtype)
+        assert torch.equal(trnrand.sobol(4096, 4, seed=3, dtype=dtype), ref)
+
+    @pytest.mark.neuron
+    @pytest.mark.skipif(not trnrand.HAS_NKI, reason="requires the NKI path")
+    @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
+    @pytest.mark.parametrize(
+        "fn",
+        [
+            lambda dt: trnrand.sobol(4096, 4, seed=3, dtype=dt),
+            lambda dt: trnrand.sobol(4096, 4, scramble=False, dtype=dt),
+            lambda dt: trnrand.halton(4096, 4, dtype=dt),
+        ],
+        ids=["sobol", "sobol_unscrambled", "halton"],
+    )
+    def test_nki_only_points_rounding_to_one_change(self, fn, dtype):
+        # NKI return path: the reduced-precision output is the float32 NKI
+        # output cast, except points that round to 1.0.
+        prev = trnrand.get_backend()
+        trnrand.set_backend("nki")
+        try:
+            cast = fn(torch.float32).to(dtype)
+            x = fn(dtype)
+        finally:
+            trnrand.set_backend(prev)
+        hit = cast == 1
+        assert bool(hit.any())  # the case this guards actually occurs
+        assert torch.equal(x[~hit], cast[~hit])
+        top = torch.nextafter(torch.ones((), dtype=dtype), torch.zeros((), dtype=dtype))
+        assert bool((x[hit] == top).all())

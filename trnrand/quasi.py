@@ -53,7 +53,7 @@ def sobol(
 
             # sobol_nki shifts whenever seed != 0, so scramble=False must pass 0 (#90).
             nki_seed = (seed or 0) if scramble else 0
-            return sobol_nki(n_points, n_dims, seed=nki_seed).to(dtype)
+            return _below_one(sobol_nki(n_points, n_dims, seed=nki_seed).to(dtype))
         except ImportError:
             pass  # sobol_nki not yet available; fall through to CPU path
     engine = torch.quasirandom.SobolEngine(
@@ -61,7 +61,7 @@ def sobol(
         scramble=scramble,
         seed=seed,
     )
-    return engine.draw(n_points).to(dtype)
+    return _below_one(engine.draw(n_points).to(dtype))
 
 
 def halton(
@@ -85,14 +85,36 @@ def halton(
         try:
             from .nki.dispatch import halton_nki
 
-            return halton_nki(n_points, n_dims).to(dtype)
+            return _below_one(halton_nki(n_points, n_dims).to(dtype), open_low=True)
         except ImportError:
             pass  # halton_nki not yet available; fall through to CPU path
     primes = _first_n_primes(n_dims)
     result = torch.zeros(n_points, n_dims, dtype=dtype)
     for d in range(n_dims):
         result[:, d] = _halton_sequence(n_points, primes[d], dtype)
-    return result
+    return _below_one(result, open_low=True)
+
+
+_REDUCED = (torch.float16, torch.bfloat16)
+
+
+def _below_one(x: torch.Tensor, open_low: bool = False) -> torch.Tensor:
+    """Keep reduced-precision QMC points inside [0, 1) (or (0, 1)).
+
+    float16 / bfloat16 rounding sends points within half an ulp of 1 to
+    exactly 1.0 (#101). Those step back to the largest value below 1 in the
+    dtype; with `open_low`, points that round to 0 step up to the smallest
+    positive value. Every other point is unchanged, and float32 / float64
+    output is returned as is (bit-identical).
+    """
+    if x.dtype not in _REDUCED:
+        return x
+    one = torch.ones((), dtype=x.dtype, device=x.device)
+    zero = torch.zeros((), dtype=x.dtype, device=x.device)
+    x = torch.where(x >= one, torch.nextafter(one, zero), x)
+    if open_low:
+        x = torch.where(x <= zero, torch.nextafter(zero, one), x)
+    return x
 
 
 def _halton_sequence(n: int, base: int, dtype: torch.dtype) -> torch.Tensor:
