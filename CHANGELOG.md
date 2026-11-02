@@ -28,7 +28,42 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   boundaries, on CPU in the regular CI job (~5 s). `--backend nki|auto` and
   `--conformance-device neuron` run the same cases on a Neuron host.
   Needs-decision behaviour (#98, #99, #100) and the new #101 are strict xfails.
+- **One dtype guard at the NKI kernel boundary (trnsci/trnsci#35).**
+  `trnrand/nki/dispatch.py` has a per-kernel operand-dtype table
+  (`_KERNEL_DTYPES`: int32 words for every kernel, float32 for Box-Muller).
+  Every launch route enforces it itself (`_launch`, the native `nki_op` table
+  returned by `_get_native_ops`, and the simulator via `_simulator`), raising
+  `TypeError` naming the op and the dtypes, and an op without a table entry
+  cannot be loaded. `tests/test_kernel_dtype_guard.py` (CPU) drives every
+  public API through stand-in kernels on the native, XLA and simulator routes
+  with float64 / bfloat16 / float16 / int32 / int64 / bool / complex64 requests.
+
 ### Fixed
+
+- **NKI path: integer, bool and complex output requests no longer return
+  truncated or zero-imaginary values** (silent). Affects released versions
+  **through 0.12.1**, on the NKI path only (`set_backend("nki")`, or `"auto"`
+  on a Neuron host). `uniform`, `normal`, `standard_normal`,
+  `truncated_normal` and `normal_into` / `uniform_into` / `exponential_into`
+  cast a float32 draw to the requested dtype: `uniform(dtype=torch.int64)`
+  returned zeros and `normal(dtype=torch.complex64)` a zero imaginary part,
+  where the PyTorch path raises or draws a complex variate. These requests now
+  take the PyTorch path (the same error or the same values as
+  `set_backend("pytorch")`), and `exponential(dtype=complex)` raises as there.
+  `GeneratorProgram.stream_into` raises `NotImplementedError` for a non-real
+  buffer before drawing anything. Under `TRNRAND_REQUIRE_NKI=1` all of these
+  raise `NotImplementedError`. Real floating requests (float32, float64,
+  float16, bfloat16) are unchanged and give the same values as before; float64
+  keeps the float32-precision kernel route (#105, needs decision).
+- **`uniform_into` / `GeneratorProgram` uniform into a float16 / bfloat16
+  buffer could return `high`** (NKI path), as `uniform()` did before #94; they
+  now step back below `high` the same way. Other values are unchanged.
+- **`box_muller_nki` returned float32 for float64 / float16 / bfloat16 input**;
+  it now returns the input dtype (as `box_muller_cpu` does) with the same
+  values, refuses integer / bool / complex input with `TypeError`, and refuses
+  float64 under `TRNRAND_REQUIRE_NKI`. `philox4x32_nki` refuses float, bool and
+  complex counter / key words with `TypeError` (integer words still go to
+  int32 as before).
 
 - **`sobol` / `halton(dtype=torch.float16 / torch.bfloat16)` returned 1.0** (silent). Affects released versions **0.1.0 through 0.12.1**, on every backend. Points were computed in float32/float64 and cast with `.to(dtype)`, so points within half an ulp of 1 rounded to exactly 1.0, outside the documented `[0, 1)` (sobol) / `(0, 1)` (halton); e.g. 32 of 16384 bfloat16 coordinates at n = 4096. Those points now step back to the largest value below 1 in the dtype (halton points that would round to 0 step up to the smallest positive value); all other points, and float32 / float64 output, are bit-identical (#101).
 - **`exponential(dtype=torch.float16 / torch.bfloat16)` returned `inf` / biased samples** (silent). Affects released versions **0.1.0 through 0.12.1**, on the PyTorch path. The uniform variate was drawn in the output dtype: float16 has ~11 random bits, so `u == 0` about once in 2^11, and the `1e-10` clamp underflows to 0 (`-log(0) = inf`; 487 inf in 2M samples). bfloat16 mapped `u == 0` (about once in 2^8) to 23.0, which biased the mean +4.5 %. The uniform is now drawn in at least float32; float32 and float64 output is bit-identical (#80).

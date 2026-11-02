@@ -171,6 +171,18 @@ class GeneratorProgram:
     def _stream_into_nki(self, buffers: dict[str, torch.Tensor]) -> None:
         from .dispatch import threefry_stream_normal, threefry_stream_uniform
 
+        # The kernels draw real float32 values. An integer / bool buffer raises on
+        # the CPU path too (normal_ / uniform_ / exponential_), and a complex one
+        # would get a zero imaginary part, so refuse both before drawing anything
+        # (trnsci/trnsci#35).
+        for _dist, _n, _kwargs, out_name in self._steps:
+            dt = buffers[out_name].dtype
+            if not dt.is_floating_point:
+                raise NotImplementedError(
+                    f"GeneratorProgram.stream_into: buffer {out_name!r} is {dt}; the NKI "
+                    "path fills real floating buffers (float32, float64, float16, bfloat16)"
+                )
+
         for dist, _n, kwargs, out_name in self._steps:
             buf = buffers[out_name]
             n_actual = buf.numel()
@@ -199,6 +211,10 @@ class GeneratorProgram:
                 high = kwargs["high"]
                 if low != 0.0 or high != 1.0:
                     raw = raw * (high - low) + low
+                if buf.dtype in (torch.float16, torch.bfloat16) and high > low:
+                    from ..distributions import _below_high
+
+                    raw = _below_high(raw.to(buf.dtype), high)  # as uniform() does (#94)
                 buf.copy_(raw.reshape(buf.shape))
 
             elif dist == "exponential":

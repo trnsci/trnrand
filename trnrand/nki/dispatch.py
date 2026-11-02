@@ -149,13 +149,135 @@ def _get_dispatch_path() -> str:
 
 
 def _get_native_ops() -> dict:
-    """Import `_native` (registering the trnrand:: custom ops) on first use."""
+    """Import `_native` (registering the trnrand:: custom ops) on first use.
+
+    Every op comes back wrapped by `_guard_op`, so a launch through this table
+    checks its operand dtypes against `_KERNEL_DTYPES` (trnsci/trnsci#35).
+    """
     global _native_ops
     if _native_ops is None:
         from . import _native
 
-        _native_ops = _native.OPS
+        missing = sorted(set(_native.OPS) - set(_KERNEL_DTYPES))
+        if missing:
+            raise TypeError(f"trnrand: kernel ops {missing} have no _KERNEL_DTYPES entry")
+        _native_ops = {name: _guard_op(name, op) for name, op in _native.OPS.items()}
     return _native_ops
+
+
+# ── Kernel operand dtypes: one guard at the kernel boundary (trnsci/trnsci#35) ─
+#
+# Every trnrand kernel takes int32 words (counters, keys, lane indices, Gray
+# codes, Halton indices) except Box-Muller, which takes float32 uniforms. The
+# host wrappers build those operands themselves, but nothing stopped a float64,
+# int64 or bool tensor from reaching a kernel unchanged. Every launch route
+# (`_launch`, the native op table, the simulator) now checks its operands
+# against this table and raises TypeError naming the op and the dtypes, and a
+# kernel op without an entry cannot be launched at all. Wrappers that take a
+# caller's tensor coerce it first with `_kernel_operands`.
+_KERNEL_DTYPES: dict[str, tuple[torch.dtype, ...]] = {
+    "philox4x32": (torch.int32,),
+    "box_muller": (torch.float32,),
+    "threefry4x32": (torch.int32,),
+    "threefry_normal": (torch.int32,),
+    "sobol_gray_code": (torch.int32,),
+    "halton": (torch.int32,),
+    "threefry_streaming_normal": (torch.int32,),
+    "threefry_streaming_uniform": (torch.int32,),
+    "threefry_bulk_normal": (torch.int32,),
+    "threefry_bulk_uniform": (torch.int32,),
+    "threefry_bulk16_normal": (torch.int32,),
+    "threefry_bulk16_uniform": (torch.int32,),
+    "threefry_bulk32_normal": (torch.int32,),
+    "threefry_bulk32_uniform": (torch.int32,),
+}
+
+_NP_DTYPES = {np.dtype(np.int32): torch.int32, np.dtype(np.float32): torch.float32}
+
+
+def _operand_dtype(x):
+    if isinstance(x, torch.Tensor):
+        return x.dtype
+    if isinstance(x, np.ndarray):
+        return _NP_DTYPES.get(x.dtype, f"numpy.{x.dtype}")
+    return None  # not an array operand
+
+
+def _check_kernel_operands(op_name: str, *operands) -> None:
+    """Raise TypeError unless every array operand of kernel `op_name` has an allowed dtype."""
+    allowed = _KERNEL_DTYPES.get(op_name)
+    if allowed is None:
+        raise TypeError(f"trnrand: no _KERNEL_DTYPES entry for kernel op {op_name!r}")
+    got = [_operand_dtype(x) for x in operands]
+    bad = [d for d in got if d is not None and d not in allowed]
+    if bad:
+        raise TypeError(
+            f"trnrand kernel {op_name!r} takes {[str(d) for d in allowed]} operands; "
+            f"got {[str(d) for d in got if d is not None]}"
+        )
+
+
+def _guard_op(op_name: str, op):
+    def guarded(*args):
+        _check_kernel_operands(op_name, *args)
+        return op(*args)
+
+    guarded.__name__ = getattr(op, "__name__", op_name)
+    guarded.op_name = op_name
+    return guarded
+
+
+def _simulator(op_name: str, kernel):
+    """`nki.simulate(kernel)`, checking the numpy operands against `_KERNEL_DTYPES`."""
+    sim = nki.simulate(kernel)
+
+    def run(*arrays):
+        _check_kernel_operands(op_name, *arrays)
+        return sim(*arrays)
+
+    return run
+
+
+def _no_kernel_for_dtype(what: str, *tensors: torch.Tensor) -> None:
+    """Under TRNRAND_REQUIRE_NKI, refuse a dtype the kernels cannot take without
+    losing precision or meaning (same convention as trnblas#69).
+
+    Without it the caller is cast for the kernel or routed to torch, as the
+    call site documents.
+    """
+    if _REQUIRE_NKI:
+        dts = sorted({str(t.dtype) if isinstance(t, torch.Tensor) else str(t) for t in tensors})
+        raise NotImplementedError(
+            f"trnrand {what}: the NKI kernels do not take {dts}. "
+            "Unset TRNRAND_REQUIRE_NKI to cast or compute in torch."
+        )
+
+
+def _kernel_operands(op_name: str, *tensors: torch.Tensor, what: str) -> list[torch.Tensor]:
+    """Coerce a caller's tensors to the dtype kernel `op_name` takes.
+
+    Integer-word kernels: any integer tensor goes to int32 (the low 32 bits, as
+    the wrappers always did); float, complex and bool raise TypeError. Float32
+    kernels: float16 / bfloat16 go to float32 exactly; float64 is cast to
+    float32 as before (refused under TRNRAND_REQUIRE_NKI); integer, bool and
+    complex raise TypeError. The caller casts the result back.
+    """
+    target = _KERNEL_DTYPES[op_name][0]
+    out = []
+    for t in tensors:
+        dt = t.dtype
+        if dt == target:
+            out.append(t)
+            continue
+        if target.is_floating_point:
+            if not dt.is_floating_point:
+                raise TypeError(f"trnrand {what}: takes real floating tensors; got {dt}")
+            if dt == torch.float64:
+                _no_kernel_for_dtype(what, t)
+        elif dt == torch.bool or dt.is_floating_point or dt.is_complex:
+            raise TypeError(f"trnrand {what}: takes integer tensors; got {dt}")
+        out.append(t.to(target))
+    return out
 
 
 # ── Host results through the caching host allocator ─────────────────────────
@@ -230,6 +352,7 @@ def _launch(kernel, op_name: str, *tensors: torch.Tensor) -> torch.Tensor:
     `op_name` is the `trnrand::<op_name>` custom op used on the native path;
     the XLA path calls `kernel` directly on torch_xla tensors.
     """
+    _check_kernel_operands(op_name, *tensors)
     if _get_dispatch_path() == "native":
         orig = tensors[0].device
         op = _get_native_ops()[op_name]
@@ -1079,9 +1202,12 @@ if HAS_NKI:
             int32 tensor of shape `(lanes * 4,)` holding the Philox output.
         """
         n_lanes = counter_lo.shape[0]
-        counter_lo = counter_lo.to(torch.int32).contiguous()
-        key_lo = key_lo.to(torch.int32).contiguous()
-        key_hi = key_hi.to(torch.int32).contiguous()
+        counter_lo, key_lo, key_hi = (
+            t.contiguous()
+            for t in _kernel_operands(
+                "philox4x32", counter_lo, key_lo, key_hi, what="philox4x32_nki"
+            )
+        )
 
         chunks = []
         for start in range(0, n_lanes, _PHILOX_LANES_PER_TILE):
@@ -1092,7 +1218,7 @@ if HAS_NKI:
 
             if _use_simulator():
                 # CPU path: feed NumPy directly to nki.simulate(kernel).
-                out_np = nki.simulate(philox4x32_kernel)(
+                out_np = _simulator("philox4x32", philox4x32_kernel)(
                     cl_tile.cpu().numpy(),
                     kl_tile.cpu().numpy(),
                     kh_tile.cpu().numpy(),
@@ -1115,7 +1241,12 @@ if HAS_NKI:
         emitting 2 * 128 normals via Box-Muller pairing).
         """
         assert uniforms.numel() % 2 == 0, "Box-Muller needs pairs"
-        uniforms = uniforms.to(torch.float32).contiguous()
+        # float16 / bfloat16 / float64 run in float32 and come back in the
+        # caller's dtype, as box_muller_cpu returns (float64 is refused under
+        # TRNRAND_REQUIRE_NKI: the kernel has float32 precision).
+        out_dtype = uniforms.dtype
+        (uniforms,) = _kernel_operands("box_muller", uniforms, what="box_muller_nki")
+        uniforms = uniforms.contiguous()
         n_pairs = uniforms.numel() // 2
         tile_pairs = _PHILOX_LANES_PER_TILE  # one pair per "lane" for symmetry
 
@@ -1127,13 +1258,14 @@ if HAS_NKI:
             tile_slice = uniforms[start_pair * 2 : end_pair * 2].reshape(-1, 2).contiguous()
 
             if _use_simulator():
-                out_np = nki.simulate(box_muller_kernel)(tile_slice.cpu().numpy())
+                out_np = _simulator("box_muller", box_muller_kernel)(tile_slice.cpu().numpy())
                 out_tile = torch.from_numpy(np.asarray(out_np)).reshape(-1)
             else:
                 # Kernel returns (tile_len, 2); flatten to interleaved [z1, z2, z1, z2, ...].
                 out_tile = _launch(box_muller_kernel, "box_muller", tile_slice).reshape(-1)
             chunks.append(out_tile)
-        return torch.cat(chunks) if len(chunks) > 1 else chunks[0]
+        out = torch.cat(chunks) if len(chunks) > 1 else chunks[0]
+        return out.to(out_dtype)
 
     # ── Threefry 4×32-20 NKI kernel (byte-tile representation) ───────────────
     #
@@ -1929,7 +2061,7 @@ if HAS_NKI:
             gray_tile = gray_codes[tile_start : tile_start + LANES].contiguous()
 
             if _use_simulator():
-                out_np = nki.simulate(sobol_gray_code_kernel)(gray_tile.numpy())
+                out_np = _simulator("sobol_gray_code", sobol_gray_code_kernel)(gray_tile.numpy())
                 chunks.append(torch.from_numpy(np.asarray(out_np)))
             else:
                 out_tile = _launch(sobol_gray_code_kernel, "sobol_gray_code", gray_tile)
@@ -2099,7 +2231,7 @@ if HAS_NKI:
             tile = idx_col[tile_start : tile_start + LANES].contiguous()
 
             if _use_simulator():
-                out_np = nki.simulate(halton_kernel)(tile.numpy())
+                out_np = _simulator("halton", halton_kernel)(tile.numpy())
                 chunks.append(torch.from_numpy(np.asarray(out_np)))
             else:
                 out_tile = _launch(halton_kernel, "halton", tile)
@@ -3252,7 +3384,7 @@ def _threefry_uniform_per_tile(
         k3_np = np.zeros((tile_lanes, 1), dtype=np.int32)
 
         if _use_simulator():
-            out_np = nki.simulate(_kernel("threefry4x32_kernel"))(
+            out_np = _simulator("threefry4x32", _kernel("threefry4x32_kernel"))(
                 c0_np,
                 c1_np,
                 c2_np,
@@ -3309,7 +3441,7 @@ def _threefry_normal_per_tile(
         k3_np = np.zeros((tile_lanes, 1), dtype=np.int32)
 
         if _use_simulator():
-            out_np = nki.simulate(_kernel("threefry_normal_kernel"))(
+            out_np = _simulator("threefry_normal", _kernel("threefry_normal_kernel"))(
                 c0_np,
                 c1_np,
                 c2_np,
@@ -3399,7 +3531,7 @@ def _bulk_launches(normal: bool, n_elements, seed, counter_offset):
     op_name, F, n_launches, final, c0_np, sb_np, k_np = _bulk_host_inputs(
         normal, n_elements, seed, counter_offset
     )
-    sim = nki.simulate(_kernel(op_name + "_kernel"))
+    sim = _simulator(op_name, _kernel(op_name + "_kernel"))
     outs = [torch.from_numpy(np.asarray(sim(c0_np, sb_np[i], *k_np))) for i in range(n_launches)]
     return _bulk_result(outs, F, n_elements, final)
 
@@ -3658,7 +3790,7 @@ def _stream_launches(kernel_name: str, op_name: str, n_elements, seed, counter_o
     )
 
     if _use_simulator():
-        sim = nki.simulate(_kernel(kernel_name))
+        sim = _simulator(op_name, _kernel(kernel_name))
         outs = [
             torch.from_numpy(np.asarray(sim(c0_np, sb_np[i], *k_np))) for i in range(n_launches)
         ]

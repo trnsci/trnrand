@@ -35,6 +35,25 @@ def _nki_active() -> bool:
     return HAS_NKI
 
 
+def _nki_takes(dtype: torch.dtype, what: str) -> bool:
+    """Whether an NKI draw can produce `dtype` the way the pytorch backend does.
+
+    The kernels produce float32 values that are then cast to the requested
+    real floating dtype (float64 included, as before). For an integer, bool or
+    complex request the pytorch backend either raises (integer / bool) or draws
+    something a cast of a real float32 draw is not (a complex variate), so those
+    requests take the pytorch route: the same error, or the same values, as
+    ``set_backend("pytorch")`` (trnsci/trnsci#35). Under TRNRAND_REQUIRE_NKI
+    they raise NotImplementedError instead.
+    """
+    if dtype.is_floating_point:
+        return True
+    from .nki.dispatch import _no_kernel_for_dtype
+
+    _no_kernel_for_dtype(what, dtype)
+    return False
+
+
 def _nki_seed(gen_obj: Generator) -> int:
     """Advance generator state and return a 24-bit seed for NKI dispatch.
 
@@ -138,7 +157,7 @@ def uniform(
     generator: Generator | None = None,
 ) -> torch.Tensor:
     """Uniform distribution on [low, high)."""
-    if _nki_active():
+    if _nki_active() and _nki_takes(dtype, "uniform"):
         gen = generator or get_default_generator()
         out = _nki_draw("uniform", gen, math.prod(size))
         out = _affine(out, high - low, low, nonneg=True).to(dtype)
@@ -156,7 +175,7 @@ def normal(
     generator: Generator | None = None,
 ) -> torch.Tensor:
     """Normal (Gaussian) distribution."""
-    if _nki_active():
+    if _nki_active() and _nki_takes(dtype, "normal"):
         gen = generator or get_default_generator()
         out = _nki_draw("normal", gen, math.prod(size))
         return _affine(out, std, mean).to(dtype).reshape(size)
@@ -183,7 +202,9 @@ def exponential(
     PDF: f(x) = λ exp(-λx)
     Mean: 1/λ
     """
-    if _nki_active():
+    # Integer / bool requests cast on both backends; complex raises on the
+    # pytorch backend (clamp), so it takes that route.
+    if _nki_active() and (not dtype.is_complex or _nki_takes(dtype, "exponential")):
         from .nki.dispatch import threefry_uniform_nki
 
         gen = generator or get_default_generator()
@@ -403,7 +424,7 @@ def normal_into(
         std:       Distribution standard deviation (default 1.0).
         generator: Optional Generator for reproducible seeding.
     """
-    if _nki_active():
+    if _nki_active() and _nki_takes(buf.dtype, "normal_into"):
         from .nki.dispatch import _PROGRAM_TILES, threefry_stream_normal
 
         gen = generator or get_default_generator()
@@ -440,7 +461,7 @@ def uniform_into(
         high:      Upper bound (exclusive, default 1.0).
         generator: Optional Generator for reproducible seeding.
     """
-    if _nki_active():
+    if _nki_active() and _nki_takes(buf.dtype, "uniform_into"):
         from .nki.dispatch import _PROGRAM_TILES, threefry_stream_uniform
 
         gen = generator or get_default_generator()
@@ -453,6 +474,8 @@ def uniform_into(
         gen._counter += streaming_batches * gen._partition_size  # every chip's slice
         if low != 0.0 or high != 1.0:
             raw = raw * (high - low) + low
+        if buf.dtype in (torch.float16, torch.bfloat16) and high > low:
+            raw = _below_high(raw.to(buf.dtype), high)  # as uniform() does (#94)
         buf.copy_(raw.reshape(buf.shape))
         return
     gen_t = (generator or get_default_generator()).torch_generator
@@ -476,7 +499,7 @@ def exponential_into(
         rate:      Rate parameter λ (default 1.0). Mean = 1/λ.
         generator: Optional Generator for reproducible seeding.
     """
-    if _nki_active():
+    if _nki_active() and _nki_takes(buf.dtype, "exponential_into"):
         from .nki.dispatch import _PROGRAM_TILES, threefry_stream_uniform
 
         gen = generator or get_default_generator()
@@ -509,7 +532,7 @@ def truncated_normal(
 
     Uses rejection sampling. Useful for bounded weight initialization.
     """
-    if _nki_active():
+    if _nki_active() and _nki_takes(dtype, "truncated_normal"):
         from .nki.dispatch import truncated_normal_nki
 
         gen = generator or get_default_generator()
