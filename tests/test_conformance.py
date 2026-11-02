@@ -989,21 +989,12 @@ def test_latin_hypercube_marginals_uniform():
 @pytest.mark.parametrize("n, d", [(1, 1), (5, 1), (3, 10), (0, 2)])
 @pytest.mark.parametrize("name", ["sobol", "halton", "latin_hypercube"])
 def test_quasi_edge_shapes(name, n, d):
-    if name == "sobol" and n == 0:
-        pytest.skip("torch.quasirandom.SobolEngine rejects n=0 (loud)")
     x = host(getattr(tr, name)(n, d))
     assert tuple(x.shape) == (n, d)
 
 
 @pytest.mark.parametrize("name", ["sobol", "halton"])
-def test_quasi_high_dim(request, nki_like, name):
-    known(
-        request,
-        "89",
-        "NKI sobol raises AssertionError for d > 10 instead of falling back",
-        strict=False,
-        when=nki_like and name == "sobol",
-    )
+def test_quasi_high_dim(name):
     x = host(getattr(tr, name)(64, 21))
     assert tuple(x.shape) == (64, 21)
     assert bool((x >= 0).all() and (x < 1).all())
