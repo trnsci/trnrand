@@ -7,6 +7,29 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- **`sobol(scramble=True)` is now Owen scrambling, on both backends (#100).**
+  A hash-based nested uniform scramble (Laine–Karras, with Burley's 2020
+  constants) of the bit-reversed Sobol integers. It keeps the (t, m, s)-net
+  property (every elementary interval keeps its point count; the old NKI
+  scramble, a random shift mod 1, did not) and its centred discrepancy
+  matches `scipy.stats.qmc.Sobol(scramble=True)`. The NKI path runs it in a
+  new `sobol_owen` kernel and gives the same points as the PyTorch path's
+  float32 output for the same seed. `seed=0` now scrambles on NKI (it gave
+  the plain sequence), and `seed=None` draws the scramble seed from torch's
+  global RNG on both backends.
+  **Seeded scrambled streams change:** `sobol(n, d, seed=s)` returns different
+  points from 0.13.0 on every backend. **Migration:** to reproduce an old
+  stream, pass `scramble="shift"`, which is the 0.13.0 behaviour bit for bit
+  (PyTorch path: `SobolEngine(scramble=True, seed=s)`; NKI path: the random
+  shift, unscrambled for `seed=None`/`0`). `scramble` also accepts `"owen"`
+  (same as `True`); other strings raise `ValueError`.
+  The `sobol_owen` NKI kernel is checked on CPU against a bit-exact host
+  reference (`sobol_owen_reference`); its device tests
+  (`tests/test_nki_quasi.py::TestSobolOwenNKI`, marked `needs_hw_validation`)
+  have not run on Neuron hardware yet.
+
 ## [0.13.0] - 2026-11-02
 
 Validated on Trn2 (trn2.3xlarge, Neuron SDK 2.33.0, native TorchNeuron) — see trnsci/trnsci#35.

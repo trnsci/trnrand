@@ -114,9 +114,9 @@ class TestSobolNKI:
     def test_conformance_vs_cpu(self):
         """NKI output matches CPU Sobol output (without scrambling), all dims."""
         set_backend("nki")
-        nki_out = sobol(256, 10, seed=0)
+        nki_out = sobol(256, 10, scramble=False)
         set_backend("pytorch")
-        cpu_out = sobol(256, 10, seed=0, scramble=False)
+        cpu_out = sobol(256, 10, scramble=False)
         # NKI uses Van der Corput / Joe-Kuo; CPU uses PyTorch SobolEngine.
         # Without scrambling, both should produce identical sequences.
         assert torch.allclose(nki_out, cpu_out, atol=1e-5)
@@ -134,6 +134,46 @@ class TestSobolNKI:
         out = sobol(2048, 4)
         assert out.shape == (2048, 4)
         assert float(out.min()) >= 0.0 and float(out.max()) < 1.0
+
+
+# ---------------------------------------------------------------------------
+# Owen-scrambled Sobol NKI (#100)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.neuron
+@pytest.mark.needs_hw_validation
+@pytest.mark.skipif(not HAS_NKI, reason="requires neuronxcc")
+class TestSobolOwenNKI:
+    """`sobol_owen_kernel`. Written and checked on CPU against
+    `sobol_owen_reference` only; these tests are its first hardware run."""
+
+    @pytest.mark.parametrize("seed", [0, 1, 123456789])
+    @pytest.mark.parametrize("n", [1, 127, 129, 1000])
+    def test_matches_reference(self, n, seed):
+        from trnrand.nki.dispatch import sobol_owen_nki, sobol_owen_reference
+
+        got = sobol_owen_nki(n, 10, seed=seed)
+        assert torch.equal(got.cpu(), sobol_owen_reference(n, 10, seed))
+
+    def test_matches_cpu_path(self):
+        set_backend("nki")
+        dev = sobol(1000, 10, seed=42)
+        set_backend("pytorch")
+        assert torch.equal(dev.cpu(), sobol(1000, 10, seed=42))
+
+    def test_start_index(self):
+        from trnrand.nki.dispatch import sobol_owen_nki
+
+        full = sobol_owen_nki(512, 3, seed=8)
+        assert torch.equal(full[256:], sobol_owen_nki(256, 3, seed=8, start_index=256))
+
+    def test_one_point_per_stratum(self):
+        set_backend("nki")
+        x = sobol(256, 10, seed=5).cpu().double()
+        for d in range(10):
+            cells = torch.floor(x[:, d] * 256).long()
+            assert torch.equal(torch.sort(cells).values, torch.arange(256)), d
 
 
 # ---------------------------------------------------------------------------

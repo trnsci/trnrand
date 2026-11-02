@@ -43,7 +43,7 @@ detected on the first kernel launch:
   on `device="neuron"`, also callable directly and inside
   `torch.compile(backend="neuron")`:
   `torch.ops.trnrand.philox4x32`, `box_muller`, `threefry4x32`,
-  `threefry_normal`, `sobol_gray_code`, `halton`,
+  `threefry_normal`, `sobol_gray_code`, `sobol_owen`, `halton`,
   `threefry_streaming_normal`, `threefry_streaming_uniform`, and the bulk
   kernels `threefry_bulk_normal` / `threefry_bulk_uniform` and their
   full-word `threefry_bulk32_*` variants. The ops are registered only once

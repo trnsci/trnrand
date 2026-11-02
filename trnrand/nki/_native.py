@@ -98,6 +98,15 @@ def sobol_gray_code(gray: torch.Tensor) -> torch.Tensor:
 
 
 @nki_op(
+    "trnrand::sobol_owen",
+    mutates_args={},
+    fake_fn=lambda gray, seeds: _fake_rows(gray, _d._SOBOL_MAX_DIMS, torch.float32),
+)
+def sobol_owen(gray: torch.Tensor, seeds: torch.Tensor) -> torch.Tensor:
+    return _d.sobol_owen_kernel(gray, seeds)
+
+
+@nki_op(
     "trnrand::halton",
     mutates_args={},
     fake_fn=lambda indices: _fake_rows(indices, _d._HALTON_MAX_DIMS, torch.float32),
@@ -254,6 +263,7 @@ OPS = {
     "threefry4x32": threefry4x32,
     "threefry_normal": threefry_normal,
     "sobol_gray_code": sobol_gray_code,
+    "sobol_owen": sobol_owen,
     "halton": halton,
     "threefry_streaming_normal": threefry_streaming_normal,
     "threefry_streaming_uniform": threefry_streaming_uniform,

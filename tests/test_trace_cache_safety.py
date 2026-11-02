@@ -89,10 +89,16 @@ ALLOWED: dict[tuple[str, str, str], str] = {
         "sobol_gray_code_kernel",
         "_SOBOL_DIR_VECS",
     ): "fixed Joe-Kuo direction table",
+    # The same table bit-reversed within 24 bits, computed at import (#100).
+    (
+        "trnrand/nki/dispatch.py",
+        "sobol_owen_kernel",
+        "_SOBOL_REV_DIR_VECS",
+    ): "fixed Joe-Kuo direction table, bit-reversed",
 }
 
 # Fewest kernels the scan must find, so a broken detector cannot pass vacuously.
-MIN_KERNELS = 14
+MIN_KERNELS = 15
 
 # --------------------------------------------------------------------------
 # AST lint

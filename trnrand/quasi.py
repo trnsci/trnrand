@@ -33,7 +33,7 @@ def sobol(
     n_points: int,
     n_dims: int,
     seed: int | None = None,
-    scramble: bool = True,
+    scramble: bool | str = True,
     dtype: torch.dtype = torch.float32,
 ) -> torch.Tensor:
     """Sobol quasi-random sequence.
@@ -41,27 +41,97 @@ def sobol(
     Args:
         n_points: Number of points to generate
         n_dims: Dimensionality
-        seed: Random seed for scrambling
-        scramble: Apply Owen scrambling for better equidistribution
+        seed: Random seed for scrambling. ``None`` draws one from torch's
+            global RNG (so ``torch.manual_seed`` makes it reproducible).
+            Every integer, including 0, gives a scrambled set.
+        scramble: ``True`` (or ``"owen"``): Owen (nested uniform) scrambling,
+            hash-based (Laine–Karras, Burley 2020). It keeps the (t, m, s)-net
+            property of the unscrambled set, and on the NKI path gives the
+            top 24 bits of the CPU points for the same seed. ``False``: the
+            plain Sobol sequence. ``"shift"``: the scramble of releases up
+            to 0.13, kept to reproduce old streams: torch's ``SobolEngine``
+            scramble on the PyTorch path, a random shift mod 1 on the NKI
+            path (unscrambled for ``seed=None`` or 0; it breaks the net
+            property).
+        dtype: Output dtype.
 
     Returns:
         Tensor of shape (n_points, n_dims) with values in [0, 1)
     """
+    mode = _scramble_mode(scramble)
+    if mode == "owen" and seed is None:
+        seed = int(torch.empty((), dtype=torch.int64).random_().item())
     if _nki_active():
         try:
-            from .nki.dispatch import sobol_nki
+            if mode == "owen":
+                from .nki.dispatch import sobol_owen_nki
 
-            # sobol_nki shifts whenever seed != 0, so scramble=False must pass 0 (#90).
-            nki_seed = (seed or 0) if scramble else 0
-            return _below_one(sobol_nki(n_points, n_dims, seed=nki_seed).to(dtype))
+                pts = sobol_owen_nki(n_points, n_dims, seed=seed)
+            else:
+                from .nki.dispatch import sobol_nki
+
+                # sobol_nki shifts whenever seed != 0, so scramble=False must
+                # pass 0 (#90).
+                nki_seed = (seed or 0) if mode == "shift" else 0
+                pts = sobol_nki(n_points, n_dims, seed=nki_seed)
+            return _below_one(pts.to(dtype))
         except ImportError:
-            pass  # sobol_nki not yet available; fall through to CPU path
+            pass  # NKI wrapper not available; fall through to CPU path
+    if mode == "owen":
+        return _sobol_owen_cpu(n_points, n_dims, seed, dtype)
     engine = torch.quasirandom.SobolEngine(
         dimension=n_dims,
-        scramble=scramble,
+        scramble=mode == "shift",
         seed=seed,
     )
     return _below_one(engine.draw(n_points).to(dtype))
+
+
+def _scramble_mode(scramble: bool | str) -> str:
+    if scramble is True or scramble == "owen":
+        return "owen"
+    if scramble is False:
+        return "none"
+    if scramble == "shift":
+        return "shift"
+    raise ValueError(f"scramble must be True, False, 'owen' or 'shift'; got {scramble!r}")
+
+
+_SWAPS = (
+    (1, 0x55555555),
+    (2, 0x33333333),
+    (4, 0x0F0F0F0F),
+    (8, 0x00FF00FF),
+    (16, 0x0000FFFF),
+)
+
+
+def _reverse32(x: torch.Tensor) -> torch.Tensor:
+    """Reverse the low 32 bits of each int64 element (values in [0, 2^32))."""
+    for shift, mask in _SWAPS:
+        x = ((x >> shift) & mask) | ((x & mask) << shift)
+    return x
+
+
+def _sobol_owen_cpu(n_points: int, n_dims: int, seed: int, dtype: torch.dtype) -> torch.Tensor:
+    """Owen-scrambled Sobol on the PyTorch path (32-bit hash, see dispatch)."""
+    from .nki.dispatch import _M32, _OWEN_C0, _OWEN_C1, _OWEN_C2, owen_dim_seeds
+
+    engine = torch.quasirandom.SobolEngine(dimension=n_dims, scramble=False)
+    # SobolEngine keeps 30-bit integers; the float64 draw holds them exactly.
+    x = (engine.draw(n_points, dtype=torch.float64) * 2.0**30).to(torch.int64) << 2
+    s = torch.tensor(owen_dim_seeds(seed, n_dims), dtype=torch.int64)
+    x = _reverse32(x)
+    x = x ^ ((x * _OWEN_C0) & _M32)
+    x = (x + s) & _M32
+    x = (x * ((s >> 16) | 1)) & _M32
+    x = x ^ ((x * _OWEN_C1) & _M32)
+    x = x ^ ((x * _OWEN_C2) & _M32)
+    x = _reverse32(x)
+    if dtype == torch.float64:
+        return x.to(torch.float64) * 2.0**-32
+    # Top 24 bits, exact in float32: the same points as the NKI kernel.
+    return _below_one(((x >> 8).to(torch.float32) * 2.0**-24).to(dtype))
 
 
 def halton(
