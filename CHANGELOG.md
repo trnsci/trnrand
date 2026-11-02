@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- **`partition_rank` was ignored on the PyTorch path: every rank drew identical samples** (silent). Affects released versions **0.7.0 through 0.13.0**, on the PyTorch path (`set_backend("pytorch")`, every CPU host) for every distribution, and on the NKI path for the draws that always go through `torch.Generator` (`bernoulli`, `randint`, `randperm`, `poisson` with `lam < 20`) and the CPU `GeneratorProgram` fallback. A data-parallel job on CPU ranks, or P simulated ranks on a dev host, got P copies of one sample. The PyTorch path now keeps the NKI path's partition contract (#72): rank r of P draws the `P × n` single-generator sample and keeps its contiguous slice `[r·n, (r+1)·n)`, so the ranks concatenate in order to the single-generator draw and every call moves past all P slices (P× the work on that path). `randperm` returns the r-th of P consecutive permutations. Output changes for rank > 0 and, on the PyTorch path, for rank 0 of P > 1; single-rank (P = 1) streams are bit-identical (#99).
+
 ## [0.13.0] - 2026-11-02
 
 Validated on Trn2 (trn2.3xlarge, Neuron SDK 2.33.0, native TorchNeuron) — see trnsci/trnsci#35.

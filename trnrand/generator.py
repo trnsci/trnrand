@@ -97,6 +97,12 @@ class Generator:
     instead. The partition arithmetic is host-side and identical on both
     dispatch paths.
 
+    On the PyTorch path ``torch.Generator`` has no counter to split, so a
+    partitioned draw of n samples draws all ``P × n`` and keeps rank r's
+    slice (P× the work; same concatenation contract). ``randperm`` returns
+    the r-th of P consecutive permutations. Through 0.13.0 the PyTorch path
+    ignored the partition and every rank drew identical samples (#99).
+
     Single-chip defaults (``partition_rank=0, partition_size=1``) preserve
     all existing behaviour identically.
     """
