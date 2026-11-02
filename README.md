@@ -27,6 +27,24 @@ _(No Phase 2 for trnrand — the precision story is inherited where relevant.)_
 
 Suite-wide tracker: [trnsci/trnsci#1](https://github.com/trnsci/trnsci/issues/1).
 
+## Known issues in earlier releases
+
+Silent wrong-result bugs fixed in the 2026-10-31 to 2026-11-02 releases. Details are in the [CHANGELOG](CHANGELOG.md). "NKI" means `set_backend("nki")`, or `"auto"` on Neuron hardware.
+
+| Bug | Affected versions | Fixed in |
+|---|---|---|
+| Partitioned generators (P > 1) reused counters from the second draw on, so ranks returned duplicate values (`key_mode="counter"`) or stopped concatenating to the single-chip stream (NKI) | 0.7.0 – 0.11.0 | 0.12.0 |
+| `sobol_nki` past index 2^24 dropped high Gray-code bits and repeated points; it now raises | 0.5.0 – 0.11.0 | 0.12.0 |
+| `Generator.get_state()` / `set_state()` did not restore the NKI stream | 0.7.0 – 0.12.0 | 0.12.1 |
+| `sobol` / `halton` in float16 / bfloat16 returned 1.0, outside the documented range | 0.1.0 – 0.12.1 | 0.13.0 |
+| `exponential` in float16 returned `inf`; bfloat16 was biased (PyTorch path) | 0.1.0 – 0.12.1 | 0.13.0 |
+| `latin_hypercube` in float16 / bfloat16 put two points in one stratum | 0.1.0 – 0.12.1 | 0.13.0 |
+| `exponential_into()` and `GeneratorProgram.exponential()` returned `inf` (NKI) | 0.6.0 – 0.12.1 | 0.13.0 |
+| `sobol(scramble=False, seed=s)` returned shifted points (NKI) | 0.5.0 – 0.12.1 | 0.13.0 |
+| `gamma` / `chi_squared` / `beta` / `truncated_normal` drew identical samples on every partition rank (NKI) | 0.7.0 – 0.12.1 | 0.13.0 |
+| `uniform` in bfloat16 / float16 returned `high`, outside `[low, high)` (NKI) | 0.5.0 – 0.12.1 | 0.13.0 |
+| `advance_to(position())` did not resume the stream with the default `key_mode="draw"` (NKI); it now warns | 0.7.0 – 0.12.1 | 0.13.0 |
+
 ## Install
 
 ```bash
