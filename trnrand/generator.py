@@ -79,6 +79,10 @@ def _lookup(handle: int) -> Generator:
 class Generator:
     """Seeded random number generator with backend dispatch.
 
+    ``seed=None`` seeds from OS entropy, so unseeded generators (including the
+    module default generator) draw independent streams; ``torch_generator
+    .initial_seed()`` reports the seed chosen. Pass a seed for reproducibility.
+
     Wraps torch.Generator for CPU/CUDA. On NKI, uses Threefry counter-based
     RNG running on the GpSimd engine.
 
@@ -129,7 +133,12 @@ class Generator:
         self._ctr = torch.zeros((), dtype=torch.int64)
         self._device = device
         self._torch_gen = torch.Generator(device=device)
-        if seed is not None:
+        if seed is None:
+            # A fresh torch.Generator starts at a fixed default seed, so every
+            # unseeded Generator drew the same stream (#98). Seed from OS
+            # entropy instead; initial_seed() reports the seed chosen.
+            self._torch_gen.seed()
+        else:
             self._torch_gen.manual_seed(seed)
         self._seed = seed
         # key_mode="counter": Threefry key words (k0, k1), int32, fixed per seed.
