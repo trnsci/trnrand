@@ -51,7 +51,9 @@ def sobol(
         try:
             from .nki.dispatch import sobol_nki
 
-            return _below_one(sobol_nki(n_points, n_dims, seed=seed or 0).to(dtype))
+            # sobol_nki shifts whenever seed != 0, so scramble=False must pass 0 (#90).
+            nki_seed = (seed or 0) if scramble else 0
+            return _below_one(sobol_nki(n_points, n_dims, seed=nki_seed).to(dtype))
         except ImportError:
             pass  # sobol_nki not yet available; fall through to CPU path
     engine = torch.quasirandom.SobolEngine(

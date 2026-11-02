@@ -45,6 +45,21 @@ def _nki_seed(gen_obj: Generator) -> int:
     return int(torch.randint(0, 2**24, (1,), generator=gen_obj.torch_generator).item())
 
 
+def _rank_seed(gen_obj: Generator, seed: int) -> int:
+    """Per-rank key for the NKI rejection samplers (gamma, chi_squared, beta,
+    truncated_normal), which take no counter offset.
+
+    Every rank draws the same `seed` from its identically seeded torch
+    generator, so without this all P ranks returned identical samples (#92).
+    The samplers use up to 8 consecutive keys per call (beta: seed..seed+7),
+    so a stride of 8 keeps ranks on disjoint keys. Rank 0 (and P = 1) is
+    unchanged. Independent ranks, not bit-exact rank concatenation (#84).
+    """
+    if gen_obj._partition_size == 1 or gen_obj._partition_rank == 0:
+        return seed
+    return (seed + 8 * gen_obj._partition_rank) & 0xFFFFFF
+
+
 def _compiling() -> bool:
     """True while Dynamo traces and the custom-op route of #61 is available."""
     if not torch.compiler.is_compiling():
@@ -93,6 +108,16 @@ def _affine(out: torch.Tensor, scale: float, shift: float, nonneg: bool = False)
     return out.add_(shift)
 
 
+def _below_high(out: torch.Tensor, high: float) -> torch.Tensor:
+    """Keep a reduced-precision cast inside [low, high): float32 values within
+    half an ulp of `high` round up to `high` in float16 / bfloat16 (#94).
+    Values already below `high` are unchanged."""
+    h = torch.tensor(high, dtype=out.dtype)
+    if h.item() >= high:
+        h = torch.nextafter(h, torch.tensor(-math.inf, dtype=out.dtype))
+    return torch.where(out >= high, h.to(out.device), out)
+
+
 def _torch_fill(kind, size, a, b, dtype, generator):
     gen = generator or get_default_generator()
     if _compiling():
@@ -116,7 +141,10 @@ def uniform(
     if _nki_active():
         gen = generator or get_default_generator()
         out = _nki_draw("uniform", gen, math.prod(size))
-        return _affine(out, high - low, low, nonneg=True).to(dtype).reshape(size)
+        out = _affine(out, high - low, low, nonneg=True).to(dtype)
+        if dtype in (torch.float16, torch.bfloat16) and high > low:
+            out = _below_high(out, high)
+        return out.reshape(size)
     return _torch_fill("uniform", size, low, high, dtype, generator)
 
 
@@ -229,7 +257,7 @@ def gamma(
         from .nki.dispatch import gamma_nki
 
         gen = generator or get_default_generator()
-        seed = _nki_seed(gen)
+        seed = _rank_seed(gen, _nki_seed(gen))
         n = math.prod(size)
         out = gamma_nki(n, shape=shape, scale=scale, seed=seed)
         return out.to(dtype).reshape(size)
@@ -290,7 +318,7 @@ def chi_squared(
         from .nki.dispatch import chi_squared_nki
 
         gen = generator or get_default_generator()
-        seed = _nki_seed(gen)
+        seed = _rank_seed(gen, _nki_seed(gen))
         n = math.prod(size)
         out = chi_squared_nki(n, df=df, seed=seed)
         return out.to(dtype).reshape(size)
@@ -316,7 +344,7 @@ def beta(
         from .nki.dispatch import beta_nki
 
         gen = generator or get_default_generator()
-        seed = _nki_seed(gen)
+        seed = _rank_seed(gen, _nki_seed(gen))
         n = math.prod(size)
         out = beta_nki(n, alpha=alpha, beta_param=beta, seed=seed)
         return out.to(dtype).reshape(size)
@@ -459,7 +487,9 @@ def exponential_into(
         counter_offset = gen._partition_rank * streaming_batches + gen._counter
         u = threefry_stream_uniform(n, seed=seed, counter_offset=counter_offset)
         gen._counter += streaming_batches * gen._partition_size  # every chip's slice
-        raw = -torch.log(u) / rate
+        # The kernel emits k * 2^-24, k >= 0: clamp as exponential() does, or
+        # u == 0 (p = 2^-24 per sample) gives +inf (#82).
+        raw = -torch.log(torch.clamp(u, min=1e-10)) / rate
         buf.copy_(raw.reshape(buf.shape))
         return
     gen_t = (generator or get_default_generator()).torch_generator
@@ -483,7 +513,7 @@ def truncated_normal(
         from .nki.dispatch import truncated_normal_nki
 
         gen = generator or get_default_generator()
-        seed = _nki_seed(gen)
+        seed = _rank_seed(gen, _nki_seed(gen))
         n = math.prod(size)
         out = truncated_normal_nki(n, low=low, high=high, mean=mean, std=std, seed=seed)
         return out.to(dtype).reshape(size)
