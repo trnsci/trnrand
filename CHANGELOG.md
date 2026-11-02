@@ -56,6 +56,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     recipe, in both key modes and on both paths, and state that
     `advance_to(position())` resumes only with `key_mode="counter"`, for the
     NKI `uniform` / `normal` / `standard_normal` draws (#76).
+### Fixed
+
+- **`exponential_into()` and `GeneratorProgram` `.exponential()` steps returned `inf`** (silent). Affects released versions **0.6.0 through 0.12.1**, on the NKI path only (`set_backend("nki")`, or `"auto"` on Neuron hardware). They computed `-log(u)` without the `1e-10` clamp `exponential()` uses, and the Threefry uniform kernels emit `u == 0` with probability 2^-24 per sample (about 4 `inf` in a 64M buffer). Only those samples change (#82).
 
 ## [0.12.1] - 2026-11-01
 

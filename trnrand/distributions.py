@@ -459,7 +459,9 @@ def exponential_into(
         counter_offset = gen._partition_rank * streaming_batches + gen._counter
         u = threefry_stream_uniform(n, seed=seed, counter_offset=counter_offset)
         gen._counter += streaming_batches * gen._partition_size  # every chip's slice
-        raw = -torch.log(u) / rate
+        # The kernel emits k * 2^-24, k >= 0: clamp as exponential() does, or
+        # u == 0 (p = 2^-24 per sample) gives +inf (#82).
+        raw = -torch.log(torch.clamp(u, min=1e-10)) / rate
         buf.copy_(raw.reshape(buf.shape))
         return
     gen_t = (generator or get_default_generator()).torch_generator
