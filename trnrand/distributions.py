@@ -108,6 +108,16 @@ def _affine(out: torch.Tensor, scale: float, shift: float, nonneg: bool = False)
     return out.add_(shift)
 
 
+def _below_high(out: torch.Tensor, high: float) -> torch.Tensor:
+    """Keep a reduced-precision cast inside [low, high): float32 values within
+    half an ulp of `high` round up to `high` in float16 / bfloat16 (#94).
+    Values already below `high` are unchanged."""
+    h = torch.tensor(high, dtype=out.dtype)
+    if h.item() >= high:
+        h = torch.nextafter(h, torch.tensor(-math.inf, dtype=out.dtype))
+    return torch.where(out >= high, h.to(out.device), out)
+
+
 def _torch_fill(kind, size, a, b, dtype, generator):
     gen = generator or get_default_generator()
     if _compiling():
@@ -131,7 +141,10 @@ def uniform(
     if _nki_active():
         gen = generator or get_default_generator()
         out = _nki_draw("uniform", gen, math.prod(size))
-        return _affine(out, high - low, low, nonneg=True).to(dtype).reshape(size)
+        out = _affine(out, high - low, low, nonneg=True).to(dtype)
+        if dtype in (torch.float16, torch.bfloat16) and high > low:
+            out = _below_high(out, high)
+        return out.reshape(size)
     return _torch_fill("uniform", size, low, high, dtype, generator)
 
 

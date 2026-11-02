@@ -65,6 +65,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Fixed
 
 - **Partitioned generators drew identical `gamma` / `chi_squared` / `beta` / `truncated_normal` samples on every rank** (silent). Affects released versions **0.7.0 through 0.12.1**, on the NKI path only (`set_backend("nki")`, or `"auto"` on Neuron hardware). These rejection samplers take a key drawn from the rank's identically seeded `torch.Generator` and no counter offset, so `partition_rank` had no effect and P ranks returned P copies of one sample. Rank r > 0 now uses key `seed + 8r`, which never overlaps the keys rank 0 uses in the same call. P = 1 and rank 0 are bit-identical. Ranks are now independent; bit-exact rank concatenation for these distributions is #84 (#92).
+### Fixed
+
+- **`uniform(dtype=torch.bfloat16 / torch.float16)` returned `high`, outside `[low, high)`** (silent). Affects released versions **0.5.0 through 0.12.1**, on the NKI path only (`set_backend("nki")`, or `"auto"` on Neuron hardware). The float32 kernel output was cast to `dtype` with round-to-nearest, which maps values within half an ulp of `high` up to `high`: about 1 sample in 2^9 for bfloat16 and 1 in 2^12 for float16. Such values now become the largest representable value below `high`. Other values and float32 / float64 output are unchanged (#94).
 
 ## [0.12.1] - 2026-11-01
 
