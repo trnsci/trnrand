@@ -31,7 +31,7 @@ def _nki_active() -> bool:
 
 
 def _outside_kernel_limits(name: str, reason: str) -> None:
-    """Fall back to the CPU path for a call the NKI kernel cannot take (#89).
+    """Fall back to the CPU path for a call the NKI kernel cannot take (#89, #104).
 
     Warns with `NkiFallbackWarning`, or raises `ValueError` when
     `TRNRAND_REQUIRE_NKI` is set (the caller asked for the kernel or nothing).
@@ -55,6 +55,25 @@ def _sobol_fits_kernel(n_points: int, n_dims: int) -> bool:
         return False
     if n_points > 1 << _SOBOL_BITS:
         _outside_kernel_limits("sobol", f"n_points={n_points} > 2^{_SOBOL_BITS}")
+        return False
+    return True
+
+
+# halton_nki's limits. The constants live inside dispatch's `if HAS_NKI:` block,
+# so they are restated here; test_halton_nki_limits checks they agree.
+_HALTON_MAX_DIMS = 10
+_HALTON_MAX_POINTS = 1 << 22  # halton_nki needs the last index, n_points, < 2^22
+
+
+def _halton_fits_kernel(n_points: int, n_dims: int) -> bool:
+    """True if `halton_nki` can take the call; warns / raises otherwise (#104)."""
+    if n_points <= 0:
+        return False  # n = 0: the CPU path returns (0, n_dims)
+    if n_dims > _HALTON_MAX_DIMS:
+        _outside_kernel_limits("halton", f"n_dims={n_dims} > {_HALTON_MAX_DIMS}")
+        return False
+    if n_points + 1 > _HALTON_MAX_POINTS:
+        _outside_kernel_limits("halton", f"n_points={n_points} >= 2^22")
         return False
     return True
 
@@ -116,8 +135,12 @@ def halton(
 
     Returns:
         Tensor of shape (n_points, n_dims) with values in (0, 1)
+
+    On the NKI path, calls outside the kernel's limits (``n_dims > 10`` or
+    ``n_points >= 2^22``) use the CPU path with an ``NkiFallbackWarning``, or
+    raise ``ValueError`` under ``TRNRAND_REQUIRE_NKI=1``.
     """
-    if _nki_active():
+    if _nki_active() and _halton_fits_kernel(n_points, n_dims):
         try:
             from .nki.dispatch import halton_nki
 
