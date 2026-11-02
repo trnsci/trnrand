@@ -35,17 +35,18 @@ def _nki_active() -> bool:
     return HAS_NKI
 
 
-def _fp64_to_torch(what: str, dtype: torch.dtype) -> bool:
+def _fp64_to_torch(what: str, dtype: torch.dtype, buf: torch.Tensor | None = None) -> bool:
     """The float64 policy (trnrand#105): True when a float64 request takes the
     torch path (backend "auto"); False for every other dtype and for float64
     under backend "nki" (float32 kernel, cast, one-time UserWarning). Raises
-    NotImplementedError for float64 under TRNRAND_REQUIRE_NKI."""
+    NotImplementedError for float64 under TRNRAND_REQUIRE_NKI. `buf`: the
+    output buffer of a `*_into` call (see TRNRAND_FP64_ON_DEVICE)."""
     from .nki.dispatch import _float64_to_torch
 
-    return _float64_to_torch(what, dtype)
+    return _float64_to_torch(what, dtype, buf)
 
 
-def _nki_takes(dtype: torch.dtype, what: str) -> bool:
+def _nki_takes(dtype: torch.dtype, what: str, buf: torch.Tensor | None = None) -> bool:
     """Whether an NKI draw can produce `dtype` the way the pytorch backend does.
 
     The kernels produce float32 values that are then cast to the requested
@@ -58,7 +59,7 @@ def _nki_takes(dtype: torch.dtype, what: str) -> bool:
     they raise NotImplementedError instead.
     """
     if dtype.is_floating_point:
-        return not _fp64_to_torch(what, dtype)
+        return not _fp64_to_torch(what, dtype, buf)
     from .nki.dispatch import _no_kernel_for_dtype
 
     _no_kernel_for_dtype(what, dtype)
@@ -418,13 +419,18 @@ def poisson(
     return torch.poisson(rates, generator=gen).to(dtype)
 
 
-def _host_fill(buf: torch.Tensor, method: str, *args, generator, **kwargs) -> None:
+def _host_fill(buf: torch.Tensor, method: str, *args, what: str, generator, **kwargs) -> None:
     """`buf.<method>(*args, generator=...)` with the host torch generator. A
     device buffer (e.g. a float64 request routed to torch on Neuron, #105) is
-    filled on the host and copied over; a CPU buffer is filled in place."""
-    if buf.device.type == "cpu":
+    filled on the host and copied over, keeping its dtype (a float64 buffer on
+    the neuron device warns once per op, `_note_fp64_host_fill`); a CPU buffer
+    is filled in place."""
+    from .nki.dispatch import _note_fp64_host_fill, _on_neuron_device
+
+    if buf.device.type == "cpu" and not _on_neuron_device(buf):
         getattr(buf, method)(*args, generator=generator, **kwargs)
         return
+    _note_fp64_host_fill(what, buf)
     tmp = torch.empty(buf.shape, dtype=buf.dtype)
     getattr(tmp, method)(*args, generator=generator, **kwargs)
     buf.copy_(tmp)
@@ -449,7 +455,7 @@ def normal_into(
         std:       Distribution standard deviation (default 1.0).
         generator: Optional Generator for reproducible seeding.
     """
-    if _nki_active() and _nki_takes(buf.dtype, "normal_into"):
+    if _nki_active() and _nki_takes(buf.dtype, "normal_into", buf):
         from .nki.dispatch import _PROGRAM_TILES, threefry_stream_normal
 
         gen = generator or get_default_generator()
@@ -465,7 +471,7 @@ def normal_into(
         buf.copy_(raw.reshape(buf.shape))
         return
     gen_t = (generator or get_default_generator()).torch_generator
-    _host_fill(buf, "normal_", mean, std, generator=gen_t)
+    _host_fill(buf, "normal_", mean, std, what="normal_into", generator=gen_t)
 
 
 def uniform_into(
@@ -486,7 +492,7 @@ def uniform_into(
         high:      Upper bound (exclusive, default 1.0).
         generator: Optional Generator for reproducible seeding.
     """
-    if _nki_active() and _nki_takes(buf.dtype, "uniform_into"):
+    if _nki_active() and _nki_takes(buf.dtype, "uniform_into", buf):
         from .nki.dispatch import _PROGRAM_TILES, threefry_stream_uniform
 
         gen = generator or get_default_generator()
@@ -504,7 +510,7 @@ def uniform_into(
         buf.copy_(raw.reshape(buf.shape))
         return
     gen_t = (generator or get_default_generator()).torch_generator
-    _host_fill(buf, "uniform_", low, high, generator=gen_t)
+    _host_fill(buf, "uniform_", low, high, what="uniform_into", generator=gen_t)
 
 
 def exponential_into(
@@ -524,7 +530,7 @@ def exponential_into(
         rate:      Rate parameter λ (default 1.0). Mean = 1/λ.
         generator: Optional Generator for reproducible seeding.
     """
-    if _nki_active() and _nki_takes(buf.dtype, "exponential_into"):
+    if _nki_active() and _nki_takes(buf.dtype, "exponential_into", buf):
         from .nki.dispatch import _PROGRAM_TILES, threefry_stream_uniform
 
         gen = generator or get_default_generator()
@@ -541,7 +547,7 @@ def exponential_into(
         buf.copy_(raw.reshape(buf.shape))
         return
     gen_t = (generator or get_default_generator()).torch_generator
-    _host_fill(buf, "exponential_", lambd=rate, generator=gen_t)
+    _host_fill(buf, "exponential_", lambd=rate, what="exponential_into", generator=gen_t)
 
 
 def truncated_normal(

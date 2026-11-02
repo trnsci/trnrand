@@ -25,7 +25,9 @@ On a Neuron host, the same cases on the NKI path, with ``*_into`` /
 
 float64 follows the suite policy (trnrand#105): under ``--backend pytorch``
 and ``--backend auto`` a float64 request is drawn in torch and is checked at
-float64 tolerance; only under ``--backend nki`` (float32 kernels, cast, one
+float64 tolerance, including float64 buffers on the neuron device under
+``--backend auto --conformance-device neuron`` (filled on the host at float64
+precision and copied over, with one warning per op); only under ``--backend nki`` (float32 kernels, cast, one
 warning per op) does float64 get the float32 tolerance. ``sobol`` is float32
 resolution on every backend (the PyTorch path is a float32 SobolEngine draw).
 
@@ -57,6 +59,8 @@ pytestmark = [
     pytest.mark.filterwarnings("ignore:The balance properties of Sobol:UserWarning"),
     # --backend nki: float64 casts warn once per op by design (trnrand#105).
     pytest.mark.filterwarnings("ignore:trnrand .*float64 on the NKI kernels:UserWarning"),
+    # --backend auto, device buffers: float64 is filled on the host, warned once per op.
+    pytest.mark.filterwarnings("ignore:trnrand .*float64 on the neuron device:UserWarning"),
 ]
 BLOCK_SIZES = [511, 512, 513, 16385]
 
@@ -557,7 +561,7 @@ def test_into_channels_last(dev, iname):
     "dt", [torch.float16, torch.bfloat16, torch.float64], ids=lambda d: str(d)[6:]
 )
 @pytest.mark.parametrize("iname", list(INTO))
-def test_into_buffer_dtypes(dev, iname, dt):
+def test_into_buffer_dtypes(dev, fp32_fp64, iname, dt):
     fn, kw, ref, _ = INTO[iname]
     b = nan_buf(dev, 50_000, dtype=dt)
     fn(b, generator=G(2), **kw)
@@ -565,6 +569,10 @@ def test_into_buffer_dtypes(dev, iname, dt):
     assert hb.dtype == dt
     assert bool(torch.isfinite(hb).all())
     assert stats.kstest(hb.double().numpy(), ref.cdf).statistic < 0.02
+    if dt == torch.float64 and not fp32_fp64:
+        # float64 precision, also for a device buffer under --backend auto
+        # (filled on the host): values a float32 draw cannot represent.
+        assert bool((hb != hb.float().double()).any()), "float32-precision values"
 
 
 @pytest.mark.parametrize("iname", list(INTO))

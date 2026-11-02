@@ -42,6 +42,17 @@ Lands in 0.14.0. **Changes the stream for float64 callers on the NKI path**
     no float64 Sobol to route to; it keeps the kernel, without a warning or a
     REQUIRE_NKI error.
   - `box_muller_nki` (internal) warns once for float64 input.
+  - float64 buffers on the neuron device (`*_into`, `GeneratorProgram`):
+    under `auto` they are filled on the host at float64 precision and copied
+    into the device buffer (which stays float64), with one `UserWarning` per
+    op: "float64 on the neuron device is computed on the host for float64
+    accuracy (device arithmetic is fp32); pass float32 to stay on device".
+    Device arithmetic on Trainium is float32 (measured on Trn2), so this is
+    the only way to keep the float64 promise for device-resident buffers. The
+    values equal a host buffer's with the same generator state.
+    `TRNRAND_FP64_ON_DEVICE=1` keeps such buffers on the on-device float32
+    kernels instead (float32 precision, no warning). Host float64 buffers and
+    every allocating call (they return host tensors) are unchanged.
 - `normal_into` / `uniform_into` / `exponential_into` on the PyTorch path
   fill a non-CPU buffer on the host and copy it over (the generator is a host
   `torch.Generator`); CPU buffers are filled in place as before.

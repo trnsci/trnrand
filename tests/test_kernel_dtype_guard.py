@@ -20,7 +20,10 @@ exception type) as the pytorch backend.
 The float64 policy (trnrand#105) is covered in all three modes: backend
 ``auto`` draws float64 in torch (no kernel launch, the pytorch backend's
 values), backend ``nki`` runs the float32 kernels and warns once per op, and
-``TRNRAND_REQUIRE_NKI`` raises ``NotImplementedError``.
+``TRNRAND_REQUIRE_NKI`` raises ``NotImplementedError``. A float64 buffer on
+the neuron device (faked: a CPU tensor the neuron predicate reports as
+device-resident) is filled on the host under ``auto`` with one warning per
+op, unless ``TRNRAND_FP64_ON_DEVICE=1`` keeps the on-device kernels.
 """
 
 import importlib.util
@@ -674,3 +677,227 @@ def test_box_muller_nki_fp64_warns_once(env, path):
             assert env.d.box_muller_nki(torch.rand(8, dtype=torch.float64)).dtype == torch.float64
     got = _fp64_warnings(rec)
     assert len(got) == 1 and "box_muller_nki" in str(got[0].message)
+
+
+# ── float64 buffers on the neuron device: filled on the host ───────────────
+#
+# Device arithmetic on Trainium is float32 (measured on Trn2), so under
+# backend "auto" a float64 `*_into` / `GeneratorProgram` buffer on the neuron
+# device is filled on the host at float64 precision and copied back into the
+# device buffer, with one UserWarning per op. TRNRAND_FP64_ON_DEVICE=1 keeps
+# the on-device float32 kernels. Here a "neuron" buffer is a CPU tensor that
+# `dispatch._on_neuron_device` reports as neuron-resident; every other trnrand
+# result is a host tensor, so the buffers are the only device-resident case.
+
+_HOST_MSG = (
+    "float64 on the neuron device is computed on the host for float64 accuracy "
+    "(device arithmetic is fp32); pass float32 to stay on device"
+)
+DEVICE_BUFFER_APIS = {
+    "normal_into": (trnrand.normal_into, {"mean": 1.0, "std": 2.0}),
+    "uniform_into": (trnrand.uniform_into, {"low": -1.0, "high": 3.0}),
+    "exponential_into": (trnrand.exponential_into, {"rate": 2.0}),
+    "program_normal": ("normal", {}),
+    "program_uniform": ("uniform", {}),
+    "program_exponential": ("exponential", {}),
+}
+
+
+def _host_warnings(record):
+    return [w for w in record if _HOST_MSG in str(w.message)]
+
+
+@pytest.fixture
+def neuron_bufs(env, monkeypatch):
+    """Marks buffers as neuron-resident and records copies into them."""
+    marked: set[int] = set()
+    copies: list[tuple[torch.device, torch.dtype]] = []
+    real_copy = torch.Tensor.copy_
+
+    def copy_spy(self, src, *a, **k):
+        if id(self) in marked:
+            copies.append((src.device, src.dtype))
+        return real_copy(self, src, *a, **k)
+
+    monkeypatch.setattr(torch.Tensor, "copy_", copy_spy)
+    monkeypatch.setattr(
+        env.d, "_on_neuron_device", lambda t: isinstance(t, torch.Tensor) and id(t) in marked
+    )
+
+    def make(dt, n=40):
+        buf = torch.full((n,), float("nan"), dtype=dt)
+        marked.add(id(buf))
+        return buf
+
+    return types.SimpleNamespace(make=make, copies=copies)
+
+
+def _fill(api, buf):
+    fn, kw = DEVICE_BUFFER_APIS[api]
+    if api.startswith("program_"):
+        prog = getattr(_gen().new_program(), fn)(buf.numel(), out="x", **kw).build()
+        prog.stream_into({"x": buf})
+    else:
+        fn(buf, generator=_gen(), **kw)
+    return buf
+
+
+@pytest.fixture(params=["nki", "no_nki"])
+def kernels_present(request, env, monkeypatch):
+    """With the NKI kernels (native path), or without them (the torch path)."""
+    if request.param == "no_nki":
+        monkeypatch.setattr(distributions, "HAS_NKI", False)
+        monkeypatch.setattr(program, "HAS_NKI", False)
+    return request.param == "nki"
+
+
+@pytest.mark.parametrize("api", sorted(DEVICE_BUFFER_APIS))
+def test_fp64_device_buffer_auto_fills_on_host(env, neuron_bufs, kernels_present, api):
+    """auto: no kernel, the host's float64 values copied into the same device
+    buffer (float64), one warning per op over repeated calls."""
+    ref = _fill(api, torch.empty(40, dtype=torch.float64))  # host buffer, same seed
+    with warnings.catch_warnings(record=True) as rec:
+        warnings.simplefilter("always")
+        outs = []
+        for _ in range(3):
+            buf = neuron_bufs.make(torch.float64)
+            assert _fill(api, buf) is buf
+            outs.append(buf)
+    assert env.kernels.calls == [], f"{api}: kernel launched"
+    assert neuron_bufs.copies == [(torch.device("cpu"), torch.float64)] * 3
+    for buf in outs:
+        assert buf.dtype == torch.float64
+        assert torch.allclose(buf, ref, rtol=1e-12, atol=1e-12), api
+    if api in ("uniform_into", "program_uniform"):
+        assert bool(((outs[0] * 2**24) % 1 != 0).any()), "float32-resolution values"
+    got = _host_warnings(rec)
+    assert len(got) == 1, [str(w.message) for w in got]
+    assert issubclass(got[0].category, UserWarning)
+    op = "GeneratorProgram.stream_into" if api.startswith("program_") else api
+    assert str(got[0].message).startswith(f"trnrand {op}: ")
+    assert "TRNRAND_FP64_ON_DEVICE=1" in str(got[0].message)
+    assert got[0].filename == __file__, got[0].filename
+    assert not _fp64_warnings(rec)
+
+
+@pytest.mark.parametrize("api", ["normal_into", "uniform_into", "exponential_into"])
+def test_fp64_device_buffer_matches_pytorch_backend(env, neuron_bufs, api):
+    env.d.set_backend("pytorch")
+    try:
+        ref = _fill(api, torch.empty(40, dtype=torch.float64))
+    finally:
+        env.d.set_backend("auto")
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore")
+        got = _fill(api, neuron_bufs.make(torch.float64))
+    assert torch.equal(got, ref)
+
+
+def test_fp64_device_buffer_warns_once_per_op(env, neuron_bufs):
+    with warnings.catch_warnings(record=True) as rec:
+        warnings.simplefilter("always")
+        for _ in range(2):
+            for api in DEVICE_BUFFER_APIS:
+                _fill(api, neuron_bufs.make(torch.float64))
+    ops = sorted(str(w.message).split(":")[0] for w in _host_warnings(rec))
+    assert ops == [
+        "trnrand GeneratorProgram.stream_into",
+        "trnrand exponential_into",
+        "trnrand normal_into",
+        "trnrand uniform_into",
+    ]
+
+
+@pytest.mark.parametrize("api", sorted(DEVICE_BUFFER_APIS))
+def test_fp64_on_device_override_keeps_the_kernels(env, neuron_bufs, api):
+    """TRNRAND_FP64_ON_DEVICE=1: the on-device float32 kernels, no host fill,
+    no warning; the buffer stays float64."""
+    env.d._FP64_ON_DEVICE = True
+    with warnings.catch_warnings(record=True) as rec:
+        warnings.simplefilter("always")
+        buf = _fill(api, neuron_bufs.make(torch.float64))
+    assert env.kernels.calls, f"{api}: no kernel launched under the override"
+    assert (torch.device("cpu"), torch.float64) not in neuron_bufs.copies  # no host fill
+    assert buf.dtype == torch.float64 and not bool(buf.isnan().any())
+    assert not _host_warnings(rec) and not _fp64_warnings(rec)
+
+
+@pytest.mark.parametrize("api", sorted(DEVICE_BUFFER_APIS))
+def test_fp64_on_device_override_without_kernels(env, neuron_bufs, monkeypatch, api):
+    """Without the NKI kernels there is no device route: host fill, no warning."""
+    monkeypatch.setattr(distributions, "HAS_NKI", False)
+    monkeypatch.setattr(program, "HAS_NKI", False)
+    env.d._FP64_ON_DEVICE = True
+    with warnings.catch_warnings(record=True) as rec:
+        warnings.simplefilter("always")
+        buf = _fill(api, neuron_bufs.make(torch.float64))
+    assert neuron_bufs.copies == [(torch.device("cpu"), torch.float64)]
+    assert buf.dtype == torch.float64
+    assert not _host_warnings(rec)
+
+
+@pytest.mark.parametrize("api", sorted(DEVICE_BUFFER_APIS))
+def test_fp64_device_buffer_require_nki_raises(env, neuron_bufs, api):
+    env.d._REQUIRE_NKI = True
+    with warnings.catch_warnings(record=True) as rec:
+        warnings.simplefilter("always")
+        with pytest.raises(NotImplementedError, match="TRNRAND_REQUIRE_NKI"):
+            _fill(api, neuron_bufs.make(torch.float64))
+    assert env.kernels.calls == [] and neuron_bufs.copies == []
+    assert not _host_warnings(rec)
+
+
+@pytest.mark.parametrize("api", sorted(DEVICE_BUFFER_APIS))
+def test_fp64_device_buffer_nki_backend_unchanged(env, neuron_bufs, api):
+    """Explicit nki: float32 kernels with the cast warning, no host fill."""
+    env.d.set_backend("nki")
+    try:
+        with warnings.catch_warnings(record=True) as rec:
+            warnings.simplefilter("always")
+            buf = _fill(api, neuron_bufs.make(torch.float64))
+    finally:
+        env.d.set_backend("auto")
+    assert env.kernels.calls and buf.dtype == torch.float64
+    assert len(_fp64_warnings(rec)) == 1 and not _host_warnings(rec)
+
+
+@pytest.mark.parametrize("api", ["normal_into", "uniform_into", "exponential_into"])
+def test_fp64_device_buffer_pytorch_backend_no_warning(env, neuron_bufs, api):
+    env.d.set_backend("pytorch")
+    try:
+        with warnings.catch_warnings(record=True) as rec:
+            warnings.simplefilter("always")
+            buf = _fill(api, neuron_bufs.make(torch.float64))
+    finally:
+        env.d.set_backend("auto")
+    assert env.kernels.calls == [] and buf.dtype == torch.float64
+    assert neuron_bufs.copies == [(torch.device("cpu"), torch.float64)]
+    assert not _host_warnings(rec)
+
+
+@pytest.mark.parametrize("api", sorted(DEVICE_BUFFER_APIS))
+def test_fp64_host_buffer_unchanged(env, neuron_bufs, kernels_present, api):
+    """A host float64 buffer is filled in place in host torch, without warning."""
+    with warnings.catch_warnings(record=True) as rec:
+        warnings.simplefilter("always")
+        buf = _fill(api, torch.full((40,), float("nan"), dtype=torch.float64))
+    assert env.kernels.calls == [] and not bool(buf.isnan().any())
+    assert not _host_warnings(rec)
+
+
+@pytest.mark.parametrize("api", sorted(DEVICE_BUFFER_APIS))
+def test_fp32_device_buffer_stays_on_device(env, neuron_bufs, api):
+    with warnings.catch_warnings(record=True) as rec:
+        warnings.simplefilter("always")
+        _fill(api, neuron_bufs.make(torch.float32))
+    assert env.kernels.calls
+    assert not _host_warnings(rec)
+
+
+@pytest.mark.parametrize("api", sorted(FP64_ROUTED))
+def test_fp64_host_results_do_not_warn(env, api):
+    """Every other trnrand result is a host tensor: no host-fill warning."""
+    with warnings.catch_warnings(record=True) as rec:
+        warnings.simplefilter("always")
+        assert APIS[api](torch.float64).dtype == torch.float64
+    assert not _host_warnings(rec)

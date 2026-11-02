@@ -38,6 +38,11 @@ except ImportError:
 # kernel breakage during iteration — mirrors TRNBLAS_REQUIRE_NKI etc.
 _REQUIRE_NKI = os.environ.get("TRNRAND_REQUIRE_NKI", "").lower() in ("1", "true", "yes")
 
+# When set, a float64 buffer on the neuron device keeps the on-device route
+# (the float32 kernels, so float32 precision) under backend "auto" instead of
+# being filled on the host at float64 precision. See the float64 policy below.
+_FP64_ON_DEVICE = os.environ.get("TRNRAND_FP64_ON_DEVICE", "").lower() in ("1", "true", "yes")
+
 # When set, dispatch bypasses torch_xla and runs kernels through
 # `nki.simulate(kernel)(np_args)` on CPU. Lets us iterate kernels on any
 # x86_64 Linux box without paying the NEFF compile + hardware dispatch
@@ -266,7 +271,46 @@ def _no_kernel_for_dtype(what: str, *tensors: torch.Tensor) -> None:
 # SobolEngine draw cast to float64, so torch has no float64-precision Sobol to
 # route to (it would only swap the random shift for a different scrambling).
 # A float64 Sobol request keeps the kernel on every backend, without warning.
+#
+# Device-resident float64 (a `*_into` / `GeneratorProgram` buffer on the
+# neuron device) under "auto": the torch path draws on the host with the host
+# `torch.Generator` at float64 precision and copies the values into the
+# device buffer, which keeps its float64 dtype; one UserWarning per op says so
+# (`_note_fp64_host_fill`). Device arithmetic is float32 on Trainium (measured
+# on Trn2), so there is no device route with float64 precision.
+# TRNRAND_FP64_ON_DEVICE=1 keeps such a buffer on the on-device float32
+# kernels instead (float32 precision, no host round trip, no warning); without
+# the NKI kernels there is no device route and the host fill is used anyway.
+# Host-resident float64 is unchanged (host torch).
 _FP64_WARNED: set[str] = set()
+_fp64_host_warned: set[str] = set()
+
+
+def _on_neuron_device(t) -> bool:
+    """True for a tensor resident on the neuron device."""
+    return isinstance(t, torch.Tensor) and t.device.type == "neuron"
+
+
+def _note_fp64_host_fill(what: str, buf: torch.Tensor) -> None:
+    """The torch path fills `buf` on the host: one UserWarning per op when
+    `buf` is a float64 (or complex128) buffer on the neuron device under
+    backend "auto" (unless TRNRAND_FP64_ON_DEVICE=1)."""
+    if (
+        _backend != "auto"
+        or _FP64_ON_DEVICE
+        or buf.dtype not in (torch.float64, torch.complex128)
+        or not _on_neuron_device(buf)
+        or what in _fp64_host_warned
+    ):
+        return
+    _fp64_host_warned.add(what)
+    warnings.warn(
+        f"trnrand {what}: float64 on the neuron device is computed on the host for "
+        "float64 accuracy (device arithmetic is fp32); pass float32 to stay on device, "
+        "or set TRNRAND_FP64_ON_DEVICE=1 to keep the on-device kernels at fp32 precision.",
+        UserWarning,
+        stacklevel=_caller_stacklevel(),
+    )
 
 
 _PKG_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__))) + os.sep
@@ -294,13 +338,15 @@ def _warn_fp64_once(what: str, hint: str = 'set_backend("auto") draws float64 in
     )
 
 
-def _float64_to_torch(what: str, dtype: torch.dtype) -> bool:
+def _float64_to_torch(what: str, dtype: torch.dtype, buf: torch.Tensor | None = None) -> bool:
     """Apply the float64 policy to a request for `dtype` on the NKI path.
 
     Returns True when the call should take the torch path (float64 under
     backend "auto"), False when the kernel runs (any other dtype, or float64
     under backend "nki", after a one-time warning). Under TRNRAND_REQUIRE_NKI
-    a float64 request raises NotImplementedError.
+    a float64 request raises NotImplementedError. `buf` is the output buffer
+    of a `*_into` / program step: on the neuron device with
+    TRNRAND_FP64_ON_DEVICE=1 a float64 buffer keeps the kernel under "auto".
     """
     if dtype != torch.float64:
         return False
@@ -314,7 +360,9 @@ def _float64_to_torch(what: str, dtype: torch.dtype) -> bool:
     if _backend == "nki":
         _warn_fp64_once(what)
         return False
-    return True
+    # TRNRAND_FP64_ON_DEVICE=1 and a neuron-resident buffer: the caller's
+    # choice, the on-device float32 kernels (no warning).
+    return not (_FP64_ON_DEVICE and _on_neuron_device(buf))
 
 
 def _kernel_operands(op_name: str, *tensors: torch.Tensor, what: str) -> list[torch.Tensor]:

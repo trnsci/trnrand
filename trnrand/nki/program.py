@@ -188,7 +188,9 @@ class GeneratorProgram:
         in_torch = {
             out_name
             for _dist, _n, _kwargs, out_name in self._steps
-            if _float64_to_torch("GeneratorProgram.stream_into", buffers[out_name].dtype)
+            if _float64_to_torch(
+                "GeneratorProgram.stream_into", buffers[out_name].dtype, buffers[out_name]
+            )
         }
 
         for dist, _n, kwargs, out_name in self._steps:
@@ -263,8 +265,14 @@ class GeneratorProgram:
 
     @staticmethod
     def _fill_torch(buf: torch.Tensor, dist: str, kwargs: dict, gen: torch.Generator) -> None:
-        # A device buffer is filled on the host (the generator is a CPU one).
-        out = buf if buf.device.type == "cpu" else torch.empty(buf.shape, dtype=buf.dtype)
+        # A device buffer is filled on the host (the generator is a CPU one);
+        # a float64 one on the neuron device warns once (`_note_fp64_host_fill`).
+        from .dispatch import _note_fp64_host_fill, _on_neuron_device
+
+        on_host = buf.device.type == "cpu" and not _on_neuron_device(buf)
+        if not on_host:
+            _note_fp64_host_fill("GeneratorProgram.stream_into", buf)
+        out = buf if on_host else torch.empty(buf.shape, dtype=buf.dtype)
         if dist == "normal":
             out.normal_(mean=kwargs["mean"], std=kwargs["std"], generator=gen)
         elif dist == "uniform":
