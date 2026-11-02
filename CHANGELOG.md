@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.13.0] - 2026-11-02
+
+Validated on Trn2 (trn2.3xlarge, Neuron SDK 2.33.0, native TorchNeuron) — see trnsci/trnsci#35.
+
+Headline: **correctness fixes — upgrade recommended on Neuron.** On the NKI path: `exponential_into` could return inf (#82); `sobol(scramble=False, seed=s)` returned shifted points (#90); gamma, χ², beta and truncated_normal drew identical samples on every partition rank (#92); fp16/bf16 `uniform` could return `high` (#94); fp16/bf16 `sobol`/`halton` could return exactly 1.0 (#101). Also: fp16 `exponential` gave inf and bf16 was biased (#80), and fp16/bf16 `latin_hypercube` broke one-point-per-stratum (#96). `advance_to` now warns in `key_mode="draw"` (#76).
+
 ### Added
 
 - **Guard against the NKI trace-cache closure bug ([aws-neuron/aws-neuron-sdk#1454](https://github.com/aws-neuron/aws-neuron-sdk/issues/1454),
@@ -28,15 +34,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   boundaries, on CPU in the regular CI job (~5 s). `--backend nki|auto` and
   `--conformance-device neuron` run the same cases on a Neuron host.
   Needs-decision behaviour (#98, #99, #100) and the new #101 are strict xfails.
+
 ### Fixed
 
 - **`sobol` / `halton(dtype=torch.float16 / torch.bfloat16)` returned 1.0** (silent). Affects released versions **0.1.0 through 0.12.1**, on every backend. Points were computed in float32/float64 and cast with `.to(dtype)`, so points within half an ulp of 1 rounded to exactly 1.0, outside the documented `[0, 1)` (sobol) / `(0, 1)` (halton); e.g. 32 of 16384 bfloat16 coordinates at n = 4096. Those points now step back to the largest value below 1 in the dtype (halton points that would round to 0 step up to the smallest positive value); all other points, and float32 / float64 output, are bit-identical (#101).
 - **`exponential(dtype=torch.float16 / torch.bfloat16)` returned `inf` / biased samples** (silent). Affects released versions **0.1.0 through 0.12.1**, on the PyTorch path. The uniform variate was drawn in the output dtype: float16 has ~11 random bits, so `u == 0` about once in 2^11, and the `1e-10` clamp underflows to 0 (`-log(0) = inf`; 487 inf in 2M samples). bfloat16 mapped `u == 0` (about once in 2^8) to 23.0, which biased the mean +4.5 %. The uniform is now drawn in at least float32; float32 and float64 output is bit-identical (#80).
-### Fixed
 
 - **`latin_hypercube(dtype=torch.float16 / torch.bfloat16)` was not a Latin hypercube** (silent). Affects released versions **0.1.0 through 0.12.1**, on every backend. Each column was computed as `(perm + u) / n` in the output dtype, and the rounding pushed points into the next stratum or onto 1.0. For n = 64, 8 of 20 float16 and all bfloat16 columns had a stratum with two points. Points outside their stratum are now moved back in (all others are bit-identical), and a dtype that cannot hold a point in every stratum (bfloat16 n > 256, float16 n > 2048) raises `ValueError`. float32 / float64 are unchanged (#96).
 
-### Fixed
 
 - **`advance_to(position())` did not resume the stream with the default
   `key_mode="draw"`** (silent), although the `position()` docstring gave it as
@@ -57,16 +62,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     recipe, in both key modes and on both paths, and state that
     `advance_to(position())` resumes only with `key_mode="counter"`, for the
     NKI `uniform` / `normal` / `standard_normal` draws (#76).
-### Fixed
 
 - **`exponential_into()` and `GeneratorProgram` `.exponential()` steps returned `inf`** (silent). Affects released versions **0.6.0 through 0.12.1**, on the NKI path only (`set_backend("nki")`, or `"auto"` on Neuron hardware). They computed `-log(u)` without the `1e-10` clamp `exponential()` uses, and the Threefry uniform kernels emit `u == 0` with probability 2^-24 per sample (about 4 `inf` in a 64M buffer). Only those samples change (#82).
-### Fixed
 
 - **`sobol(scramble=False, seed=s)` returned shifted points on the NKI path** (silent). Affects released versions **0.5.0 through 0.12.1**, on the NKI path only (`set_backend("nki")`, or `"auto"` on Neuron hardware). The NKI branch passed `seed` to `sobol_nki` regardless of `scramble`, and `sobol_nki` applies its random shift whenever `seed != 0`, so an unscrambled request with a seed was not the Sobol sequence. `scramble=False` now always gives the plain sequence. `scramble=True` with `seed=None` / `0` (unscrambled on NKI) is unchanged and tracked in #85 (#90).
-### Fixed
 
 - **Partitioned generators drew identical `gamma` / `chi_squared` / `beta` / `truncated_normal` samples on every rank** (silent). Affects released versions **0.7.0 through 0.12.1**, on the NKI path only (`set_backend("nki")`, or `"auto"` on Neuron hardware). These rejection samplers take a key drawn from the rank's identically seeded `torch.Generator` and no counter offset, so `partition_rank` had no effect and P ranks returned P copies of one sample. Rank r > 0 now uses key `seed + 8r`, which never overlaps the keys rank 0 uses in the same call. P = 1 and rank 0 are bit-identical. Ranks are now independent; bit-exact rank concatenation for these distributions is #84 (#92).
-### Fixed
 
 - **`uniform(dtype=torch.bfloat16 / torch.float16)` returned `high`, outside `[low, high)`** (silent). Affects released versions **0.5.0 through 0.12.1**, on the NKI path only (`set_backend("nki")`, or `"auto"` on Neuron hardware). The float32 kernel output was cast to `dtype` with round-to-nearest, which maps values within half an ulp of `high` up to `high`: about 1 sample in 2^9 for bfloat16 and 1 in 2^12 for float16. Such values now become the largest representable value below `high`. Other values and float32 / float64 output are unchanged (#94).
 
