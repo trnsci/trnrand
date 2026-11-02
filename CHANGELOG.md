@@ -59,6 +59,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Fixed
 
 - **`exponential_into()` and `GeneratorProgram` `.exponential()` steps returned `inf`** (silent). Affects released versions **0.6.0 through 0.12.1**, on the NKI path only (`set_backend("nki")`, or `"auto"` on Neuron hardware). They computed `-log(u)` without the `1e-10` clamp `exponential()` uses, and the Threefry uniform kernels emit `u == 0` with probability 2^-24 per sample (about 4 `inf` in a 64M buffer). Only those samples change (#82).
+### Fixed
+
+- **`sobol(scramble=False, seed=s)` returned shifted points on the NKI path** (silent). Affects released versions **0.5.0 through 0.12.1**, on the NKI path only (`set_backend("nki")`, or `"auto"` on Neuron hardware). The NKI branch passed `seed` to `sobol_nki` regardless of `scramble`, and `sobol_nki` applies its random shift whenever `seed != 0`, so an unscrambled request with a seed was not the Sobol sequence. `scramble=False` now always gives the plain sequence. `scramble=True` with `seed=None` / `0` (unscrambled on NKI) is unchanged and tracked in #85 (#90).
 
 ## [0.12.1] - 2026-11-01
 
