@@ -11,6 +11,8 @@ Single-rank (P = 1) streams are bit-identical to 0.13.0.
 from __future__ import annotations
 
 import hashlib
+import platform
+import sys
 
 import pytest
 import torch
@@ -136,6 +138,17 @@ _KW = {
 }
 
 
+# The hashes were recorded on arm64 macOS against trnrand 0.13.0. torch's CPU
+# sampling kernels (vectorised normal and friends) are not bit-identical across
+# CPU architectures, so the pinned values only hold on that platform; the
+# platform-independent check below covers every machine.
+_PINNED_PLATFORM = sys.platform == "darwin" and platform.machine() == "arm64"
+
+
+@pytest.mark.skipif(
+    not _PINNED_PLATFORM,
+    reason="hashes pinned on arm64 macOS (torch RNG kernels differ by CPU arch)",
+)
 @pytest.mark.parametrize("name", list(_PINNED))
 def test_single_rank_streams_unchanged(name):
     g = tr.Generator(seed=2026)
@@ -149,3 +162,23 @@ def test_single_rank_streams_unchanged(name):
 
     t = torch.cat([draw().double().reshape(-1) for _ in range(2)])
     assert hashlib.sha256(t.numpy().tobytes()).hexdigest()[:16] == _PINNED[name]
+
+
+@pytest.mark.parametrize("name", list(_PINNED))
+def test_explicit_single_rank_matches_default(name):
+    """partition_rank=0, partition_size=1 must reproduce the unpartitioned stream
+    bit for bit on any platform (the pytorch path for P = 1 is unchanged by #99)."""
+
+    def draws(g):
+        def draw():
+            if name.endswith("_into"):
+                b = torch.empty(1000)
+                getattr(tr, name)(b, generator=g)
+                return b
+            return getattr(tr, name)(1000, generator=g, **_KW.get(name, {}))
+
+        return torch.cat([draw().double().reshape(-1) for _ in range(2)])
+
+    a = draws(tr.Generator(seed=2026))
+    b = draws(tr.Generator(seed=2026, partition_rank=0, partition_size=1))
+    assert torch.equal(a, b)
