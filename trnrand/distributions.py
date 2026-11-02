@@ -45,6 +45,21 @@ def _nki_seed(gen_obj: Generator) -> int:
     return int(torch.randint(0, 2**24, (1,), generator=gen_obj.torch_generator).item())
 
 
+def _rank_seed(gen_obj: Generator, seed: int) -> int:
+    """Per-rank key for the NKI rejection samplers (gamma, chi_squared, beta,
+    truncated_normal), which take no counter offset.
+
+    Every rank draws the same `seed` from its identically seeded torch
+    generator, so without this all P ranks returned identical samples (#92).
+    The samplers use up to 8 consecutive keys per call (beta: seed..seed+7),
+    so a stride of 8 keeps ranks on disjoint keys. Rank 0 (and P = 1) is
+    unchanged. Independent ranks, not bit-exact rank concatenation (#84).
+    """
+    if gen_obj._partition_size == 1 or gen_obj._partition_rank == 0:
+        return seed
+    return (seed + 8 * gen_obj._partition_rank) & 0xFFFFFF
+
+
 def _compiling() -> bool:
     """True while Dynamo traces and the custom-op route of #61 is available."""
     if not torch.compiler.is_compiling():
@@ -179,10 +194,14 @@ def exponential(
         u = torch.clamp(u, min=1e-10)
         return (-torch.log(u) / rate).to(dtype).reshape(size)
     gen = (generator or get_default_generator()).torch_generator
-    u = torch.empty(*size, dtype=dtype).uniform_(0, 1, generator=gen)
+    # Draw the uniform in at least float32: a float16 / bfloat16 uniform has only
+    # ~11 / ~8 random bits, so u == 0 is common, and 1e-10 underflows to 0 in
+    # float16 (-log(0) = inf). float32 / float64 are unchanged (#80).
+    work = torch.promote_types(dtype, torch.float32)
+    u = torch.empty(*size, dtype=work).uniform_(0, 1, generator=gen)
     # Clamp to avoid log(0)
     u = torch.clamp(u, min=1e-10)
-    return -torch.log(u) / rate
+    return (-torch.log(u) / rate).to(dtype)
 
 
 def bernoulli(
@@ -238,7 +257,7 @@ def gamma(
         from .nki.dispatch import gamma_nki
 
         gen = generator or get_default_generator()
-        seed = _nki_seed(gen)
+        seed = _rank_seed(gen, _nki_seed(gen))
         n = math.prod(size)
         out = gamma_nki(n, shape=shape, scale=scale, seed=seed)
         return out.to(dtype).reshape(size)
@@ -299,7 +318,7 @@ def chi_squared(
         from .nki.dispatch import chi_squared_nki
 
         gen = generator or get_default_generator()
-        seed = _nki_seed(gen)
+        seed = _rank_seed(gen, _nki_seed(gen))
         n = math.prod(size)
         out = chi_squared_nki(n, df=df, seed=seed)
         return out.to(dtype).reshape(size)
@@ -325,7 +344,7 @@ def beta(
         from .nki.dispatch import beta_nki
 
         gen = generator or get_default_generator()
-        seed = _nki_seed(gen)
+        seed = _rank_seed(gen, _nki_seed(gen))
         n = math.prod(size)
         out = beta_nki(n, alpha=alpha, beta_param=beta, seed=seed)
         return out.to(dtype).reshape(size)
@@ -468,7 +487,9 @@ def exponential_into(
         counter_offset = gen._partition_rank * streaming_batches + gen._counter
         u = threefry_stream_uniform(n, seed=seed, counter_offset=counter_offset)
         gen._counter += streaming_batches * gen._partition_size  # every chip's slice
-        raw = -torch.log(u) / rate
+        # The kernel emits k * 2^-24, k >= 0: clamp as exponential() does, or
+        # u == 0 (p = 2^-24 per sample) gives +inf (#82).
+        raw = -torch.log(torch.clamp(u, min=1e-10)) / rate
         buf.copy_(raw.reshape(buf.shape))
         return
     gen_t = (generator or get_default_generator()).torch_generator
@@ -492,7 +513,7 @@ def truncated_normal(
         from .nki.dispatch import truncated_normal_nki
 
         gen = generator or get_default_generator()
-        seed = _nki_seed(gen)
+        seed = _rank_seed(gen, _nki_seed(gen))
         n = math.prod(size)
         out = truncated_normal_nki(n, low=low, high=high, mean=mean, std=std, seed=seed)
         return out.to(dtype).reshape(size)

@@ -76,6 +76,16 @@ Python:
 export NKI_ENABLE_TRACE_CACHE=0
 ```
 
+The test suite keeps the cache on, as users run it, but gives each session
+a fresh, empty cache directory (`NKI_TRACE_CACHE_URL`), so edits never hit
+a stale entry.
+
+The cache also ignores constants captured in a kernel's closure
+([aws-neuron/aws-neuron-sdk#1454](https://github.com/aws-neuron/aws-neuron-sdk/issues/1454));
+trnrand's kernels take every specialising value as an argument
+(`tests/test_trace_cache_safety.py`). Set `NKI_ENABLE_TRACE_CACHE=0` if
+you write NKI kernels that a factory specialises through a closure.
+
 See the TorchNeuron
 [environment variables](https://github.com/aws-neuron/torch-neuronx/blob/main/docs/environment_variables.md)
 reference.

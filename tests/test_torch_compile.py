@@ -21,6 +21,7 @@ test at the bottom.
 from __future__ import annotations
 
 import operator
+import warnings
 
 import numpy as np
 import pytest
@@ -235,7 +236,9 @@ def _partitioned(seed, rank=0, size=1, advance=0, key_mode="draw"):
         g = trnrand.Generator(
             seed=seed, partition_rank=rank, partition_size=size, key_mode=key_mode
         )
-        g.advance(advance)
+        with warnings.catch_warnings():  # draw mode warns (#76); counter placement only
+            warnings.simplefilter("ignore", trnrand.AdvanceWarning)
+            g.advance(advance)
         return g
 
     return make
