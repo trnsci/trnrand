@@ -34,7 +34,7 @@ from .distributions import (
     uniform,
     uniform_into,
 )
-from .generator import Generator, get_default_generator, manual_seed
+from .generator import AdvanceWarning, Generator, get_default_generator, manual_seed
 
 # Backend control
 from .nki import HAS_NKI, get_backend, get_cores, set_backend, set_cores
@@ -48,6 +48,7 @@ from .quasi import halton, latin_hypercube, sobol
 __all__ = [
     # Generator
     "Generator",
+    "AdvanceWarning",
     "manual_seed",
     "get_default_generator",
     # Distributions

@@ -9,8 +9,9 @@ Pseudo-random and quasi-random number generation targeting Trainium.
 Seeded generators, standard distributions, and low-discrepancy sequences
 for Monte Carlo and quasi-Monte Carlo integration.
 
-The NKI target is a Philox counter-based RNG on the GpSimd engine —
-on-device generation avoids host→device transfer for large random tensors.
+The NKI generator is Threefry4x32-20, a counter-based RNG on the GpSimd
+engine (a Philox 4x32-10 kernel ships alongside it) — on-device generation
+avoids host→device transfer for large random tensors.
 
 ## Architecture
 
@@ -18,6 +19,7 @@ on-device generation avoids host→device transfer for large random tensors.
 trnrand/
 ├── trnrand/
 │   ├── __init__.py          # Re-exports all RNG operations
+│   ├── _compile.py          # torch.compile custom ops for generator state (#61)
 │   ├── generator.py         # Generator class, seeding, state management
 │   ├── distributions.py     # uniform, normal, exponential, bernoulli, etc.
 │   ├── quasi.py             # sobol, halton, latin_hypercube
@@ -51,25 +53,29 @@ trnrand/
 
 ## NKI Strategy
 
-The Philox 4×32 counter-based RNG maps to Trainium:
+The counter-based RNGs (Threefry4x32-20 for every distribution, Philox 4×32-10
+as a second kernel) map to Trainium:
 - **GpSimd engine** for the integer multiply-XOR rounds (not Tensor Engine)
 - **Parallel generation**: each tile gets disjoint counter range
 - **Deterministic**: (counter, key) → output, no state to synchronize
 
-Philox is preferred over Mersenne Twister because it's stateless and
-trivially parallelizable. Same engine used by cuRAND and JAX.
+Counter-based RNGs are preferred over Mersenne Twister because they're
+stateless and trivially parallelizable. Threefry needs no 32-bit integer
+multiply (JAX's default); Philox is cuRAND's and PyTorch CUDA's.
 
 ## Known Gaps
 
-- **NKI Philox kernel is a stub.** All generation uses torch.Generator
-  until validated on hardware.
+- **`advance` / `advance_to` resume the stream only with
+  `key_mode="counter"`** (and only for `uniform` / `normal`). With the default `key_mode="draw"` each NKI draw
+  takes a fresh key from the host `torch.Generator`, which they don't move;
+  checkpoint with `get_state` / `set_state` instead (#76).
 
 - **Halton degrades above ~20 dimensions.** Known limitation of the
   algorithm — correlations appear in high-dimensional projections.
   Sobol is preferred for d > 10.
 
-- **No on-device normal distribution yet.** Box-Muller transform from
-  uniform samples would run on Vector Engine (cos, sin, log, sqrt).
+- **NKI Sobol is limited to 10 dimensions and 2^24 points**, and its
+  scrambling is a per-dimension random shift, not Owen scrambling.
 
 ## Dependencies
 
