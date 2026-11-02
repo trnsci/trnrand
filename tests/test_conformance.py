@@ -783,24 +783,13 @@ def test_unseeded_generators_are_independent():
     assert not torch.equal(a, b)
 
 
-_NKI_PARTITIONED = {
-    "uniform",
-    "normal",
-    "exponential",
-    "poisson_large",
-    "normal_into",
-    "uniform_into",
-    "exponential_into",
-}
 _NKI_92 = {"gamma", "beta", "chi_squared", "truncated_normal"}
 
 
 @pytest.mark.parametrize("dn", list(DRAWS))
 def test_partition_ranks_draw_different_samples(request, nki_like, dn):
     # Docs: each rank draws a disjoint subrange of the logical stream.
-    if not nki_like or dn not in (_NKI_PARTITIONED | _NKI_92):
-        known(request, "99", "partition_rank is ignored on the PyTorch path", strict=True)
-    elif dn in _NKI_92:
+    if nki_like and dn in _NKI_92:
         known(
             request,
             "92",
@@ -815,15 +804,8 @@ def test_partition_ranks_draw_different_samples(request, nki_like, dn):
 
 @pytest.mark.parametrize("km", KEY_MODES)
 @pytest.mark.parametrize("dn", ["uniform", "normal", "exponential"])
-def test_partition_concat_equals_single_chip(request, nki_like, dn, km):
+def test_partition_concat_equals_single_chip(dn, km):
     # Generator docstring: concatenating ranks in order reproduces one chip.
-    known(
-        request,
-        "99",
-        "partition_rank is ignored on the PyTorch path",
-        strict=True,
-        when=not nki_like,
-    )
     P, N = 4, 4 * 2048
     d = DRAWS[dn]
     g1 = G(31, key_mode=km)

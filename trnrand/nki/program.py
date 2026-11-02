@@ -134,6 +134,8 @@ class GeneratorProgram:
         On hosts without neuronxcc, `stream_into` uses `torch.Generator`
         with `seed ^ counter` as seed. Output is not bit-exact with the NKI
         path; shape, dtype, and distribution properties are preserved.
+        A partitioned program (rank r of P) draws each step's P × n samples
+        and keeps its slice, so ranks concatenate to the single-chip output.
     """
 
     def __init__(
@@ -223,14 +225,20 @@ class GeneratorProgram:
         gen = torch.Generator()
         gen.manual_seed(self._seed ^ self._counter)
 
+        P, r = self._partition_size, self._partition_rank
         for dist, _n, kwargs, out_name in self._steps:
             buf = buffers[out_name]
+            # Rank r of P fills its slice of the P × n single-chip draw (#99).
+            n = buf.numel()
+            t = buf if P == 1 else torch.empty(P * n, dtype=buf.dtype, device=buf.device)
             if dist == "normal":
-                buf.normal_(mean=kwargs["mean"], std=kwargs["std"], generator=gen)
+                t.normal_(mean=kwargs["mean"], std=kwargs["std"], generator=gen)
             elif dist == "uniform":
-                buf.uniform_(kwargs["low"], kwargs["high"], generator=gen)
+                t.uniform_(kwargs["low"], kwargs["high"], generator=gen)
             elif dist == "exponential":
-                buf.exponential_(lambd=kwargs["rate"], generator=gen)
+                t.exponential_(lambd=kwargs["rate"], generator=gen)
+            if P > 1:
+                buf.copy_(t[r * n : (r + 1) * n].reshape(buf.shape))
 
         # Increment counter to distinguish consecutive calls on the CPU path.
         self._counter += 1
