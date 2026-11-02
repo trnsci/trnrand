@@ -45,6 +45,21 @@ def _nki_seed(gen_obj: Generator) -> int:
     return int(torch.randint(0, 2**24, (1,), generator=gen_obj.torch_generator).item())
 
 
+def _rank_seed(gen_obj: Generator, seed: int) -> int:
+    """Per-rank key for the NKI rejection samplers (gamma, chi_squared, beta,
+    truncated_normal), which take no counter offset.
+
+    Every rank draws the same `seed` from its identically seeded torch
+    generator, so without this all P ranks returned identical samples (#92).
+    The samplers use up to 8 consecutive keys per call (beta: seed..seed+7),
+    so a stride of 8 keeps ranks on disjoint keys. Rank 0 (and P = 1) is
+    unchanged. Independent ranks, not bit-exact rank concatenation (#84).
+    """
+    if gen_obj._partition_size == 1 or gen_obj._partition_rank == 0:
+        return seed
+    return (seed + 8 * gen_obj._partition_rank) & 0xFFFFFF
+
+
 def _compiling() -> bool:
     """True while Dynamo traces and the custom-op route of #61 is available."""
     if not torch.compiler.is_compiling():
@@ -229,7 +244,7 @@ def gamma(
         from .nki.dispatch import gamma_nki
 
         gen = generator or get_default_generator()
-        seed = _nki_seed(gen)
+        seed = _rank_seed(gen, _nki_seed(gen))
         n = math.prod(size)
         out = gamma_nki(n, shape=shape, scale=scale, seed=seed)
         return out.to(dtype).reshape(size)
@@ -290,7 +305,7 @@ def chi_squared(
         from .nki.dispatch import chi_squared_nki
 
         gen = generator or get_default_generator()
-        seed = _nki_seed(gen)
+        seed = _rank_seed(gen, _nki_seed(gen))
         n = math.prod(size)
         out = chi_squared_nki(n, df=df, seed=seed)
         return out.to(dtype).reshape(size)
@@ -316,7 +331,7 @@ def beta(
         from .nki.dispatch import beta_nki
 
         gen = generator or get_default_generator()
-        seed = _nki_seed(gen)
+        seed = _rank_seed(gen, _nki_seed(gen))
         n = math.prod(size)
         out = beta_nki(n, alpha=alpha, beta_param=beta, seed=seed)
         return out.to(dtype).reshape(size)
@@ -485,7 +500,7 @@ def truncated_normal(
         from .nki.dispatch import truncated_normal_nki
 
         gen = generator or get_default_generator()
-        seed = _nki_seed(gen)
+        seed = _rank_seed(gen, _nki_seed(gen))
         n = math.prod(size)
         out = truncated_normal_nki(n, low=low, high=high, mean=mean, std=std, seed=seed)
         return out.to(dtype).reshape(size)

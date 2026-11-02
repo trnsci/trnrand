@@ -62,6 +62,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Fixed
 
 - **`sobol(scramble=False, seed=s)` returned shifted points on the NKI path** (silent). Affects released versions **0.5.0 through 0.12.1**, on the NKI path only (`set_backend("nki")`, or `"auto"` on Neuron hardware). The NKI branch passed `seed` to `sobol_nki` regardless of `scramble`, and `sobol_nki` applies its random shift whenever `seed != 0`, so an unscrambled request with a seed was not the Sobol sequence. `scramble=False` now always gives the plain sequence. `scramble=True` with `seed=None` / `0` (unscrambled on NKI) is unchanged and tracked in #85 (#90).
+### Fixed
+
+- **Partitioned generators drew identical `gamma` / `chi_squared` / `beta` / `truncated_normal` samples on every rank** (silent). Affects released versions **0.7.0 through 0.12.1**, on the NKI path only (`set_backend("nki")`, or `"auto"` on Neuron hardware). These rejection samplers take a key drawn from the rank's identically seeded `torch.Generator` and no counter offset, so `partition_rank` had no effect and P ranks returned P copies of one sample. Rank r > 0 now uses key `seed + 8r`, which never overlaps the keys rank 0 uses in the same call. P = 1 and rank 0 are bit-identical. Ranks are now independent; bit-exact rank concatenation for these distributions is #84 (#92).
 
 ## [0.12.1] - 2026-11-01
 
