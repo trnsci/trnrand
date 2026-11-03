@@ -30,6 +30,20 @@ def _nki_active() -> bool:
     return HAS_NKI
 
 
+def _halton_fp64_to_torch(dtype: torch.dtype) -> bool:
+    """The float64 policy (trnrand#105) for halton: a float64 request takes the
+    float64 torch path under backend "auto", the float32 kernel (cast, warned
+    once) under "nki", and raises under TRNRAND_REQUIRE_NKI.
+
+    sobol has no such routing: the pytorch backend's float64 Sobol is a
+    float32 SobolEngine draw cast to float64, so there is no float64-precision
+    torch Sobol to route to; float64 Sobol keeps the kernel on every backend.
+    """
+    from .nki.dispatch import _float64_to_torch
+
+    return _float64_to_torch("halton", dtype)
+
+
 def _outside_kernel_limits(name: str, reason: str) -> None:
     """Fall back to the CPU path for a call the NKI kernel cannot take (#89, #104).
 
@@ -140,7 +154,7 @@ def halton(
     ``n_points >= 2^22``) use the CPU path with an ``NkiFallbackWarning``, or
     raise ``ValueError`` under ``TRNRAND_REQUIRE_NKI=1``.
     """
-    if _nki_active() and _halton_fits_kernel(n_points, n_dims):
+    if _nki_active() and not _halton_fp64_to_torch(dtype) and _halton_fits_kernel(n_points, n_dims):
         try:
             from .nki.dispatch import halton_nki
 

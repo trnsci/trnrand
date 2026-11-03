@@ -171,7 +171,29 @@ class GeneratorProgram:
             self._stream_into_pytorch(buffers)
 
     def _stream_into_nki(self, buffers: dict[str, torch.Tensor]) -> None:
-        from .dispatch import threefry_stream_normal, threefry_stream_uniform
+        from .dispatch import _float64_to_torch, threefry_stream_normal, threefry_stream_uniform
+
+        # The kernels draw real float32 values. An integer / bool buffer raises on
+        # the CPU path too (normal_ / uniform_ / exponential_), and a complex one
+        # would get a zero imaginary part, so refuse both before drawing anything
+        # (trnsci/trnsci#35).
+        for _dist, _n, _kwargs, out_name in self._steps:
+            dt = buffers[out_name].dtype
+            if not dt.is_floating_point:
+                raise NotImplementedError(
+                    f"GeneratorProgram.stream_into: buffer {out_name!r} is {dt}; the NKI "
+                    "path fills real floating buffers (float32, float64, float16, bfloat16)"
+                )
+        # float64 buffers (trnrand#105): filled in torch at float64 precision under
+        # backend "auto", by the float32 kernel (cast, warned once) under "nki";
+        # TRNRAND_REQUIRE_NKI raises here, before anything is drawn.
+        in_torch = {
+            out_name
+            for _dist, _n, _kwargs, out_name in self._steps
+            if _float64_to_torch(
+                "GeneratorProgram.stream_into", buffers[out_name].dtype, buffers[out_name]
+            )
+        }
 
         for dist, _n, kwargs, out_name in self._steps:
             buf = buffers[out_name]
@@ -183,7 +205,15 @@ class GeneratorProgram:
             # self._counter, so its counter_offset is shifted by partition_rank.
             counter_offset = self._counter + self._partition_rank * streaming_batches
 
-            if dist == "normal":
+            if out_name in in_torch:
+                # Same counter slots as the kernel step, so the other steps'
+                # streams do not move; the torch generator is keyed by
+                # (seed, counter_offset), so calls and ranks stay independent.
+                gen = torch.Generator()
+                gen.manual_seed((self._seed * 0x9E3779B97F4A7C15 + counter_offset) % (1 << 63))
+                self._fill_torch(buf, dist, kwargs, gen)
+
+            elif dist == "normal":
                 raw = threefry_stream_normal(
                     n_actual, seed=self._seed, counter_offset=counter_offset
                 )
@@ -201,6 +231,10 @@ class GeneratorProgram:
                 high = kwargs["high"]
                 if low != 0.0 or high != 1.0:
                     raw = raw * (high - low) + low
+                if buf.dtype in (torch.float16, torch.bfloat16) and high > low:
+                    from ..distributions import _below_high
+
+                    raw = _below_high(raw.to(buf.dtype), high)  # as uniform() does (#94)
                 buf.copy_(raw.reshape(buf.shape))
 
             elif dist == "exponential":
@@ -231,14 +265,28 @@ class GeneratorProgram:
             # Rank r of P fills its slice of the P × n single-chip draw (#99).
             n = buf.numel()
             t = buf if P == 1 else torch.empty(P * n, dtype=buf.dtype, device=buf.device)
-            if dist == "normal":
-                t.normal_(mean=kwargs["mean"], std=kwargs["std"], generator=gen)
-            elif dist == "uniform":
-                t.uniform_(kwargs["low"], kwargs["high"], generator=gen)
-            elif dist == "exponential":
-                t.exponential_(lambd=kwargs["rate"], generator=gen)
+            self._fill_torch(t, dist, kwargs, gen)
             if P > 1:
                 buf.copy_(t[r * n : (r + 1) * n].reshape(buf.shape))
 
         # Increment counter to distinguish consecutive calls on the CPU path.
         self._counter += 1
+
+    @staticmethod
+    def _fill_torch(buf: torch.Tensor, dist: str, kwargs: dict, gen: torch.Generator) -> None:
+        # A device buffer is filled on the host (the generator is a CPU one);
+        # a float64 one on the neuron device warns once (`_note_fp64_host_fill`).
+        from .dispatch import _note_fp64_host_fill, _on_neuron_device
+
+        on_host = buf.device.type == "cpu" and not _on_neuron_device(buf)
+        if not on_host:
+            _note_fp64_host_fill("GeneratorProgram.stream_into", buf)
+        out = buf if on_host else torch.empty(buf.shape, dtype=buf.dtype)
+        if dist == "normal":
+            out.normal_(mean=kwargs["mean"], std=kwargs["std"], generator=gen)
+        elif dist == "uniform":
+            out.uniform_(kwargs["low"], kwargs["high"], generator=gen)
+        elif dist == "exponential":
+            out.exponential_(lambd=kwargs["rate"], generator=gen)
+        if out is not buf:
+            buf.copy_(out)

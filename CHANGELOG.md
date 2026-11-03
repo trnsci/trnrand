@@ -7,8 +7,97 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+Lands in 0.14.0. **Changes the stream for float64 callers on the NKI path**
+(`set_backend("auto")` on a Neuron host): see Changed.
+
+### Changed
+
+- **float64 policy (trnrand#105, the trnsci suite policy).** float64 under
+  `auto` now computes in torch at float64 accuracy (previously cast to fp32 on
+  the NKI path). Affects released versions **0.5.0 through 0.13.0**, on the
+  NKI path only (`set_backend("nki")`, or `"auto"` on a Neuron host): a
+  `dtype=torch.float64` request (or a float64 buffer for `*_into` /
+  `GeneratorProgram.stream_into`) was drawn by the float32 kernels and cast up,
+  so the values had float32 resolution (24-bit uniforms) while
+  `set_backend("pytorch")` draws float64. From 0.14.0:
+  - backend `"auto"`: `uniform`, `normal`, `standard_normal`,
+    `truncated_normal`, `exponential`, `gamma`, `chi_squared`, `beta`,
+    `poisson` (lam >= 20; smaller lam always used torch), `halton`,
+    `normal_into` / `uniform_into` / `exponential_into` draw float64 in torch,
+    with the same values as `set_backend("pytorch")`. **This changes the
+    stream for float64 callers on Trainium under `auto`** and they no longer
+    get the on-device generator. A float64 `GeneratorProgram` buffer is filled
+    in torch at float64 precision, keyed by the program seed and the step's
+    counter slots; the program's other buffers and its counter are unchanged.
+  - backend `"nki"` (explicit): the float32 kernels run as before (same
+    values) and the result is cast to float64, with a one-time `UserWarning`
+    per op saying the precision is float32.
+  - `TRNRAND_REQUIRE_NKI=1`: a float64 request raises `NotImplementedError`
+    on either backend (before anything is drawn, for a program).
+  - Result dtype: always the dtype the PyTorch backend returns for the same
+    request (the requested dtype, or the buffer's), for float32, float64,
+    float16 and bfloat16. trnrand takes no tensor operands that promote.
+  - `sobol` is unchanged on every backend: the PyTorch backend's float64
+    Sobol is itself a float32 `SobolEngine` draw cast to float64, so there is
+    no float64 Sobol to route to; it keeps the kernel, without a warning or a
+    REQUIRE_NKI error.
+  - `box_muller_nki` (internal) warns once for float64 input.
+  - float64 buffers on the neuron device (`*_into`, `GeneratorProgram`):
+    under `auto` they are filled on the host at float64 precision and copied
+    into the device buffer (which stays float64), with one `UserWarning` per
+    op: "float64 on the neuron device is computed on the host for float64
+    accuracy (device arithmetic is fp32); pass float32 to stay on device".
+    Device arithmetic on Trainium is float32 (measured on Trn2), so this is
+    the only way to keep the float64 promise for device-resident buffers. The
+    values equal a host buffer's with the same generator state.
+    `TRNRAND_FP64_ON_DEVICE=1` keeps such buffers on the on-device float32
+    kernels instead (float32 precision, no warning). Host float64 buffers and
+    every allocating call (they return host tensors) are unchanged.
+- `normal_into` / `uniform_into` / `exponential_into` on the PyTorch path
+  fill a non-CPU buffer on the host and copy it over (the generator is a host
+  `torch.Generator`); CPU buffers are filled in place as before.
+
+### Added
+
+- **One dtype guard at the NKI kernel boundary (trnsci/trnsci#35).**
+  `trnrand/nki/dispatch.py` has a per-kernel operand-dtype table
+  (`_KERNEL_DTYPES`: int32 words for every kernel, float32 for Box-Muller).
+  Every launch route enforces it itself (`_launch`, the native `nki_op` table
+  returned by `_get_native_ops`, and the simulator via `_simulator`), raising
+  `TypeError` naming the op and the dtypes, and an op without a table entry
+  cannot be loaded. `tests/test_kernel_dtype_guard.py` (CPU) drives every
+  public API through stand-in kernels on the native, XLA and simulator routes
+  with float64 / bfloat16 / float16 / int32 / int64 / bool / complex64
+  requests, and the float64 policy in all three modes.
+- `tests/test_conformance.py`: float64 is checked at float64 tolerance under
+  `--backend pytorch` and `--backend auto`; only `--backend nki` uses the
+  float32 tolerance for float64.
+
 ### Fixed
 
+- **NKI path: integer, bool and complex output requests no longer return
+  truncated or zero-imaginary values** (silent). Affects released versions
+  **through 0.13.0**, on the NKI path only (`set_backend("nki")`, or `"auto"`
+  on a Neuron host). `uniform`, `normal`, `standard_normal`,
+  `truncated_normal` and `normal_into` / `uniform_into` / `exponential_into`
+  cast a float32 draw to the requested dtype: `uniform(dtype=torch.int64)`
+  returned zeros and `normal(dtype=torch.complex64)` a zero imaginary part,
+  where the PyTorch path raises or draws a complex variate. These requests now
+  take the PyTorch path (the same error or the same values as
+  `set_backend("pytorch")`), and `exponential(dtype=complex)` raises as there.
+  `GeneratorProgram.stream_into` raises `NotImplementedError` for a non-real
+  buffer before drawing anything. Under `TRNRAND_REQUIRE_NKI=1` all of these
+  raise `NotImplementedError`. float32, float16 and bfloat16 requests are
+  unchanged and give the same values as before (float64: see Changed).
+- **`uniform_into` / `GeneratorProgram` uniform into a float16 / bfloat16
+  buffer could return `high`** (NKI path), as `uniform()` did before #94; they
+  now step back below `high` the same way. Other values are unchanged.
+- **`box_muller_nki` returned float32 for float64 / float16 / bfloat16 input**;
+  it now returns the input dtype (as `box_muller_cpu` does) with the same
+  values, refuses integer / bool / complex input with `TypeError`, and refuses
+  float64 under `TRNRAND_REQUIRE_NKI`. `philox4x32_nki` refuses float, bool and
+  complex counter / key words with `TypeError` (integer words still go to
+  int32 as before).
 - **`Generator(seed=None)` drew the same stream every time** (silent). Affects released versions **0.1.0 through 0.13.0**, on every backend. A fresh `torch.Generator` starts at torch's fixed default seed, so every unseeded `Generator`, in every process, and the module default generator behind un-seeded `trnrand.uniform(...)` etc. drew one identical stream: one unseeded generator per worker gave perfectly correlated workers. `seed=None` now seeds from OS entropy (`torch.Generator.seed()`); `gen.torch_generator.initial_seed()` reports the seed chosen, and `get_state` / `set_state` replay as before. Code that never seeds now gets different output each run. Every seeded stream (`Generator(seed=s)`, `manual_seed(s)`) is bit-identical (#98).
 - **`partition_rank` was ignored on the PyTorch path: every rank drew identical samples** (silent). Affects released versions **0.7.0 through 0.13.0**, on the PyTorch path (`set_backend("pytorch")`, every CPU host) for every distribution, and on the NKI path for the draws that always go through `torch.Generator` (`bernoulli`, `randint`, `randperm`, `poisson` with `lam < 20`) and the CPU `GeneratorProgram` fallback. A data-parallel job on CPU ranks, or P simulated ranks on a dev host, got P copies of one sample. The PyTorch path now keeps the NKI path's partition contract (#72): rank r of P draws the `P × n` single-generator sample and keeps its contiguous slice `[r·n, (r+1)·n)`, so the ranks concatenate in order to the single-generator draw and every call moves past all P slices (P× the work on that path). `randperm` returns the r-th of P consecutive permutations. Output changes for rank > 0 and, on the PyTorch path, for rank 0 of P > 1; single-rank (P = 1) streams are bit-identical (#99).
 - **`sobol()` on the NKI path raised `AssertionError` for `n_dims > 10` or more than 2^24 points instead of falling back** (loud). Affects released versions **0.5.0 through 0.13.0**, on the NKI path only (`set_backend("nki")`, or `"auto"` on Neuron hardware). Only a missing kernel (`ImportError`) fell through to the CPU path. Calls outside the kernel's limits now use `torch.quasirandom.SobolEngine` with an `NkiFallbackWarning`, or raise `ValueError` under `TRNRAND_REQUIRE_NKI=1`. `sobol(0, d)` now returns an empty `(0, d)` tensor on every backend (it raised on the CPU path and asserted on NKI). Calls inside the limits are unchanged (#89).

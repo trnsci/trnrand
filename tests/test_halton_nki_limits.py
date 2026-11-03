@@ -51,9 +51,23 @@ def test_limits_match_the_kernel_wrapper():
 @pytest.mark.parametrize("d", [11, 21])
 def test_high_dim_falls_back(kernel_calls, monkeypatch, backend, d):
     monkeypatch.setattr(dispatch, "_backend", backend)
+    # float32: a float64 request never considers the kernel under "auto" and
+    # takes the cast under "nki" (the float64 policy, #105); see below.
     with pytest.warns(dispatch.NkiFallbackWarning, match=f"n_dims={d}"):
+        x = trnrand.halton(64, d, dtype=torch.float32)
+    torch.testing.assert_close(x, _scipy_halton(64, d).float(), atol=1e-6, rtol=0)
+    assert kernel_calls == []
+
+
+@pytest.mark.parametrize("d", [4, 11])
+def test_float64_auto_takes_torch_before_the_limits(kernel_calls, monkeypatch, d):
+    """Under "auto" float64 goes to the float64 torch path first (#105), so
+    there is no kernel call and no limits fallback warning."""
+    monkeypatch.setattr(dispatch, "_backend", "auto")
+    with warnings.catch_warnings():
+        warnings.simplefilter("error")
         x = trnrand.halton(64, d, dtype=torch.float64)
-    torch.testing.assert_close(x, _scipy_halton(64, d), atol=1e-6, rtol=0)
+    torch.testing.assert_close(x, _scipy_halton(64, d), atol=1e-12, rtol=0)
     assert kernel_calls == []
 
 
