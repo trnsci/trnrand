@@ -15,6 +15,7 @@ Use cases:
 from __future__ import annotations
 
 import math
+import warnings
 
 import torch
 
@@ -43,6 +44,54 @@ def _halton_fp64_to_torch(dtype: torch.dtype) -> bool:
     return _float64_to_torch("halton", dtype)
 
 
+def _outside_kernel_limits(name: str, reason: str) -> None:
+    """Fall back to the CPU path for a call the NKI kernel cannot take (#89, #104).
+
+    Warns with `NkiFallbackWarning`, or raises `ValueError` when
+    `TRNRAND_REQUIRE_NKI` is set (the caller asked for the kernel or nothing).
+    """
+    from .nki import dispatch
+
+    msg = f"{name}: {reason}, outside the NKI kernel's limits"
+    if dispatch._REQUIRE_NKI:
+        raise ValueError(f"{msg} (TRNRAND_REQUIRE_NKI is set, so no CPU fallback)")
+    warnings.warn(f"{msg}; using the CPU path.", dispatch.NkiFallbackWarning, stacklevel=3)
+
+
+def _sobol_fits_kernel(n_points: int, n_dims: int) -> bool:
+    """True if `sobol_nki` can take the call; warns / raises otherwise (#89)."""
+    from .nki.dispatch import _SOBOL_BITS, _SOBOL_MAX_DIMS
+
+    if n_points <= 0:
+        return False  # n = 0: the CPU path returns (0, n_dims); n < 0: it raises
+    if n_dims > _SOBOL_MAX_DIMS:
+        _outside_kernel_limits("sobol", f"n_dims={n_dims} > {_SOBOL_MAX_DIMS}")
+        return False
+    if n_points > 1 << _SOBOL_BITS:
+        _outside_kernel_limits("sobol", f"n_points={n_points} > 2^{_SOBOL_BITS}")
+        return False
+    return True
+
+
+# halton_nki's limits. The constants live inside dispatch's `if HAS_NKI:` block,
+# so they are restated here; test_halton_nki_limits checks they agree.
+_HALTON_MAX_DIMS = 10
+_HALTON_MAX_POINTS = 1 << 22  # halton_nki needs the last index, n_points, < 2^22
+
+
+def _halton_fits_kernel(n_points: int, n_dims: int) -> bool:
+    """True if `halton_nki` can take the call; warns / raises otherwise (#104)."""
+    if n_points <= 0:
+        return False  # n = 0: the CPU path returns (0, n_dims)
+    if n_dims > _HALTON_MAX_DIMS:
+        _outside_kernel_limits("halton", f"n_dims={n_dims} > {_HALTON_MAX_DIMS}")
+        return False
+    if n_points + 1 > _HALTON_MAX_POINTS:
+        _outside_kernel_limits("halton", f"n_points={n_points} >= 2^22")
+        return False
+    return True
+
+
 def sobol(
     n_points: int,
     n_dims: int,
@@ -60,8 +109,12 @@ def sobol(
 
     Returns:
         Tensor of shape (n_points, n_dims) with values in [0, 1)
+
+    On the NKI path, calls outside the kernel's limits (``n_dims > 10`` or
+    ``n_points > 2^24``) use the CPU path with an ``NkiFallbackWarning``, or
+    raise ``ValueError`` under ``TRNRAND_REQUIRE_NKI=1``.
     """
-    if _nki_active():
+    if _nki_active() and _sobol_fits_kernel(n_points, n_dims):
         try:
             from .nki.dispatch import sobol_nki
 
@@ -75,6 +128,8 @@ def sobol(
         scramble=scramble,
         seed=seed,
     )
+    if n_points == 0:
+        return torch.empty(0, n_dims, dtype=dtype)  # SobolEngine.draw(0) raises
     return _below_one(engine.draw(n_points).to(dtype))
 
 
@@ -94,8 +149,12 @@ def halton(
 
     Returns:
         Tensor of shape (n_points, n_dims) with values in (0, 1)
+
+    On the NKI path, calls outside the kernel's limits (``n_dims > 10`` or
+    ``n_points >= 2^22``) use the CPU path with an ``NkiFallbackWarning``, or
+    raise ``ValueError`` under ``TRNRAND_REQUIRE_NKI=1``.
     """
-    if _nki_active() and not _halton_fp64_to_torch(dtype):
+    if _nki_active() and not _halton_fp64_to_torch(dtype) and _halton_fits_kernel(n_points, n_dims):
         try:
             from .nki.dispatch import halton_nki
 

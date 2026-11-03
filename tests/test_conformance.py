@@ -814,24 +814,13 @@ def test_unseeded_generators_are_independent():
     assert not torch.equal(a, b)
 
 
-_NKI_PARTITIONED = {
-    "uniform",
-    "normal",
-    "exponential",
-    "poisson_large",
-    "normal_into",
-    "uniform_into",
-    "exponential_into",
-}
 _NKI_92 = {"gamma", "beta", "chi_squared", "truncated_normal"}
 
 
 @pytest.mark.parametrize("dn", list(DRAWS))
 def test_partition_ranks_draw_different_samples(request, nki_like, dn):
     # Docs: each rank draws a disjoint subrange of the logical stream.
-    if not nki_like or dn not in (_NKI_PARTITIONED | _NKI_92):
-        known(request, "99", "partition_rank is ignored on the PyTorch path", strict=True)
-    elif dn in _NKI_92:
+    if nki_like and dn in _NKI_92:
         known(
             request,
             "92",
@@ -846,15 +835,8 @@ def test_partition_ranks_draw_different_samples(request, nki_like, dn):
 
 @pytest.mark.parametrize("km", KEY_MODES)
 @pytest.mark.parametrize("dn", ["uniform", "normal", "exponential"])
-def test_partition_concat_equals_single_chip(request, nki_like, dn, km):
+def test_partition_concat_equals_single_chip(dn, km):
     # Generator docstring: concatenating ranks in order reproduces one chip.
-    known(
-        request,
-        "99",
-        "partition_rank is ignored on the PyTorch path",
-        strict=True,
-        when=not nki_like,
-    )
     P, N = 4, 4 * 2048
     d = DRAWS[dn]
     g1 = G(31, key_mode=km)
@@ -1039,21 +1021,12 @@ def test_latin_hypercube_marginals_uniform():
 @pytest.mark.parametrize("n, d", [(1, 1), (5, 1), (3, 10), (0, 2)])
 @pytest.mark.parametrize("name", ["sobol", "halton", "latin_hypercube"])
 def test_quasi_edge_shapes(name, n, d):
-    if name == "sobol" and n == 0:
-        pytest.skip("torch.quasirandom.SobolEngine rejects n=0 (loud)")
     x = host(getattr(tr, name)(n, d))
     assert tuple(x.shape) == (n, d)
 
 
 @pytest.mark.parametrize("name", ["sobol", "halton"])
-def test_quasi_high_dim(request, nki_like, name):
-    known(
-        request,
-        "89",
-        "NKI sobol raises AssertionError for d > 10 instead of falling back",
-        strict=False,
-        when=nki_like and name == "sobol",
-    )
+def test_quasi_high_dim(name):
     x = host(getattr(tr, name)(64, 21))
     assert tuple(x.shape) == (64, 21)
     assert bool((x >= 0).all() and (x < 1).all())
