@@ -23,6 +23,14 @@ On a Neuron host, the same cases on the NKI path, with ``*_into`` /
     pytest tests/test_conformance.py --backend nki --conformance-device neuron
     pytest tests/test_conformance.py --backend auto --conformance-device neuron
 
+float64 follows the suite policy (trnrand#105): under ``--backend pytorch``
+and ``--backend auto`` a float64 request is drawn in torch and is checked at
+float64 tolerance, including float64 buffers on the neuron device under
+``--backend auto --conformance-device neuron`` (filled on the host at float64
+precision and copied over, with one warning per op); only under ``--backend nki`` (float32 kernels, cast, one
+warning per op) does float64 get the float32 tolerance. ``sobol`` is float32
+resolution on every backend (the PyTorch path is a float32 SobolEngine draw).
+
 Known issues are ``xfail`` with the issue number. Needs-decision items are
 ``strict=True``, so the test fails (XPASS) once the behaviour changes and the
 mark must be removed. Bugs with an open fix PR are ``strict=False``.
@@ -47,7 +55,13 @@ REDUCED = (torch.float16, torch.bfloat16)
 SIZES = [1, 127, 129, 1000]
 
 # scipy warns that Sobol balance needs n = 2^k; awkward n is the point here.
-pytestmark = pytest.mark.filterwarnings("ignore:The balance properties of Sobol:UserWarning")
+pytestmark = [
+    pytest.mark.filterwarnings("ignore:The balance properties of Sobol:UserWarning"),
+    # --backend nki: float64 casts warn once per op by design (trnrand#105).
+    pytest.mark.filterwarnings("ignore:trnrand .*float64 on the NKI kernels:UserWarning"),
+    # --backend auto, device buffers: float64 is filled on the host, warned once per op.
+    pytest.mark.filterwarnings("ignore:trnrand .*float64 on the neuron device:UserWarning"),
+]
 BLOCK_SIZES = [511, 512, 513, 16385]
 
 
@@ -71,6 +85,19 @@ def backend(request) -> str:
 def nki_like(backend) -> bool:
     """True when distributions take the NKI path in this run."""
     return backend != "pytorch" and tr.HAS_NKI
+
+
+@pytest.fixture
+def fp32_fp64(backend) -> bool:
+    """True when float64 requests carry float32 precision in this run: only the
+    explicit NKI backend casts float32 kernel output (trnrand#105); "auto"
+    draws float64 in torch."""
+    return backend == "nki" and tr.HAS_NKI
+
+
+def precision(dt, fp32_fp64: bool):
+    """The dtype whose precision a `dt` result carries in this run."""
+    return torch.float32 if (dt == torch.float64 and fp32_fp64) else dt
 
 
 @pytest.fixture
@@ -250,7 +277,7 @@ def assert_support(x, support):
 
 @pytest.mark.parametrize("dt", FLOAT_DTYPES, ids=lambda d: str(d)[6:])
 @pytest.mark.parametrize("name", list(DISTS))
-def test_distribution_matches_scipy(request, nki_like, name, dt):
+def test_distribution_matches_scipy(request, nki_like, fp32_fp64, name, dt):
     known(
         request,
         "94",
@@ -265,7 +292,7 @@ def test_distribution_matches_scipy(request, nki_like, name, dt):
     assert tuple(x.shape) == (n,)
     assert bool(torch.isfinite(x).all()), f"{int((~torch.isfinite(x)).sum())} non-finite"
     assert_support(x, support)
-    assert_moments(x, ref, dt, heavy=heavy)
+    assert_moments(x, ref, precision(dt, fp32_fp64), heavy=heavy)
     if support[0] == "count":
         assert_chi2_discrete(x[:50_000], ref)
     else:
@@ -534,7 +561,7 @@ def test_into_channels_last(dev, iname):
     "dt", [torch.float16, torch.bfloat16, torch.float64], ids=lambda d: str(d)[6:]
 )
 @pytest.mark.parametrize("iname", list(INTO))
-def test_into_buffer_dtypes(dev, iname, dt):
+def test_into_buffer_dtypes(dev, fp32_fp64, iname, dt):
     fn, kw, ref, _ = INTO[iname]
     b = nan_buf(dev, 50_000, dtype=dt)
     fn(b, generator=G(2), **kw)
@@ -542,6 +569,10 @@ def test_into_buffer_dtypes(dev, iname, dt):
     assert hb.dtype == dt
     assert bool(torch.isfinite(hb).all())
     assert stats.kstest(hb.double().numpy(), ref.cdf).statistic < 0.02
+    if dt == torch.float64 and not fp32_fp64:
+        # float64 precision, also for a device buffer under --backend auto
+        # (filled on the host): values a float32 draw cannot represent.
+        assert bool((hb != hb.float().double()).any()), "float32-precision values"
 
 
 @pytest.mark.parametrize("iname", list(INTO))
@@ -777,31 +808,19 @@ def test_generator_rejects_bad_arguments():
         G(1).advance_to(-1)
 
 
-def test_unseeded_generators_are_independent(request):
-    known(request, "98", "Generator(seed=None) always draws the same stream", strict=True)
+def test_unseeded_generators_are_independent():
     a = host(tr.uniform(100, generator=tr.Generator()))
     b = host(tr.uniform(100, generator=tr.Generator()))
     assert not torch.equal(a, b)
 
 
-_NKI_PARTITIONED = {
-    "uniform",
-    "normal",
-    "exponential",
-    "poisson_large",
-    "normal_into",
-    "uniform_into",
-    "exponential_into",
-}
 _NKI_92 = {"gamma", "beta", "chi_squared", "truncated_normal"}
 
 
 @pytest.mark.parametrize("dn", list(DRAWS))
 def test_partition_ranks_draw_different_samples(request, nki_like, dn):
     # Docs: each rank draws a disjoint subrange of the logical stream.
-    if not nki_like or dn not in (_NKI_PARTITIONED | _NKI_92):
-        known(request, "99", "partition_rank is ignored on the PyTorch path", strict=True)
-    elif dn in _NKI_92:
+    if nki_like and dn in _NKI_92:
         known(
             request,
             "92",
@@ -816,15 +835,8 @@ def test_partition_ranks_draw_different_samples(request, nki_like, dn):
 
 @pytest.mark.parametrize("km", KEY_MODES)
 @pytest.mark.parametrize("dn", ["uniform", "normal", "exponential"])
-def test_partition_concat_equals_single_chip(request, nki_like, dn, km):
+def test_partition_concat_equals_single_chip(dn, km):
     # Generator docstring: concatenating ranks in order reproduces one chip.
-    known(
-        request,
-        "99",
-        "partition_rank is ignored on the PyTorch path",
-        strict=True,
-        when=not nki_like,
-    )
     P, N = 4, 4 * 2048
     d = DRAWS[dn]
     g1 = G(31, key_mode=km)
@@ -963,11 +975,12 @@ def test_sobol_seed_determinism():
 
 @pytest.mark.parametrize("d", [1, 4, 10])
 @pytest.mark.parametrize("n", [0, *SIZES])
-def test_halton_matches_scipy(n, d):
+def test_halton_matches_scipy(fp32_fp64, n, d):
     x = host(tr.halton(n, d, dtype=torch.float64))
     ref = torch.from_numpy(qmc.Halton(d, scramble=False).random(n + 1)[1:])
     assert tuple(x.shape) == (n, d)
-    torch.testing.assert_close(x, ref, atol=1e-6, rtol=0)
+    # float32 kernel (cast) only under --backend nki; otherwise float64 in torch.
+    torch.testing.assert_close(x, ref, atol=1e-6 if fp32_fp64 else 1e-12, rtol=0)
 
 
 @pytest.mark.parametrize("dt", FLOAT_DTYPES, ids=lambda d: str(d)[6:])
@@ -1019,21 +1032,12 @@ def test_latin_hypercube_marginals_uniform():
 @pytest.mark.parametrize("n, d", [(1, 1), (5, 1), (3, 10), (0, 2)])
 @pytest.mark.parametrize("name", ["sobol", "halton", "latin_hypercube"])
 def test_quasi_edge_shapes(name, n, d):
-    if name == "sobol" and n == 0:
-        pytest.skip("torch.quasirandom.SobolEngine rejects n=0 (loud)")
     x = host(getattr(tr, name)(n, d))
     assert tuple(x.shape) == (n, d)
 
 
 @pytest.mark.parametrize("name", ["sobol", "halton"])
-def test_quasi_high_dim(request, nki_like, name):
-    known(
-        request,
-        "89",
-        "NKI sobol raises AssertionError for d > 10 instead of falling back",
-        strict=False,
-        when=nki_like and name == "sobol",
-    )
+def test_quasi_high_dim(name):
     x = host(getattr(tr, name)(64, 21))
     assert tuple(x.shape) == (64, 21)
     assert bool((x >= 0).all() and (x < 1).all())

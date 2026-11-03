@@ -35,6 +35,37 @@ def _nki_active() -> bool:
     return HAS_NKI
 
 
+def _fp64_to_torch(what: str, dtype: torch.dtype, buf: torch.Tensor | None = None) -> bool:
+    """The float64 policy (trnrand#105): True when a float64 request takes the
+    torch path (backend "auto"); False for every other dtype and for float64
+    under backend "nki" (float32 kernel, cast, one-time UserWarning). Raises
+    NotImplementedError for float64 under TRNRAND_REQUIRE_NKI. `buf`: the
+    output buffer of a `*_into` call (see TRNRAND_FP64_ON_DEVICE)."""
+    from .nki.dispatch import _float64_to_torch
+
+    return _float64_to_torch(what, dtype, buf)
+
+
+def _nki_takes(dtype: torch.dtype, what: str, buf: torch.Tensor | None = None) -> bool:
+    """Whether an NKI draw can produce `dtype` the way the pytorch backend does.
+
+    The kernels produce float32 values that are then cast to the requested
+    real floating dtype; float64 follows `_fp64_to_torch` (torch under
+    "auto", a warned cast under "nki"). For an integer, bool or complex
+    request the pytorch backend either raises (integer / bool) or draws
+    something a cast of a real float32 draw is not (a complex variate), so those
+    requests take the pytorch route: the same error, or the same values, as
+    ``set_backend("pytorch")`` (trnsci/trnsci#35). Under TRNRAND_REQUIRE_NKI
+    they raise NotImplementedError instead.
+    """
+    if dtype.is_floating_point:
+        return not _fp64_to_torch(what, dtype, buf)
+    from .nki.dispatch import _no_kernel_for_dtype
+
+    _no_kernel_for_dtype(what, dtype)
+    return False
+
+
 def _nki_seed(gen_obj: Generator) -> int:
     """Advance generator state and return a 24-bit seed for NKI dispatch.
 
@@ -58,6 +89,41 @@ def _rank_seed(gen_obj: Generator, seed: int) -> int:
     if gen_obj._partition_size == 1 or gen_obj._partition_rank == 0:
         return seed
     return (seed + 8 * gen_obj._partition_rank) & 0xFFFFFF
+
+
+def _partitioned(gen_obj: Generator, size: tuple, draw) -> torch.Tensor:
+    """PyTorch-path draw for rank r of P (#99).
+
+    ``torch.Generator`` (a Mersenne Twister) has no counter to split, so every
+    rank draws the whole ``P × n`` single-generator sample and keeps its own
+    contiguous slice ``[r·n, (r+1)·n)``. Concatenating the ranks in order then
+    reproduces the single-generator draw, and each rank's host generator moves
+    past every rank's share, as the NKI counter does. Costs P× the draw.
+    ``draw(size)`` must return a tensor of that size. P = 1 calls
+    ``draw(size)`` unchanged.
+    """
+    P = gen_obj._partition_size
+    if P == 1:
+        return draw(size)
+    if len(size) == 1 and isinstance(size[0], (tuple, list, torch.Size)):
+        size = tuple(size[0])
+    n = math.prod(size)
+    r = gen_obj._partition_rank
+    full = draw((P * n,)).reshape(-1)
+    return full[r * n : (r + 1) * n].clone().reshape(size)
+
+
+def _partitioned_into(gen_obj: Generator, buf: torch.Tensor, fill) -> None:
+    """In-place counterpart of :func:`_partitioned`: ``fill(t)`` fills ``t``."""
+    P = gen_obj._partition_size
+    if P == 1:
+        fill(buf)
+        return
+    n = buf.numel()
+    r = gen_obj._partition_rank
+    tmp = torch.empty(P * n, dtype=buf.dtype, device=buf.device)
+    fill(tmp)
+    buf.copy_(tmp[r * n : (r + 1) * n].reshape(buf.shape))
 
 
 def _compiling() -> bool:
@@ -120,14 +186,18 @@ def _below_high(out: torch.Tensor, high: float) -> torch.Tensor:
 
 def _torch_fill(kind, size, a, b, dtype, generator):
     gen = generator or get_default_generator()
-    if _compiling():
-        from . import _compile
 
-        return _compile.fill(gen, size, kind, a, b, dtype)
-    out = torch.empty(*size, dtype=dtype)
-    if kind == "uniform":
-        return out.uniform_(a, b, generator=gen.torch_generator)
-    return out.normal_(a, b, generator=gen.torch_generator)
+    def draw(sz):
+        if _compiling():
+            from . import _compile
+
+            return _compile.fill(gen, sz, kind, a, b, dtype)
+        out = torch.empty(*sz, dtype=dtype)
+        if kind == "uniform":
+            return out.uniform_(a, b, generator=gen.torch_generator)
+        return out.normal_(a, b, generator=gen.torch_generator)
+
+    return _partitioned(gen, size, draw)
 
 
 def uniform(
@@ -138,7 +208,7 @@ def uniform(
     generator: Generator | None = None,
 ) -> torch.Tensor:
     """Uniform distribution on [low, high)."""
-    if _nki_active():
+    if _nki_active() and _nki_takes(dtype, "uniform"):
         gen = generator or get_default_generator()
         out = _nki_draw("uniform", gen, math.prod(size))
         out = _affine(out, high - low, low, nonneg=True).to(dtype)
@@ -156,7 +226,7 @@ def normal(
     generator: Generator | None = None,
 ) -> torch.Tensor:
     """Normal (Gaussian) distribution."""
-    if _nki_active():
+    if _nki_active() and _nki_takes(dtype, "normal"):
         gen = generator or get_default_generator()
         out = _nki_draw("normal", gen, math.prod(size))
         return _affine(out, std, mean).to(dtype).reshape(size)
@@ -183,7 +253,11 @@ def exponential(
     PDF: f(x) = λ exp(-λx)
     Mean: 1/λ
     """
-    if _nki_active():
+    # Integer / bool requests cast on both backends; complex raises on the
+    # pytorch backend (clamp), so it takes that route; float64 per #105.
+    if _nki_active() and (
+        _nki_takes(dtype, "exponential") if dtype.is_complex or dtype.is_floating_point else True
+    ):
         from .nki.dispatch import threefry_uniform_nki
 
         gen = generator or get_default_generator()
@@ -193,12 +267,15 @@ def exponential(
         gen._advance_by_elements(n)
         u = torch.clamp(u, min=1e-10)
         return (-torch.log(u) / rate).to(dtype).reshape(size)
-    gen = (generator or get_default_generator()).torch_generator
+    gen_obj = generator or get_default_generator()
+    gen = gen_obj.torch_generator
     # Draw the uniform in at least float32: a float16 / bfloat16 uniform has only
     # ~11 / ~8 random bits, so u == 0 is common, and 1e-10 underflows to 0 in
     # float16 (-log(0) = inf). float32 / float64 are unchanged (#80).
     work = torch.promote_types(dtype, torch.float32)
-    u = torch.empty(*size, dtype=work).uniform_(0, 1, generator=gen)
+    u = _partitioned(
+        gen_obj, size, lambda sz: torch.empty(*sz, dtype=work).uniform_(0, 1, generator=gen)
+    )
     # Clamp to avoid log(0)
     u = torch.clamp(u, min=1e-10)
     return (-torch.log(u) / rate).to(dtype)
@@ -211,8 +288,11 @@ def bernoulli(
     generator: Generator | None = None,
 ) -> torch.Tensor:
     """Bernoulli distribution: 1 with probability p, 0 otherwise."""
-    gen = (generator or get_default_generator()).torch_generator
-    return torch.empty(*size, dtype=dtype).bernoulli_(p, generator=gen)
+    gen_obj = generator or get_default_generator()
+    gen = gen_obj.torch_generator
+    return _partitioned(
+        gen_obj, size, lambda sz: torch.empty(*sz, dtype=dtype).bernoulli_(p, generator=gen)
+    )
 
 
 def randint(
@@ -223,8 +303,11 @@ def randint(
     generator: Generator | None = None,
 ) -> torch.Tensor:
     """Random integers from [low, high)."""
-    gen = (generator or get_default_generator()).torch_generator
-    return torch.randint(low, high, size, dtype=dtype, generator=gen)
+    gen_obj = generator or get_default_generator()
+    gen = gen_obj.torch_generator
+    return _partitioned(
+        gen_obj, size, lambda sz: torch.randint(low, high, sz, dtype=dtype, generator=gen)
+    )
 
 
 def randperm(
@@ -232,9 +315,19 @@ def randperm(
     dtype: torch.dtype = torch.long,
     generator: Generator | None = None,
 ) -> torch.Tensor:
-    """Random permutation of 0..n-1."""
-    gen = (generator or get_default_generator()).torch_generator
-    return torch.randperm(n, dtype=dtype, generator=gen)
+    """Random permutation of 0..n-1.
+
+    A partitioned generator (rank r of P) returns the r-th of P consecutive
+    single-generator permutations and moves past all P (#99).
+    """
+    gen_obj = generator or get_default_generator()
+    gen = gen_obj.torch_generator
+    out = None
+    for r in range(gen_obj._partition_size):
+        perm = torch.randperm(n, dtype=dtype, generator=gen)
+        if r == gen_obj._partition_rank:
+            out = perm
+    return out
 
 
 def gamma(
@@ -253,7 +346,7 @@ def gamma(
     Gamma(shape+1) and multiplies by U^(1/shape) (the "boost" identity).
     """
     assert shape > 0 and scale > 0, "gamma requires shape > 0 and scale > 0"
-    if _nki_active():
+    if _nki_active() and not _fp64_to_torch("gamma", dtype):
         from .nki.dispatch import gamma_nki
 
         gen = generator or get_default_generator()
@@ -261,8 +354,14 @@ def gamma(
         n = math.prod(size)
         out = gamma_nki(n, shape=shape, scale=scale, seed=seed)
         return out.to(dtype).reshape(size)
-    gen = (generator or get_default_generator()).torch_generator
+    gen_obj = generator or get_default_generator()
+    return _partitioned(
+        gen_obj, size, lambda sz: _gamma_torch(sz, shape, scale, dtype, gen_obj.torch_generator)
+    )
 
+
+def _gamma_torch(size, shape: float, scale: float, dtype, gen: torch.Generator) -> torch.Tensor:
+    """PyTorch-path gamma sampler (one generator, no partitioning)."""
     if len(size) == 1 and isinstance(size[0], (tuple, list)):
         size = tuple(size[0])
     n = 1
@@ -314,7 +413,7 @@ def chi_squared(
     Equivalent to Gamma(df/2, scale=2). Mean: df; Variance: 2·df.
     """
     assert df > 0, "chi_squared requires df > 0"
-    if _nki_active():
+    if _nki_active() and not _fp64_to_torch("chi_squared", dtype):
         from .nki.dispatch import chi_squared_nki
 
         gen = generator or get_default_generator()
@@ -340,7 +439,7 @@ def beta(
     Mean: α/(α+β); Variance: αβ/((α+β)²(α+β+1)).
     """
     assert alpha > 0 and beta > 0, "beta requires alpha > 0 and beta > 0"
-    if _nki_active():
+    if _nki_active() and not _fp64_to_torch("beta", dtype):
         from .nki.dispatch import beta_nki
 
         gen = generator or get_default_generator()
@@ -372,16 +471,39 @@ def poisson(
     if _nki_active():
         from .nki.dispatch import _POISSON_NORMAL_THRESHOLD, poisson_nki
 
-        if lam >= _POISSON_NORMAL_THRESHOLD:
+        if lam >= _POISSON_NORMAL_THRESHOLD and not _fp64_to_torch("poisson", dtype):
             gen = generator or get_default_generator()
             seed = _nki_seed(gen)
             n = math.prod(size)
             out = poisson_nki(n, lam=lam, seed=seed, counter_offset=gen._chip_counter_offset(n))
             gen._advance_by_elements(n)
             return out.to(dtype).reshape(size)
-    gen = (generator or get_default_generator()).torch_generator
-    rates = torch.full(size, float(lam), dtype=torch.float32)
-    return torch.poisson(rates, generator=gen).to(dtype)
+    gen_obj = generator or get_default_generator()
+    gen = gen_obj.torch_generator
+    return _partitioned(
+        gen_obj,
+        size,
+        lambda sz: torch.poisson(torch.full(sz, float(lam), dtype=torch.float32), generator=gen).to(
+            dtype
+        ),
+    )
+
+
+def _host_fill(buf: torch.Tensor, method: str, *args, what: str, generator, **kwargs) -> None:
+    """`buf.<method>(*args, generator=...)` with the host torch generator. A
+    device buffer (e.g. a float64 request routed to torch on Neuron, #105) is
+    filled on the host and copied over, keeping its dtype (a float64 buffer on
+    the neuron device warns once per op, `_note_fp64_host_fill`); a CPU buffer
+    is filled in place."""
+    from .nki.dispatch import _note_fp64_host_fill, _on_neuron_device
+
+    if buf.device.type == "cpu" and not _on_neuron_device(buf):
+        getattr(buf, method)(*args, generator=generator, **kwargs)
+        return
+    _note_fp64_host_fill(what, buf)
+    tmp = torch.empty(buf.shape, dtype=buf.dtype)
+    getattr(tmp, method)(*args, generator=generator, **kwargs)
+    buf.copy_(tmp)
 
 
 def normal_into(
@@ -403,7 +525,7 @@ def normal_into(
         std:       Distribution standard deviation (default 1.0).
         generator: Optional Generator for reproducible seeding.
     """
-    if _nki_active():
+    if _nki_active() and _nki_takes(buf.dtype, "normal_into", buf):
         from .nki.dispatch import _PROGRAM_TILES, threefry_stream_normal
 
         gen = generator or get_default_generator()
@@ -418,8 +540,13 @@ def normal_into(
             raw = raw * std + mean
         buf.copy_(raw.reshape(buf.shape))
         return
-    gen_t = (generator or get_default_generator()).torch_generator
-    buf.normal_(mean, std, generator=gen_t)
+    gen_obj = generator or get_default_generator()
+    gen_t = gen_obj.torch_generator
+    _partitioned_into(
+        gen_obj,
+        buf,
+        lambda t: _host_fill(t, "normal_", mean, std, what="normal_into", generator=gen_t),
+    )
 
 
 def uniform_into(
@@ -440,7 +567,7 @@ def uniform_into(
         high:      Upper bound (exclusive, default 1.0).
         generator: Optional Generator for reproducible seeding.
     """
-    if _nki_active():
+    if _nki_active() and _nki_takes(buf.dtype, "uniform_into", buf):
         from .nki.dispatch import _PROGRAM_TILES, threefry_stream_uniform
 
         gen = generator or get_default_generator()
@@ -453,10 +580,17 @@ def uniform_into(
         gen._counter += streaming_batches * gen._partition_size  # every chip's slice
         if low != 0.0 or high != 1.0:
             raw = raw * (high - low) + low
+        if buf.dtype in (torch.float16, torch.bfloat16) and high > low:
+            raw = _below_high(raw.to(buf.dtype), high)  # as uniform() does (#94)
         buf.copy_(raw.reshape(buf.shape))
         return
-    gen_t = (generator or get_default_generator()).torch_generator
-    buf.uniform_(low, high, generator=gen_t)
+    gen_obj = generator or get_default_generator()
+    gen_t = gen_obj.torch_generator
+    _partitioned_into(
+        gen_obj,
+        buf,
+        lambda t: _host_fill(t, "uniform_", low, high, what="uniform_into", generator=gen_t),
+    )
 
 
 def exponential_into(
@@ -476,7 +610,7 @@ def exponential_into(
         rate:      Rate parameter λ (default 1.0). Mean = 1/λ.
         generator: Optional Generator for reproducible seeding.
     """
-    if _nki_active():
+    if _nki_active() and _nki_takes(buf.dtype, "exponential_into", buf):
         from .nki.dispatch import _PROGRAM_TILES, threefry_stream_uniform
 
         gen = generator or get_default_generator()
@@ -492,8 +626,15 @@ def exponential_into(
         raw = -torch.log(torch.clamp(u, min=1e-10)) / rate
         buf.copy_(raw.reshape(buf.shape))
         return
-    gen_t = (generator or get_default_generator()).torch_generator
-    buf.exponential_(lambd=rate, generator=gen_t)
+    gen_obj = generator or get_default_generator()
+    gen_t = gen_obj.torch_generator
+    _partitioned_into(
+        gen_obj,
+        buf,
+        lambda t: _host_fill(
+            t, "exponential_", lambd=rate, what="exponential_into", generator=gen_t
+        ),
+    )
 
 
 def truncated_normal(
@@ -509,7 +650,7 @@ def truncated_normal(
 
     Uses rejection sampling. Useful for bounded weight initialization.
     """
-    if _nki_active():
+    if _nki_active() and _nki_takes(dtype, "truncated_normal"):
         from .nki.dispatch import truncated_normal_nki
 
         gen = generator or get_default_generator()
@@ -517,8 +658,19 @@ def truncated_normal(
         n = math.prod(size)
         out = truncated_normal_nki(n, low=low, high=high, mean=mean, std=std, seed=seed)
         return out.to(dtype).reshape(size)
+    gen_obj = generator or get_default_generator()
+    return _partitioned(
+        gen_obj,
+        size,
+        lambda sz: _truncated_normal_torch(
+            sz, mean, std, low, high, dtype, gen_obj.torch_generator
+        ),
+    )
+
+
+def _truncated_normal_torch(size, mean, std, low, high, dtype, gen) -> torch.Tensor:
+    """PyTorch-path truncated normal by rejection (one generator, no partitioning)."""
     result = torch.empty(*size, dtype=dtype)
-    gen = (generator or get_default_generator()).torch_generator
 
     # Rejection sampling
     remaining = result.reshape(-1)

@@ -16,12 +16,66 @@ trnrand.set_backend("nki")  # force NKI (requires neuronxcc)
 `trnrand.HAS_NKI` is `True` when `nki>=0.3.0` is importable.
 `trnrand.get_backend()` returns the active backend name.
 
+## Precision and dtypes
+
+The NKI kernels draw float32 values (24-bit uniforms; every kernel operand is
+an int32 word, or float32 for Box-Muller). A float64 request
+(`dtype=torch.float64`, or a float64 buffer for `*_into` /
+`GeneratorProgram.stream_into`) follows the trnsci suite policy (trnrand#105,
+from 0.14.0):
+
+| Mode | float64 request |
+|---|---|
+| `set_backend("auto")` | Drawn in torch at float64 precision: the same values as `set_backend("pytorch")`, no kernel launch. |
+| `set_backend("nki")` | The float32 kernels run and the result is cast to float64; one `UserWarning` per op per process says the precision is float32. |
+| `TRNRAND_REQUIRE_NKI=1` | `NotImplementedError` (either backend). |
+
+The result dtype always matches the PyTorch backend: the requested dtype (or
+the buffer's) for float32, float64, float16 and bfloat16. float16 / bfloat16
+requests run on the kernels and are rounded from float32, staying inside the
+documented support. Integer, bool and complex requests take the PyTorch path
+(the same values or the same error as `set_backend("pytorch")`), or raise
+`NotImplementedError` under `TRNRAND_REQUIRE_NKI=1`.
+
+**Float64 buffers on the neuron device.** trnrand's allocating calls
+(`uniform`, `normal`, `halton`, ...) return host tensors, so the only
+device-resident float64 is a `*_into` / `GeneratorProgram.stream_into` buffer
+on the `neuron` device. Device arithmetic on Trainium is float32 (measured on
+Trn2: device aten computes float64 at float32 precision), so under
+`set_backend("auto")` such a buffer is filled on the host with the host
+`torch.Generator` at float64 precision and the values are copied into the
+device buffer, which keeps its float64 dtype. The values are the same as for
+a host buffer with the same generator state (and, for `*_into`, the same as
+`set_backend("pytorch")`). Each op emits one `UserWarning` per process:
+"float64 on the neuron device is computed on the host for float64 accuracy
+(device arithmetic is fp32); pass float32 to stay on device". A float32 buffer
+stays on the device kernels, and host float64 buffers are filled in place as
+before, without a warning.
+
+`TRNRAND_FP64_ON_DEVICE=1` opts out for callers who prefer speed: a float64
+buffer on the neuron device keeps the on-device float32 kernels under
+`"auto"` (float32 precision, cast to float64; no host round trip, no warning).
+Without the NKI kernels there is no on-device route (the generator is a host
+`torch.Generator`), so the buffer is filled on the host either way.
+`TRNRAND_REQUIRE_NKI=1` still raises for float64.
+
+Owen-scrambled `sobol` (the default, `scramble=True`) follows this policy:
+the PyTorch path holds its 32-bit points in float64, the `sobol_owen` kernel
+the top 24 bits in float32. Unscrambled and `scramble="shift"` `sobol` are
+the exception: the PyTorch backend's float64 Sobol there is a float32
+`SobolEngine` draw cast to float64, so such a float64 request keeps the NKI
+kernel on every backend, without a warning or a `TRNRAND_REQUIRE_NKI` error.
+
+Before 0.14.0, float64 on the NKI path (including `"auto"` on a Neuron host)
+was always the cast float32 kernel output, with no warning.
+
 ## Environment variables
 
 | Env var | Effect |
 |---|---|
 | `TRNRAND_USE_SIMULATOR=1` | Dispatch routes kernels through `nki.simulate(kernel)(numpy_args)` on CPU — bypasses `torch_xla` and hardware. Use for fast correctness iteration; no NEFF compile. |
-| `TRNRAND_REQUIRE_NKI=1` | Kernel-path failures re-raise instead of silently falling back to PyTorch. Used by the validation suite to catch silent kernel breakage. |
+| `TRNRAND_REQUIRE_NKI=1` | Kernel-path failures re-raise instead of silently falling back to PyTorch, and requests the kernels cannot serve at full precision (float64, integer, bool, complex) raise `NotImplementedError` (see [Precision and dtypes](#precision-and-dtypes)). Used by the validation suite to catch silent kernel breakage. |
+| `TRNRAND_FP64_ON_DEVICE=1` | Under `set_backend("auto")`, a float64 `*_into` / `GeneratorProgram` buffer on the neuron device keeps the on-device float32 kernels (float32 precision) instead of being filled on the host at float64 precision (see [Precision and dtypes](#precision-and-dtypes)). |
 | `TRNRAND_CORES=<n>\|auto` | Default for `set_cores` (below). Off (1) by default. |
 | `TRNRAND_CORES_MIN_ELEMENTS` | Requests below this (default 8,388,608) stay on one core. |
 | `TRNRAND_PINNED_OUTPUT=0` | Turns off pinned host output for large native-path draws (on by default since v0.11.0). |

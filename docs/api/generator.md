@@ -6,13 +6,21 @@ path draws from on the GpSimd engine.
 
 ## `Generator(seed=None, device="cpu", partition_rank=0, partition_size=1, key_mode=None)`
 
-Construct a seeded generator. `seed=None` leaves the underlying
-`torch.Generator` unseeded (random state).
+Construct a seeded generator. `seed=None` seeds the underlying
+`torch.Generator` from OS entropy, so every unseeded generator (and the
+module default generator used when no `generator=` is passed) draws an
+independent stream; `gen.torch_generator.initial_seed()` reports the seed
+chosen. Through 0.13.0, `seed=None` used torch's fixed default seed and
+every unseeded generator drew the same stream (#98).
 
 - `partition_rank` / `partition_size`: this generator is rank `r` of `P`
   in a counter-partitioned stream; concatenating the ranks' draws in order
   gives the single-generator stream on the NKI path. Fixed for P > 1 in
-  v0.12.0 (0.7.0–0.11.0 reused counters from the second draw on).
+  v0.12.0 (0.7.0–0.11.0 reused counters from the second draw on). On the
+  PyTorch path each rank draws the whole `P × n` sample and keeps its slice
+  (P× the work, same concatenation contract; `randperm` gives the r-th of P
+  consecutive permutations). Through 0.13.0 the PyTorch path ignored the
+  partition, so every rank drew identical samples (#99).
 - `key_mode`: `"draw"` (default, or `TRNRAND_KEY_MODE`) takes a fresh
   Threefry key from the `torch.Generator` on each NKI draw. `"counter"`
   fixes the key by the seed and only advances the counter, which makes
