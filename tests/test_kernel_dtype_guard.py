@@ -55,6 +55,7 @@ ALLOWED = {
     "threefry4x32": _I32,
     "threefry_normal": _I32,
     "sobol_gray_code": _I32,
+    "sobol_owen": _I32,
     "halton": _I32,
     "threefry_streaming_normal": _I32,
     "threefry_streaming_uniform": _I32,
@@ -256,6 +257,7 @@ APIS = {
     "program_uniform": _program("uniform"),
     "program_exponential": _program("exponential"),
     "sobol": lambda dt: trnrand.sobol(40, 3, seed=5, dtype=dt),
+    "sobol_shift": lambda dt: trnrand.sobol(40, 3, seed=5, scramble="shift", dtype=dt),
     "sobol_noscramble": lambda dt: trnrand.sobol(40, 3, seed=5, scramble=False, dtype=dt),
     "halton": lambda dt: trnrand.halton(40, 3, dtype=dt),
     "latin_hypercube": lambda dt: trnrand.latin_hypercube(40, 3, dtype=dt),
@@ -473,7 +475,7 @@ def test_every_op_is_driven(env, monkeypatch):
     def drive():
         env.d.set_backend("nki")
         try:
-            for api in ("uniform", "normal", "sobol", "halton", "program_normal"):
+            for api in ("uniform", "normal", "sobol", "sobol_shift", "halton", "program_normal"):
                 APIS[api](torch.float64)
             w = torch.arange(8)
             env.d.philox4x32_nki(w, w, w)
@@ -516,13 +518,16 @@ FP64_ROUTED = {
     "uniform_into": "uniform_into",
     "exponential_into": "exponential_into",
     "halton": "halton",
+    "sobol": "sobol",
     "program_normal": "GeneratorProgram.stream_into",
     "program_uniform": "GeneratorProgram.stream_into",
     "program_exponential": "GeneratorProgram.stream_into",
 }
-# The pytorch backend's float64 Sobol is a float32 SobolEngine draw cast, so
-# float64 Sobol keeps the kernel on every backend (no warning, no raise).
-FP64_KERNEL = ("sobol", "sobol_noscramble")
+# Owen-scrambled sobol (the default, #100) is routed above: its pytorch path
+# holds 32-bit points in float64. Unscrambled and "shift" Sobol on the pytorch
+# backend are a float32 SobolEngine draw cast, so float64 there keeps the
+# kernel on every backend (no warning, no raise).
+FP64_KERNEL = ("sobol_shift", "sobol_noscramble")
 
 
 def _fp64_warnings(record):
@@ -554,7 +559,7 @@ def test_fp64_auto_draws_in_torch(env, path, api):
         assert bool(torch.isfinite(got).all())
     else:
         assert torch.equal(got, ref), f"{api}: not the pytorch backend's float64 draw"
-    if api in ("uniform", "uniform_into", "program_uniform", "halton"):
+    if api in ("uniform", "uniform_into", "program_uniform", "halton", "sobol"):
         # Not on the float32 kernels' 24-bit grid (k * 2^-24).
         grid = (got.double() * 2**24) % 1
         assert bool((grid != 0).any()), f"{api}: float32-resolution values"

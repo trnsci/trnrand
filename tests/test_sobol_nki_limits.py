@@ -58,11 +58,18 @@ def test_more_than_2_pow_24_points_falls_back(kernel_calls):
     assert kernel_calls == []
 
 
-def test_scrambled_high_dim_falls_back_to_sobol_engine(kernel_calls):
+def test_shift_scrambled_high_dim_falls_back_to_sobol_engine(kernel_calls):
     with pytest.warns(dispatch.NkiFallbackWarning):
-        x = trnrand.sobol(64, 11, seed=3)
+        x = trnrand.sobol(64, 11, seed=3, scramble="shift")
     ref = torch.quasirandom.SobolEngine(11, scramble=True, seed=3).draw(64)
     assert torch.equal(x, ref)
+
+
+def test_owen_scrambled_high_dim_falls_back_to_cpu_owen(kernel_calls, monkeypatch):
+    with pytest.warns(dispatch.NkiFallbackWarning):
+        x = trnrand.sobol(64, 11, seed=3)
+    monkeypatch.setattr(quasi, "HAS_NKI", False)
+    assert torch.equal(x, trnrand.sobol(64, 11, seed=3))
 
 
 @pytest.mark.parametrize("fake_nki", [False, True])

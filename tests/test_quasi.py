@@ -170,8 +170,9 @@ class TestQuasiReducedPrecisionRange:
 
     @pytest.fixture
     def pytorch_backend(self):
-        # The SobolEngine references below are the PyTorch path; on a Neuron
-        # host the auto backend takes the NKI path (a random shift, #100).
+        # The SobolEngine references below are the PyTorch path's
+        # scramble="shift"; on a Neuron host the auto backend takes the NKI
+        # path, where "shift" is a random shift mod 1.
         prev = trnrand.get_backend()
         trnrand.set_backend("pytorch")
         yield
@@ -196,7 +197,7 @@ class TestQuasiReducedPrecisionRange:
     def test_only_points_rounding_to_one_change(self, pytorch_backend, dtype):
         ref = torch.quasirandom.SobolEngine(4, scramble=True, seed=3).draw(4096)
         cast = ref.to(dtype)
-        x = trnrand.sobol(4096, 4, seed=3, dtype=dtype)
+        x = trnrand.sobol(4096, 4, seed=3, scramble="shift", dtype=dtype)
         hit = cast == 1
         assert bool(hit.any())  # the case this guards actually occurs
         assert torch.equal(x[~hit], cast[~hit])
@@ -206,7 +207,7 @@ class TestQuasiReducedPrecisionRange:
     @pytest.mark.parametrize("dtype", [torch.float32, torch.float64])
     def test_full_precision_bit_identical(self, pytorch_backend, dtype):
         ref = torch.quasirandom.SobolEngine(4, scramble=True, seed=3).draw(4096).to(dtype)
-        assert torch.equal(trnrand.sobol(4096, 4, seed=3, dtype=dtype), ref)
+        assert torch.equal(trnrand.sobol(4096, 4, seed=3, scramble="shift", dtype=dtype), ref)
 
     @pytest.mark.neuron
     @pytest.mark.skipif(not trnrand.HAS_NKI, reason="requires the NKI path")

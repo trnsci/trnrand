@@ -281,9 +281,27 @@ def _sobol(n, d, start):
 def _sobol_public(n, d):
     import trnrand
 
+    # Unscrambled: since #100 every seed (0 included) scrambles under the default
+    # scramble=True, so the unscrambled oracle needs scramble=False.
     with _nki_backend():
-        got = trnrand.sobol(n, d, seed=0)
+        got = trnrand.sobol(n, d, seed=0, scramble=False)
     return got, sobol_reference(n, d, 0), 0.0
+
+
+def _sobol_owen_public(n, d, seed):
+    import trnrand
+
+    # Owen (scramble=True): the NKI points are bit-identical to the PyTorch
+    # path's float32 points for the same seed (#100).
+    with _nki_backend():
+        got = trnrand.sobol(n, d, seed=seed)
+    prev = trnrand.get_backend()
+    trnrand.set_backend("pytorch")
+    try:
+        want = trnrand.sobol(n, d, seed=seed)
+    finally:
+        trnrand.set_backend(prev)
+    return got, want, 0.0
 
 
 def _halton(n, d, start):
@@ -373,6 +391,10 @@ def _build_cases():
         cases[f"sobol[n={n},d=7,start=129]"] = lambda n=n: _sobol(n, 7, 129)
         cases[f"halton[n={n},d=7,start=129]"] = lambda n=n: _halton(n, 7, 129)
     cases["sobol_public[n=1000,d=5]"] = lambda: _sobol_public(1000, 5)
+    for seed in (0, 5):
+        cases[f"sobol_owen_public[n=1000,d=5,seed={seed}]"] = lambda seed=seed: _sobol_owen_public(
+            1000, 5, seed
+        )
     cases["halton_public[n=1000,d=5]"] = lambda: _halton_public(1000, 5)
     cases["halton_chunks[128,1,129,200]"] = lambda: _halton_chunks([128, 1, 129, 200], 4)
     for lanes in (1, 127, 129, 200):

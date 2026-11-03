@@ -26,6 +26,7 @@ EXPECTED_OPS = {
     "threefry4x32",
     "threefry_normal",
     "sobol_gray_code",
+    "sobol_owen",
     "halton",
     "threefry_streaming_normal",
     "threefry_streaming_uniform",
@@ -325,6 +326,9 @@ class TestLazyRegistration:
         assert fake("threefry4x32")(*[i32] * 8).shape == (128, 4)
         assert fake("threefry_normal")(*[i32] * 8).dtype == torch.float32
         assert fake("sobol_gray_code")(i32).shape == (128, 10)
+        assert fake("sobol_owen")(
+            i32, torch.zeros(128, 20, dtype=torch.int32, device="meta")
+        ).shape == (128, 10)
         assert fake("halton")(i32).shape == (128, 10)
         streaming = (128, 4 * dispatch._PROGRAM_TILES)
         assert fake("threefry_streaming_normal")(*[i32] * 6).shape == streaming

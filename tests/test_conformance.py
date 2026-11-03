@@ -935,25 +935,36 @@ def test_sobol_scramble_false_ignores_seed(request, nki_like):
 
 
 @pytest.mark.parametrize("seed", [None, 0, 5])
-def test_sobol_scramble_true_is_scrambled(request, nki_like, seed):
-    known(
-        request,
-        "100",
-        "NKI default sobol(scramble=True) is unscrambled for seed None/0",
-        strict=True,
-        when=nki_like and not seed,
-    )
+def test_sobol_scramble_true_is_scrambled(seed):
     plain = host(tr.sobol(256, 3, scramble=False))
     assert not torch.equal(plain, host(tr.sobol(256, 3, scramble=True, seed=seed)))
 
 
-def test_sobol_scrambled_is_still_a_net(request, nki_like):
-    # Owen / LMS scrambling keeps one point per 1/256 stratum in each dim.
-    known(request, "100", "NKI scramble is a random shift, not Owen", strict=True, when=nki_like)
-    x = host(tr.sobol(256, 3, scramble=True, seed=5)).double()
+@pytest.mark.parametrize("seed", [None, 0, 5])
+def test_sobol_scrambled_is_still_a_net(seed):
+    # Owen scrambling keeps the (0, 8, 2)-net of dims 0-1 at n = 256: every
+    # elementary interval 2^-a x 2^-(8-a) holds exactly one point (#100).
+    x = host(tr.sobol(256, 3, scramble=True, seed=seed)).double()
+    for a in range(9):
+        cells = torch.floor(x[:, 0] * 2**a).long() * 2 ** (8 - a)
+        cells += torch.floor(x[:, 1] * 2 ** (8 - a)).long()
+        assert torch.equal(torch.sort(cells).values, torch.arange(256)), f"a={a}"
     for d in range(3):
         cells = torch.floor(x[:, d] * 256).long()
         assert torch.equal(torch.sort(cells).values, torch.arange(256)), f"dim {d}"
+
+
+@pytest.mark.parametrize("d", [2, 5, 10])
+def test_sobol_owen_discrepancy_matches_scipy(d):
+    # Mean centred L2 discrepancy over 16 seeds, against scipy's scrambled Sobol.
+    n = 512
+    ours = np.mean(
+        [qmc.discrepancy(host(tr.sobol(n, d, seed=s)).double().numpy()) for s in range(16)]
+    )
+    ref = np.mean(
+        [qmc.discrepancy(qmc.Sobol(d, scramble=True, seed=s).random(n)) for s in range(16)]
+    )
+    assert ours <= 1.1 * ref, (ours, ref)
 
 
 def test_sobol_seed_determinism():

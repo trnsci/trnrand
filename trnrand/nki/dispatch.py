@@ -186,6 +186,7 @@ _KERNEL_DTYPES: dict[str, tuple[torch.dtype, ...]] = {
     "threefry4x32": (torch.int32,),
     "threefry_normal": (torch.int32,),
     "sobol_gray_code": (torch.int32,),
+    "sobol_owen": (torch.int32,),
     "halton": (torch.int32,),
     "threefry_streaming_normal": (torch.int32,),
     "threefry_streaming_uniform": (torch.int32,),
@@ -267,10 +268,12 @@ def _no_kernel_for_dtype(what: str, *tensors: torch.Tensor) -> None:
 #   backend "nki"           -> the float32 kernel, cast to float64, with one
 #                              UserWarning per op per process;
 #   TRNRAND_REQUIRE_NKI=1   -> NotImplementedError (takes precedence).
-# `sobol` is the exception: the pytorch backend's float64 Sobol is a float32
-# SobolEngine draw cast to float64, so torch has no float64-precision Sobol to
-# route to (it would only swap the random shift for a different scrambling).
-# A float64 Sobol request keeps the kernel on every backend, without warning.
+# Owen-scrambled `sobol` (the default, #100) follows this policy: its pytorch
+# path holds the full 32-bit points in float64, the kernel the top 24 bits.
+# Unscrambled and `scramble="shift"` `sobol` are the exception: the pytorch
+# backend's float64 Sobol there is a float32 SobolEngine draw cast to float64,
+# so torch has no float64-precision Sobol to route to. Those float64 requests
+# keep the kernel on every backend, without warning.
 #
 # Device-resident float64 (a `*_into` / `GeneratorProgram` buffer on the
 # neuron device) under "auto": the torch path draws on the host with the host
@@ -1049,6 +1052,130 @@ def sobol_reference(n_points: int, n_dims: int, start_index: int = 0) -> torch.T
         bit = ((gray >> k) & 1).astype(bool)
         acc[bit] ^= dirs[:, k]
     return torch.from_numpy((acc * _SOBOL_SCALE).astype(np.float32))
+
+
+# ── Owen (nested uniform) scrambling of Sobol points (#100) ───────────────────
+#
+# Hash-based Owen scrambling (Laine & Karras 2011; constants from Burley 2020,
+# "Practical Hash-based Owen Scrambling", JCGT 9(4)). On the bit-reversed Sobol
+# integer, `_owen_hash` only lets each bit depend on itself and the bits
+# below it, so after reversing back, bit k from the top of a coordinate is
+# flipped by a seeded function of the bits above it: a nested uniform
+# scramble. Every elementary interval maps onto an elementary interval of the
+# same shape, so the (t, m, s)-net property of the unscrambled set is kept.
+#
+# The CPU path computes it on 32-bit integers. The NKI kernel computes the
+# same hash on 24 bits (the low 24 bits of every step only depend on the low
+# 24 bits of its inputs), so its points are the top 24 bits of the CPU ones.
+
+_OWEN_C0 = 0x3D20ADEA
+_OWEN_C1 = 0x05526C56
+_OWEN_C2 = 0x53A22864
+_M24 = 0xFFFFFF
+_M32 = 0xFFFFFFFF
+_M64 = 0xFFFFFFFFFFFFFFFF
+
+
+def _splitmix64(z: int) -> int:
+    z = (z + 0x9E3779B97F4A7C15) & _M64
+    z = ((z ^ (z >> 30)) * 0xBF58476D1CE4E5B9) & _M64
+    z = ((z ^ (z >> 27)) * 0x94D049BB133111EB) & _M64
+    return z ^ (z >> 31)
+
+
+def owen_dim_seeds(seed: int, n_dims: int) -> tuple[int, ...]:
+    """32-bit per-dimension Owen scramble seeds derived from `seed`.
+
+    Dimension `d`'s seed does not depend on `n_dims`, so the first `k` columns
+    of `sobol(n, d, seed=s)` equal `sobol(n, k, seed=s)`.
+    """
+    base = _splitmix64(int(seed) & _M64)
+    return tuple(_splitmix64((base + d) & _M64) & _M32 for d in range(n_dims))
+
+
+def _rev_bits(v: int, bits: int) -> int:
+    return int(format(v, f"0{bits}b")[::-1], 2)
+
+
+# Direction vectors bit-reversed within 24 bits: XOR commutes with bit
+# reversal, so the kernel accumulates reversed Sobol integers directly.
+_SOBOL_REV_DIR_VECS = tuple(
+    tuple(_rev_bits(v, _SOBOL_BITS) for v in dim) for dim in _SOBOL_DIR_VECS
+)
+
+
+def owen_kernel_seeds(seed: int) -> tuple[tuple[int, ...], tuple[int, ...]]:
+    """(add, mul) 24-bit constants per dimension for the NKI Owen kernel."""
+    s = owen_dim_seeds(seed, _SOBOL_MAX_DIMS)
+    return tuple(x & _M24 for x in s), tuple(((x >> 16) | 1) & _M24 for x in s)
+
+
+def _bytes24_np(a):
+    return a & 0xFF, (a >> 8) & 0xFF, (a >> 16) & 0xFF
+
+
+def _mul24_np(a, b):
+    """(a * b) mod 2^24 as the NKI kernel computes it (`_nki_mul24`).
+
+    8-bit limbs keep every product <= 2^16 and every column sum < 2^18, inside
+    the float32-exact range of the engine multiply path.
+    """
+    a0, a1, a2 = _bytes24_np(a)
+    b0, b1, b2 = _bytes24_np(b)
+    c0 = a0 * b0
+    c1 = a0 * b1 + a1 * b0
+    c2 = a0 * b2 + a1 * b1 + a2 * b0
+    acc = (c0 >> 8) + c1
+    out = (c0 & 0xFF) | ((acc & 0xFF) << 8)
+    acc = (acc >> 8) + c2
+    return out | ((acc & 0xFF) << 16)
+
+
+def _add24_np(a, b):
+    """(a + b) mod 2^24 in 12-bit halves, as `_nki_add24` computes it."""
+    lo = (a & 0xFFF) + (b & 0xFFF)
+    hi = (a >> 12) + (b >> 12) + (lo >> 12)
+    return ((hi & 0xFFF) << 12) | (lo & 0xFFF)
+
+
+def _owen_hash24_np(x, add, mul):
+    """Low 24 bits of the Laine–Karras / Burley hash (mirrors the kernel)."""
+    x = x ^ _mul24_np(x, _OWEN_C0 & _M24)
+    x = _add24_np(x, add)
+    x = _mul24_np(x, mul)
+    x = x ^ _mul24_np(x, _OWEN_C1 & _M24)
+    return x ^ _mul24_np(x, _OWEN_C2 & _M24)
+
+
+def sobol_owen_reference(
+    n_points: int, n_dims: int, seed: int, start_index: int = 0
+) -> torch.Tensor:
+    """CPU reference for the NKI Owen-scrambled Sobol kernel, bit-exact.
+
+    Mirrors ``sobol_owen_kernel`` step by step (reversed direction vectors,
+    24-bit limb arithmetic, bit-by-bit reversal). Equals the top 24 bits of the
+    CPU ``sobol(scramble=True, seed=seed)`` points.
+
+    Returns:
+        Float32 tensor of shape (n_points, n_dims) with values in [0, 1).
+    """
+    assert 1 <= n_dims <= _SOBOL_MAX_DIMS
+    adds, muls = owen_kernel_seeds(seed)
+    idx = np.arange(start_index, start_index + n_points, dtype=np.int64)
+    gray = idx ^ (idx >> 1)
+    out = np.zeros((n_points, n_dims), dtype=np.float32)
+    for d in range(n_dims):
+        s = np.zeros(n_points, dtype=np.int64)
+        for k in range(_SOBOL_BITS):
+            v = _SOBOL_REV_DIR_VECS[d][k]
+            if v:
+                s ^= ((gray >> k) & 1) * v
+        h = _owen_hash24_np(s, adds[d], muls[d])
+        r = np.zeros(n_points, dtype=np.int64)
+        for k in range(_SOBOL_BITS):
+            r |= ((h >> k) & 1) << (_SOBOL_BITS - 1 - k)
+        out[:, d] = (r * _SOBOL_SCALE).astype(np.float32)
+    return torch.from_numpy(out)
 
 
 if HAS_NKI:
@@ -2133,7 +2260,8 @@ if HAS_NKI:
     ) -> torch.Tensor:
         """Sobol quasi-random sequence via GpSimd Gray-code XOR accumulation.
 
-        Generates an Owen-scrambled (randomly shifted) Sobol sequence.
+        Generates a Sobol sequence, randomly shifted mod 1 when seed != 0
+        (`sobol(scramble="shift")`; Owen scrambling is `sobol_owen_nki`).
         Supports up to _SOBOL_MAX_DIMS=10 dimensions and up to 2^24 ≈ 16.7M points.
 
         Args:
@@ -2192,6 +2320,188 @@ if HAS_NKI:
             result = torch.fmod(result + shifts.unsqueeze(0), 1.0)
 
         return result.float()
+
+    # ── Owen-scrambled Sobol (GpSimd XOR + 24-bit hash, #100) ─────────────────
+    #
+    # Same Gray-code XOR accumulation as `sobol_gray_code_kernel`, but over the
+    # bit-reversed direction vectors, then the Laine–Karras / Burley hash on
+    # 24 bits and a bit-by-bit reversal back. `sobol_owen_reference` (module
+    # level) mirrors every step on the host.
+
+    def _nki_bytes24(a):
+        """Three byte tiles of a uint32 tile holding a value < 2^24."""
+        b0 = nl.bitwise_and(a, 0xFF, dtype=nl.uint32)
+        b1 = nl.bitwise_and(nl.right_shift(a, 8, dtype=nl.uint32), 0xFF, dtype=nl.uint32)
+        b2 = nl.bitwise_and(nl.right_shift(a, 16, dtype=nl.uint32), 0xFF, dtype=nl.uint32)
+        return b0, b1, b2
+
+    def _nki_mul24(a, b):
+        """(a * b) mod 2^24 for uint32 tiles a, b < 2^24.
+
+        8-bit limbs: products <= 2^16, column sums < 2^18, inside the
+        float32-exact envelope of the engine multiply (see `_mul32_hi_lo`).
+        """
+        a0, a1, a2 = _nki_bytes24(a)
+        b0, b1, b2 = _nki_bytes24(b)
+        c0 = _nki_mul_u32(a0, b0)
+        c1 = _nki_add_u32(_nki_mul_u32(a0, b1), _nki_mul_u32(a1, b0))
+        c2 = _nki_add_u32(
+            _nki_add_u32(_nki_mul_u32(a0, b2), _nki_mul_u32(a1, b1)),
+            _nki_mul_u32(a2, b0),
+        )
+        byte0, acc = _nki_carry_step(c0, c1)
+        byte1, acc = _nki_carry_step(acc, c2)
+        byte2 = nl.bitwise_and(acc, 0xFF, dtype=nl.uint32)
+        return nl.bitwise_or(
+            nl.bitwise_or(byte0, nl.left_shift(byte1, 8, dtype=nl.uint32)),
+            nl.left_shift(byte2, 16, dtype=nl.uint32),
+        )
+
+    def _nki_add24(a, b):
+        """(a + b) mod 2^24 for uint32 tiles a, b < 2^24, in 12-bit halves."""
+        lo = _nki_add_u32(
+            nl.bitwise_and(a, 0xFFF, dtype=nl.uint32),
+            nl.bitwise_and(b, 0xFFF, dtype=nl.uint32),
+        )
+        hi = _nki_add_u32(
+            _nki_add_u32(
+                nl.right_shift(a, 12, dtype=nl.uint32),
+                nl.right_shift(b, 12, dtype=nl.uint32),
+            ),
+            nl.right_shift(lo, 12, dtype=nl.uint32),
+        )
+        return nl.bitwise_or(
+            nl.left_shift(nl.bitwise_and(hi, 0xFFF, dtype=nl.uint32), 12, dtype=nl.uint32),
+            nl.bitwise_and(lo, 0xFFF, dtype=nl.uint32),
+        )
+
+    def _nki_owen_hash24(x, add, mul):
+        """Low 24 bits of the Laine–Karras / Burley hash (see `_owen_hash24_np`)."""
+        P = x.shape[0]
+        k0 = nl.full((P, 1), _OWEN_C0 & 0xFFFFFF, dtype=nl.uint32)
+        k1 = nl.full((P, 1), _OWEN_C1 & 0xFFFFFF, dtype=nl.uint32)
+        k2 = nl.full((P, 1), _OWEN_C2 & 0xFFFFFF, dtype=nl.uint32)
+        x = nl.bitwise_xor(x, _nki_mul24(x, k0), dtype=nl.uint32)
+        x = _nki_add24(x, add)
+        x = _nki_mul24(x, mul)
+        x = nl.bitwise_xor(x, _nki_mul24(x, k1), dtype=nl.uint32)
+        return nl.bitwise_xor(x, _nki_mul24(x, k2), dtype=nl.uint32)
+
+    @nki.jit
+    def sobol_owen_kernel(gray_ref, seeds_ref):
+        """Owen-scrambled Sobol: Gray codes + per-dim seeds → float32 points.
+
+        Args:
+            gray_ref: (P, 1) int32 tile — pre-computed Gray codes.
+            seeds_ref: (P, 2 * _SOBOL_MAX_DIMS) int32 tile, the same in every
+                row: column d is dimension d's 24-bit add seed, column
+                _SOBOL_MAX_DIMS + d its odd 24-bit multiplier
+                (`owen_kernel_seeds`).
+
+        Returns:
+            (P, _SOBOL_MAX_DIMS) float32 tile in [0, 1).
+        """
+        P = gray_ref.shape[0]
+        g = _as_u32(nl.load(gray_ref))
+
+        out = nl.ndarray((P, _SOBOL_MAX_DIMS), dtype=nl.float32, buffer=nl.shared_hbm)
+
+        inv24 = nl.full((P, 1), _SOBOL_SCALE, dtype=nl.float32)
+        _s256 = nl.full((P, 1), 256.0, dtype=nl.float32)
+        _s65536 = nl.full((P, 1), 65536.0, dtype=nl.float32)
+
+        for d_idx in nl.static_range(_SOBOL_MAX_DIMS):
+            add_d = _as_u32(nl.load(seeds_ref[:, d_idx : d_idx + 1]))
+            mul_d = _as_u32(
+                nl.load(seeds_ref[:, _SOBOL_MAX_DIMS + d_idx : _SOBOL_MAX_DIMS + d_idx + 1])
+            )
+            # Reversed Sobol integer: XOR of reversed direction vectors.
+            s = nl.full((P, 1), 0, dtype=nl.uint32)
+            for k in nl.static_range(_SOBOL_BITS):
+                v_dk = _SOBOL_REV_DIR_VECS[d_idx][k]
+                if v_dk != 0:
+                    bit_k = nl.bitwise_and(
+                        nl.right_shift(g, k, dtype=nl.uint32),
+                        1,
+                        dtype=nl.uint32,
+                    )
+                    s = nl.bitwise_xor(
+                        s,
+                        _nki_mul_u32(bit_k, nl.full((P, 1), v_dk, dtype=nl.uint32)),
+                        dtype=nl.uint32,
+                    )
+            h = _nki_owen_hash24(s, add_d, mul_d)
+            # Reverse the 24 bits back.
+            r = nl.full((P, 1), 0, dtype=nl.uint32)
+            for k in nl.static_range(_SOBOL_BITS):
+                bit_k = nl.bitwise_and(nl.right_shift(h, k, dtype=nl.uint32), 1, dtype=nl.uint32)
+                r = nl.bitwise_or(r, nl.left_shift(bit_k, _SOBOL_BITS - 1 - k, dtype=nl.uint32))
+            b0, b1, b2 = _nki_bytes24(r)
+            out[:, d_idx : d_idx + 1] = nl.multiply(
+                nl.add(
+                    nl.add(
+                        nl.copy(b0, dtype=nl.float32),
+                        nl.multiply(nl.copy(b1, dtype=nl.float32), _s256, dtype=nl.float32),
+                        dtype=nl.float32,
+                    ),
+                    nl.multiply(nl.copy(b2, dtype=nl.float32), _s65536, dtype=nl.float32),
+                    dtype=nl.float32,
+                ),
+                inv24,
+                dtype=nl.float32,
+            )
+
+        return out
+
+    def sobol_owen_nki(
+        n_points: int,
+        n_dims: int,
+        seed: int,
+        start_index: int = 0,
+    ) -> torch.Tensor:
+        """Owen-scrambled Sobol sequence on the GpSimd engine (#100).
+
+        Bit-exact with `sobol_owen_reference`, i.e. the top 24 bits of the
+        PyTorch-path `sobol(scramble=True, seed=seed)` points. Up to
+        _SOBOL_MAX_DIMS=10 dimensions and 2^24 points.
+
+        Returns:
+            Float32 tensor of shape (n_points, n_dims) with values in [0, 1).
+        """
+        assert 1 <= n_dims <= _SOBOL_MAX_DIMS, (
+            f"sobol_owen_nki supports 1 ≤ n_dims ≤ {_SOBOL_MAX_DIMS}, got {n_dims}"
+        )
+        assert n_points > 0
+        assert start_index >= 0
+        assert start_index + n_points <= 1 << _SOBOL_BITS, (
+            f"sobol_owen_nki: index {start_index + n_points} exceeds 2^{_SOBOL_BITS}. "
+            "Use the CPU path (set_backend('pytorch')) for longer sequences."
+        )
+
+        LANES = _THREEFRY_LANES
+
+        indices = torch.arange(start_index, start_index + n_points, dtype=torch.int32)
+        gray_codes = (indices ^ (indices >> 1)).reshape(-1, 1).contiguous()
+        n_padded = ((n_points + LANES - 1) // LANES) * LANES
+        if n_padded > n_points:
+            pad = torch.zeros(n_padded - n_points, 1, dtype=torch.int32)
+            gray_codes = torch.cat([gray_codes, pad], dim=0)
+
+        adds, muls = owen_kernel_seeds(seed)
+        seeds = torch.tensor(adds + muls, dtype=torch.int32).expand(LANES, -1).contiguous()
+
+        chunks = []
+        for tile_start in range(0, n_padded, LANES):
+            gray_tile = gray_codes[tile_start : tile_start + LANES].contiguous()
+            if _use_simulator():
+                out_np = _simulator("sobol_owen", sobol_owen_kernel)(
+                    gray_tile.numpy(), seeds.numpy()
+                )
+                chunks.append(torch.from_numpy(np.asarray(out_np)))
+            else:
+                chunks.append(_launch(sobol_owen_kernel, "sobol_owen", gray_tile, seeds))
+
+        return torch.cat(chunks, dim=0)[:n_points, :n_dims].float()
 
     # ── Halton quasi-random sequence (GpSimd + Vector Engine) ─────────────────
     #

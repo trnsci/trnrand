@@ -59,8 +59,11 @@ Without the NKI kernels there is no on-device route (the generator is a host
 `torch.Generator`), so the buffer is filled on the host either way.
 `TRNRAND_REQUIRE_NKI=1` still raises for float64.
 
-`sobol` is the exception: the PyTorch backend's float64 Sobol is a float32
-`SobolEngine` draw cast to float64, so a float64 Sobol request keeps the NKI
+Owen-scrambled `sobol` (the default, `scramble=True`) follows this policy:
+the PyTorch path holds its 32-bit points in float64, the `sobol_owen` kernel
+the top 24 bits in float32. Unscrambled and `scramble="shift"` `sobol` are
+the exception: the PyTorch backend's float64 Sobol there is a float32
+`SobolEngine` draw cast to float64, so such a float64 request keeps the NKI
 kernel on every backend, without a warning or a `TRNRAND_REQUIRE_NKI` error.
 
 Before 0.14.0, float64 on the NKI path (including `"auto"` on a Neuron host)
@@ -94,7 +97,7 @@ detected on the first kernel launch:
   on `device="neuron"`, also callable directly and inside
   `torch.compile(backend="neuron")`:
   `torch.ops.trnrand.philox4x32`, `box_muller`, `threefry4x32`,
-  `threefry_normal`, `sobol_gray_code`, `halton`,
+  `threefry_normal`, `sobol_gray_code`, `sobol_owen`, `halton`,
   `threefry_streaming_normal`, `threefry_streaming_uniform`, and the bulk
   kernels `threefry_bulk_normal` / `threefry_bulk_uniform` and their
   full-word `threefry_bulk32_*` variants. The ops are registered only once

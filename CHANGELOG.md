@@ -12,6 +12,33 @@ Lands in 0.14.0. **Changes the stream for float64 callers on the NKI path**
 
 ### Changed
 
+- **`sobol(scramble=True)` is now Owen scrambling, on both backends (#100).**
+  A hash-based nested uniform scramble (Laine–Karras, with Burley's 2020
+  constants) of the bit-reversed Sobol integers. It keeps the (t, m, s)-net
+  property (every elementary interval keeps its point count; the old NKI
+  scramble, a random shift mod 1, did not) and its centred discrepancy
+  matches `scipy.stats.qmc.Sobol(scramble=True)`. The NKI path runs it in a
+  new `sobol_owen` kernel and gives the same points as the PyTorch path's
+  float32 output for the same seed. `seed=0` now scrambles on NKI (it gave
+  the plain sequence), and `seed=None` draws the scramble seed from torch's
+  global RNG on both backends.
+  **Seeded scrambled streams change:** `sobol(n, d, seed=s)` returns different
+  points from 0.13.0 on every backend. **Migration:** to reproduce an old
+  stream, pass `scramble="shift"`, which is the 0.13.0 behaviour bit for bit
+  (PyTorch path: `SobolEngine(scramble=True, seed=s)`; NKI path: the random
+  shift, unscrambled for `seed=None`/`0`). `scramble` also accepts `"owen"`
+  (same as `True`); other strings raise `ValueError`.
+  The `sobol_owen` NKI kernel is checked on CPU against a bit-exact host
+  reference (`sobol_owen_reference`); its device tests
+  (`tests/test_nki_quasi.py::TestSobolOwenNKI`, marked `needs_hw_validation`)
+  have not run on Neuron hardware yet.
+  Owen-scrambled float64 follows the float64 policy below (#105): under
+  `set_backend("auto")` a `dtype=torch.float64` request on the NKI path takes
+  the PyTorch path (full 32-bit points); under `set_backend("nki")` the
+  float32 kernel output is cast with a one-time `UserWarning`; under
+  `TRNRAND_REQUIRE_NKI=1` it raises `NotImplementedError`. Only unscrambled and
+  `scramble="shift"` Sobol keep the kernel for float64.
+
 - **float64 policy (trnrand#105, the trnsci suite policy).** float64 under
   `auto` now computes in torch at float64 accuracy (previously cast to fp32 on
   the NKI path). Affects released versions **0.5.0 through 0.13.0**, on the
@@ -37,10 +64,11 @@ Lands in 0.14.0. **Changes the stream for float64 callers on the NKI path**
   - Result dtype: always the dtype the PyTorch backend returns for the same
     request (the requested dtype, or the buffer's), for float32, float64,
     float16 and bfloat16. trnrand takes no tensor operands that promote.
-  - `sobol` is unchanged on every backend: the PyTorch backend's float64
-    Sobol is itself a float32 `SobolEngine` draw cast to float64, so there is
-    no float64 Sobol to route to; it keeps the kernel, without a warning or a
-    REQUIRE_NKI error.
+  - unscrambled and `scramble="shift"` `sobol` are unchanged on every
+    backend: the PyTorch backend's float64 Sobol there is itself a float32
+    `SobolEngine` draw cast to float64, so there is no float64 Sobol to route
+    to; they keep the kernel, without a warning or a REQUIRE_NKI error.
+    Owen-scrambled `sobol` (the default, #100) is routed like `halton`.
   - `box_muller_nki` (internal) warns once for float64 input.
   - float64 buffers on the neuron device (`*_into`, `GeneratorProgram`):
     under `auto` they are filled on the host at float64 precision and copied

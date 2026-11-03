@@ -111,5 +111,6 @@ include = ["trnrand*"]
 markers = [
     "neuron: requires Neuron hardware (trn1/trn2 instance)",
     "nki_simulator: runs NKI kernels via nki.simulate on CPU (no hardware)",
+    "needs_hw_validation: NKI kernel not yet run on Neuron hardware or the simulator",
 ]
 testpaths = ["tests"]
