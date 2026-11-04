@@ -104,6 +104,12 @@ def _to_xla(*tensors):
 _NEURON_DEVICE = "neuron"
 _dispatch_path: str | None = None
 _native_ops: dict | None = None
+_xla_deprecation_warned = False
+
+_XLA_DEPRECATION_MESSAGE = (
+    "the PyTorch/XLA path is deprecated on Trn2/Trn3; use TorchNeuron (native). "
+    "Trn1/Inf2 remain supported in maintenance mode."
+)
 
 
 def _native_available() -> bool:
@@ -145,11 +151,26 @@ def _detect_dispatch_path() -> str:
     return "cpu"
 
 
+def _maybe_warn_xla_deprecated() -> None:
+    """Dormant hook: one DeprecationWarning on the XLA path, opt-in only.
+
+    Off unless ``TRNSCI_XLA_DEPRECATION=1``; the suite turns it on at
+    TorchNeuron GA (trnsci/trnsci#35, trnsci/trnsci#136).
+    """
+    global _xla_deprecation_warned
+    if _xla_deprecation_warned or os.environ.get("TRNSCI_XLA_DEPRECATION", "") != "1":
+        return
+    _xla_deprecation_warned = True
+    warnings.warn(_XLA_DEPRECATION_MESSAGE, DeprecationWarning, stacklevel=3)
+
+
 def _get_dispatch_path() -> str:
     """Return "native", "xla", or "cpu" (cached after the first call)."""
     global _dispatch_path
     if _dispatch_path is None:
         _dispatch_path = _detect_dispatch_path()
+        if _dispatch_path == "xla":
+            _maybe_warn_xla_deprecated()
     return _dispatch_path
 
 

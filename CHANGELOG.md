@@ -7,6 +7,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- Dormant XLA deprecation hook, matching the other five trnsci libraries
+  (#120, trnsci/trnsci#136). With `TRNSCI_XLA_DEPRECATION=1`, selecting the
+  PyTorch/XLA dispatch path emits one `DeprecationWarning` per process. Off
+  by default; the suite turns it on at TorchNeuron GA. The native and CPU
+  paths never warn.
+
 ## [0.14.0] - 2026-11-04
 
 Validated on Trn2 (trn2.3xlarge, Neuron SDK 2.33.0, native TorchNeuron) — see trnsci/trnsci#35.
