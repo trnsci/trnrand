@@ -62,6 +62,9 @@ variable is shared by every trnsci library:
 | `native` | Use TorchNeuron; raise `RuntimeError` if no `neuron` device is available. |
 | `xla` | Use torch_xla even if TorchNeuron is present; raise `RuntimeError` if torch_xla is missing. |
 
+`TRNSCI_XLA_DEPRECATION=1` makes the XLA path emit one `DeprecationWarning`.
+It is off by default; the suite turns it on at TorchNeuron GA.
+
 ### Editable installs and the NKI kernel cache
 
 TorchNeuron enables the NKI trace cache by default

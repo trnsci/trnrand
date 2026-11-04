@@ -80,6 +80,8 @@ was always the cast float32 kernel output, with no warning.
 | `TRNRAND_CORES_MIN_ELEMENTS` | Requests below this (default 8,388,608) stay on one core. |
 | `TRNRAND_PINNED_OUTPUT=0` | Turns off pinned host output for large native-path draws (on by default since v0.11.0). |
 | `TRNRAND_KEY_MODE=draw\|counter` | Default `Generator` key mode. |
+| `TRNSCI_NKI_DISPATCH=auto\|native\|xla` | Suite-wide. Forces the native or XLA dispatch path; `auto` (default) detects. Forcing an unavailable path raises. |
+| `TRNSCI_XLA_DEPRECATION=1` | Suite-wide, off by default. The XLA path emits one `DeprecationWarning`. |
 
 ## Multi-core bulk draws
 
