@@ -11,6 +11,7 @@ import importlib.util
 import subprocess
 import sys
 import types
+import warnings
 
 import pytest
 import torch
@@ -44,7 +45,9 @@ def reset_dispatch_state(monkeypatch):
     """Each test sees an undetected path and an unregistered op table."""
     monkeypatch.setattr(dispatch, "_dispatch_path", None)
     monkeypatch.setattr(dispatch, "_native_ops", None)
+    monkeypatch.setattr(dispatch, "_xla_deprecation_warned", False)
     monkeypatch.delenv("TRNSCI_NKI_DISPATCH", raising=False)
+    monkeypatch.delenv("TRNSCI_XLA_DEPRECATION", raising=False)
     # Drop any `_native` left by an earlier test so registration re-runs.
     monkeypatch.delitem(sys.modules, "trnrand.nki._native", raising=False)
     monkeypatch.delattr(trnrand.nki, "_native", raising=False)
@@ -204,6 +207,63 @@ class TestDispatchOverride:
         monkeypatch.setenv("TRNSCI_NKI_DISPATCH", "cuda")
         with pytest.raises(ValueError, match="auto, native, or xla"):
             dispatch._get_dispatch_path()
+
+
+class TestXlaDeprecationHook:
+    """Dormant until TorchNeuron GA (trnsci/trnsci#35, #136): off unless
+    TRNSCI_XLA_DEPRECATION=1, then a single DeprecationWarning."""
+
+    def _xla_only(self, monkeypatch):
+        monkeypatch.setitem(sys.modules, "torch_neuronx", _fake_xla_torch_neuronx())
+        _set_torch_xla_present(monkeypatch, True)
+
+    def test_off_by_default(self, monkeypatch):
+        self._xla_only(monkeypatch)
+        with warnings.catch_warnings():
+            warnings.simplefilter("error")
+            assert dispatch._get_dispatch_path() == "xla"
+            assert dispatch._get_dispatch_path() == "xla"
+
+    def test_off_for_other_values(self, monkeypatch):
+        self._xla_only(monkeypatch)
+        monkeypatch.setenv("TRNSCI_XLA_DEPRECATION", "0")
+        with warnings.catch_warnings():
+            warnings.simplefilter("error")
+            assert dispatch._get_dispatch_path() == "xla"
+
+    def test_fires_once_when_enabled(self, monkeypatch):
+        self._xla_only(monkeypatch)
+        monkeypatch.setenv("TRNSCI_XLA_DEPRECATION", "1")
+        with warnings.catch_warnings(record=True) as caught:
+            warnings.simplefilter("always")
+            assert dispatch._get_dispatch_path() == "xla"
+            assert dispatch._get_dispatch_path() == "xla"
+            # Even a re-detection does not warn a second time.
+            monkeypatch.setattr(dispatch, "_dispatch_path", None)
+            assert dispatch._get_dispatch_path() == "xla"
+        dep = [w for w in caught if issubclass(w.category, DeprecationWarning)]
+        assert len(dep) == 1
+        assert str(dep[0].message) == (
+            "the PyTorch/XLA path is deprecated on Trn2/Trn3; use TorchNeuron (native). "
+            "Trn1/Inf2 remain supported in maintenance mode."
+        )
+
+    def test_not_fired_on_native_path(self, monkeypatch):
+        monkeypatch.setitem(sys.modules, "torch_neuronx", _fake_native_torch_neuronx())
+        _accept_neuron_device(monkeypatch)
+        _set_torch_xla_present(monkeypatch, True)
+        monkeypatch.setenv("TRNSCI_XLA_DEPRECATION", "1")
+        with warnings.catch_warnings():
+            warnings.simplefilter("error")
+            assert dispatch._get_dispatch_path() == "native"
+
+    def test_not_fired_on_cpu_path(self, monkeypatch):
+        monkeypatch.setitem(sys.modules, "torch_neuronx", None)
+        _set_torch_xla_present(monkeypatch, False)
+        monkeypatch.setenv("TRNSCI_XLA_DEPRECATION", "1")
+        with warnings.catch_warnings():
+            warnings.simplefilter("error")
+            assert dispatch._get_dispatch_path() == "cpu"
 
 
 class TestLaunchRouting:
