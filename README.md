@@ -29,7 +29,7 @@ Suite-wide tracker: [trnsci/trnsci#1](https://github.com/trnsci/trnsci/issues/1)
 
 ## Known issues in earlier releases
 
-Silent wrong-result bugs fixed in the 2026-10-31 to 2026-11-02 releases. Details are in the [CHANGELOG](CHANGELOG.md). "NKI" means `set_backend("nki")`, or `"auto"` on Neuron hardware.
+Silent wrong-result bugs fixed in the 2026-10-31 to 2026-11-04 releases. Details are in the [CHANGELOG](CHANGELOG.md). "NKI" means `set_backend("nki")`, or `"auto"` on Neuron hardware.
 
 | Bug | Affected versions | Fixed in |
 |---|---|---|
@@ -44,6 +44,10 @@ Silent wrong-result bugs fixed in the 2026-10-31 to 2026-11-02 releases. Details
 | `gamma` / `chi_squared` / `beta` / `truncated_normal` drew identical samples on every partition rank (NKI) | 0.7.0 – 0.12.1 | 0.13.0 |
 | `uniform` in bfloat16 / float16 returned `high`, outside `[low, high)` (NKI) | 0.5.0 – 0.12.1 | 0.13.0 |
 | `advance_to(position())` did not resume the stream with the default `key_mode="draw"` (NKI); it now warns | 0.7.0 – 0.12.1 | 0.13.0 |
+| `Generator(seed=None)`, and the module default generator behind unseeded calls, drew the same stream in every process, so unseeded workers were perfectly correlated (every backend) | 0.1.0 – 0.13.0 | 0.14.0 |
+| `partition_rank` was ignored on the PyTorch path, so every rank drew identical samples (also `bernoulli` / `randint` / `randperm` / `poisson` with `lam < 20` and the CPU `GeneratorProgram` fallback on NKI) | 0.7.0 – 0.13.0 | 0.14.0 |
+| Integer and complex output requests cast a float32 draw: `uniform(dtype=torch.int64)` returned zeros and `normal(dtype=torch.complex64)` a zero imaginary part (NKI) | through 0.13.0 | 0.14.0 |
+| `uniform_into()` and `GeneratorProgram` uniform into a float16 / bfloat16 buffer could return `high`, outside `[low, high)` (NKI) | through 0.13.0 | 0.14.0 |
 
 ## Install
 
