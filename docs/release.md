@@ -34,6 +34,16 @@ e.g. `v0.2.0-rc1`) go to TestPyPI; stable tags go to PyPI.
    TestPyPI.
 4. **Verify** the workflow run on the Actions tab. PyPI/TestPyPI shows the
    new version within a minute or two.
+5. **Update umbrella docs/extras** in one
+   [trnsci/trnsci](https://github.com/trnsci/trnsci) PR (stable releases only):
+   - [ ] if users should require this release (always for a fix to silent
+     wrong results), bump `trnrand` in the umbrella `pyproject.toml` `[rand]`
+     and `[all]` extras, and cut a `trnsci` meta-package release;
+   - [ ] update the `[[described:trnrand=X.Y.Z]]` rows in `docs/roadmap.md`
+     and `docs/nki_validation_status.md`, with the
+     [#35](https://github.com/trnsci/trnsci/issues/35) Trn2 validation link;
+   - [ ] check that `python scripts/check_docs_drift.py` exits 0. The weekly
+     docs-drift workflow opens a `docs-stale` issue for anything missed.
 
 ## Pre-release smoke test
 
