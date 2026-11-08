@@ -22,7 +22,7 @@ generalize across distributions.
 
 Trainium has a structurally different escape route:
 
-1. **SBUF** is 24 MB of directly-addressable on-chip memory that
+1. **SBUF** is 24 MiB (Trn1) or 28 MiB (Trn2) of directly-addressable on-chip memory that
    persists for the lifetime of a kernel invocation. Per-lane state
    (Philox counter/key, rejection accumulators) can live there
    indefinitely at near-register latency.
