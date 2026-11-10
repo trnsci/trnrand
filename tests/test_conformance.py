@@ -114,6 +114,61 @@ def known(request, issue: str, why: str, *, strict: bool, when: bool = True):
         )
 
 
+# ── device-known categories (trnsci/trnsci#35) ────────────────────────────
+# A device conformance run (--backend nki --conformance-device neuron) has
+# known platform failures. Each category has one tracking issue; matching
+# cases are marked xfail(strict=False) at run time, on device runs only, so the
+# only red in a device run is a NEW failure, and a category that starts passing
+# shows as XPASS (a signal, not a failure). CPU CI runs and must pass every
+# case. The pattern is trnsolver#146's; the summary hook is in conftest.py.
+
+DEVICE_KNOWN = {
+    "poisson-normal-approx": (
+        "trnsci/trnrand#88",
+        "NKI poisson for lam >= 20 is the documented normal approximation "
+        "round(N(lam, sqrt(lam))), which fails an exact chi-square GOF test",
+    ),
+}
+
+# The rate behind each Poisson case name in DISTS / PARAM_GRID below.
+_POISSON_LAM = {
+    "poisson_small": 3.0,
+    "poisson_large": 40.0,
+    "poisson_19.9": 19.9,
+    "poisson_20": 20.0,
+    "poisson_1e4": 1e4,
+}
+_POISSON_NORMAL_THRESHOLD = 20.0  # trnrand.nki.dispatch._POISSON_NORMAL_THRESHOLD
+_GOF_TESTS = {"test_distribution_matches_scipy", "test_parameters_match_scipy"}
+
+
+def _device_known_category(node) -> str | None:
+    """The DEVICE_KNOWN category of a collected test, or None."""
+    callspec = getattr(node, "callspec", None)
+    params = callspec.params if callspec is not None else {}
+    name = getattr(node, "originalname", node.name)
+    lam = _POISSON_LAM.get(params.get("name"))
+    if name in _GOF_TESTS and lam is not None and lam >= _POISSON_NORMAL_THRESHOLD:
+        return "poisson-normal-approx"
+    return None
+
+
+@pytest.fixture(autouse=True)
+def _device_known_xfail(request, _conformance_backend):
+    """xfail(strict=False) a DEVICE_KNOWN case, on nki device runs only."""
+    cfg = request.config
+    if cfg.getoption("--backend") != "nki":
+        return
+    if torch.device(cfg.getoption("--conformance-device")).type == "cpu":
+        return
+    cat = _device_known_category(request.node)
+    if cat is not None:
+        issue, what = DEVICE_KNOWN[cat]
+        request.applymarker(
+            pytest.mark.xfail(strict=False, reason=f"[device-known:{cat}] {issue}: {what}")
+        )
+
+
 def host(t):
     return t.detach().cpu() if isinstance(t, torch.Tensor) else t
 

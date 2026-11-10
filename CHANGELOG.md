@@ -14,6 +14,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   PyTorch/XLA dispatch path emits one `DeprecationWarning` per process. Off
   by default; the suite turns it on at TorchNeuron GA. The native and CPU
   paths never warn.
+- Device conformance runs are signal-only (trnsci/trnsci#35). Under
+  `--backend nki` with a non-CPU `--conformance-device`, the known
+  platform-limit cases are marked `xfail(strict=False)` at run time: the
+  Poisson λ ≥ 20 chi-square GOF cases (the documented normal approximation,
+  #88). CPU runs still run and must pass them. A device run ends with a
+  summary of passed, xfailed and XPASS by category, and NEW failures;
+  `--conformance-json PATH` writes it as JSON and
+  `scripts/conformance_expect.py` merges chunked runs (exit 1 on NEW failures).
+  Test-only.
 
 ## [0.14.0] - 2026-11-04
 
