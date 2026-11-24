@@ -148,7 +148,9 @@ def _device_known_category(node) -> str | None:
     params = callspec.params if callspec is not None else {}
     name = getattr(node, "originalname", node.name)
     lam = _POISSON_LAM.get(params.get("name"))
-    if name in _GOF_TESTS and lam is not None and lam >= _POISSON_NORMAL_THRESHOLD:
+    # At lam = 1e4 the normal approximation passes the chi-square test on
+    # device (trnsci/trnsci#35, windows 6 and 7), so only 20 <= lam < 1e4 is marked.
+    if name in _GOF_TESTS and lam is not None and _POISSON_NORMAL_THRESHOLD <= lam < 1e4:
         return "poisson-normal-approx"
     return None
 
@@ -332,14 +334,7 @@ def assert_support(x, support):
 
 @pytest.mark.parametrize("dt", FLOAT_DTYPES, ids=lambda d: str(d)[6:])
 @pytest.mark.parametrize("name", list(DISTS))
-def test_distribution_matches_scipy(request, nki_like, fp32_fp64, name, dt):
-    known(
-        request,
-        "94",
-        "NKI uniform in float16/bfloat16 returns high (fix in #95)",
-        strict=False,
-        when=nki_like and name.startswith("uniform") and dt in REDUCED,
-    )
+def test_distribution_matches_scipy(fp32_fp64, name, dt):
     draw, ref, support, heavy = DISTS[name]
     n = 100_000
     x = host(draw(n, dt, G(7)))
@@ -672,14 +667,7 @@ def test_into_does_not_touch_other_tensors(dev):
     assert torch.equal(other, keep)
 
 
-def test_exponential_into_finite_at_scale(request, dev, nki_like):
-    known(
-        request,
-        "82",
-        "NKI exponential_into returns inf when u == 0 (fix in #86)",
-        strict=False,
-        when=nki_like,
-    )
+def test_exponential_into_finite_at_scale(dev, nki_like):
     n = 1 << 22 if nki_like else 1 << 20
     b = nan_buf(dev, n)
     tr.exponential_into(b, generator=G(100))
@@ -729,14 +717,7 @@ def test_program_builder_requires_steps():
         ProgramBuilder(seed=0).build()
 
 
-def test_program_exponential_finite_at_scale(request, dev):
-    known(
-        request,
-        "82",
-        "NKI GeneratorProgram.exponential returns inf when u == 0 (fix in #86)",
-        strict=False,
-        when=tr.HAS_NKI,
-    )
+def test_program_exponential_finite_at_scale(dev):
     n = 1 << 22 if tr.HAS_NKI else 1 << 18
     b = {"e": nan_buf(dev, n)}
     G(5).new_program().exponential(n, out="e").build().stream_into(b)
@@ -869,19 +850,9 @@ def test_unseeded_generators_are_independent():
     assert not torch.equal(a, b)
 
 
-_NKI_92 = {"gamma", "beta", "chi_squared", "truncated_normal"}
-
-
 @pytest.mark.parametrize("dn", list(DRAWS))
-def test_partition_ranks_draw_different_samples(request, nki_like, dn):
+def test_partition_ranks_draw_different_samples(dn):
     # Docs: each rank draws a disjoint subrange of the logical stream.
-    if nki_like and dn in _NKI_92:
-        known(
-            request,
-            "92",
-            "ranks identical on NKI for rejection samplers (fix in #93)",
-            strict=False,
-        )
     d = DRAWS[dn]
     a = host(d(G(55, partition_rank=0, partition_size=2), 2048))
     b = host(d(G(55, partition_rank=1, partition_size=2), 2048))
@@ -976,14 +947,7 @@ def test_sobol_nki_reference_matches_scipy(n, d):
     torch.testing.assert_close(x, ref, atol=0, rtol=0)
 
 
-def test_sobol_scramble_false_ignores_seed(request, nki_like):
-    known(
-        request,
-        "90",
-        "NKI sobol(scramble=False, seed=s) is shifted (fix in #91)",
-        strict=False,
-        when=nki_like,
-    )
+def test_sobol_scramble_false_ignores_seed():
     assert torch.equal(
         host(tr.sobol(256, 3, scramble=False)), host(tr.sobol(256, 3, scramble=False, seed=5))
     )
