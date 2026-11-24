@@ -25,7 +25,7 @@ def _node(originalname, **params):
     "test,params,cat",
     [
         ("test_parameters_match_scipy", {"name": "poisson_20"}, "poisson-normal-approx"),
-        ("test_parameters_match_scipy", {"name": "poisson_1e4"}, "poisson-normal-approx"),
+        ("test_parameters_match_scipy", {"name": "poisson_1e4"}, None),
         ("test_parameters_match_scipy", {"name": "poisson_19.9"}, None),
         ("test_parameters_match_scipy", {"name": "gamma_shape1"}, None),
         ("test_distribution_matches_scipy", {"name": "poisson_large"}, "poisson-normal-approx"),
