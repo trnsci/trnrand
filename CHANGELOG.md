@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.15.0] - 2026-11-25
+
+Validated on Trn2 (trn2.3xlarge, Neuron SDK 2.33.1, native TorchNeuron) — see trnsci/trnsci#35.
+
+Headline: the dormant XLA-path deprecation hook, matching the other five trnsci libraries (#120, trnsci/trnsci#136): with `TRNSCI_XLA_DEPRECATION=1`, selecting the PyTorch/XLA dispatch path warns once per process; off by default. The build now requires `setuptools>=77` (#124). Device conformance xfail rules for the documented Poisson normal approximation (test-only, #125, #127).
+
 ### Added
 
 - Dormant XLA deprecation hook, matching the other five trnsci libraries
@@ -23,6 +29,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `--conformance-json PATH` writes it as JSON and
   `scripts/conformance_expect.py` merges chunked runs (exit 1 on NEW failures).
   Test-only.
+
+### Fixed
+
+- Build: `[build-system]` requires `setuptools>=77`, which the SPDX
+  `license = "Apache-2.0"` string needs. With older setuptools, builds
+  without build isolation (conda, distribution packaging) failed (#124,
+  trnsci/trnsci#160). Isolated `pip install` was not affected.
 
 ## [0.14.0] - 2026-11-04
 
